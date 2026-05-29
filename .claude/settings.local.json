@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(New-Item -ItemType Directory -Force \"C:\\\\okx\\\\src\")",
+      "PowerShell(New-Item -ItemType Directory -Force \"C:\\\\okx\\\\logs\")",
+      "Bash(pip install *)"
+    ]
+  }
+}
