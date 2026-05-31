@@ -237,6 +237,32 @@ OKX_FLAG=1
 SERVERCHAN_KEY=your_serverchan_key_here
 ```
 
+### 获取 SERVERCHAN_KEY
+
+`SERVERCHAN_KEY` 用于把开仓、加仓、平仓和风险事件推送到微信。当前程序使用的是 Server 酱新版接口：
+
+```text
+https://sctapi.ftqq.com/{SERVERCHAN_KEY}.send
+```
+
+获取方法：
+
+1. 打开 Server 酱官网：[https://sct.ftqq.com/](https://sct.ftqq.com/)
+2. 使用微信扫码登录。
+3. 按页面提示绑定消息通道。一般选择默认的微信/方糖服务号通道即可。
+4. 在官网后台找到 `SendKey` 页面。
+5. 复制你的 `SendKey`，填入 `.env`：
+
+```env
+SERVERCHAN_KEY=你的SendKey
+```
+
+注意：`SendKey` 等同于推送密钥，不要提交到 GitHub，也不要发给别人。如果不需要微信推送，可以留空：
+
+```env
+SERVERCHAN_KEY=
+```
+
 说明：
 
 ```text
@@ -244,7 +270,7 @@ OKX_FLAG=1  模拟盘
 OKX_FLAG=0  实盘
 ```
 
-`SERVERCHAN_KEY` 是可选项，不需要微信推送可以不填。
+补充：如果你使用的是 Server 酱 3，它的入口通常是 [https://sc3.ft07.com](https://sc3.ft07.com)，但当前程序默认适配的是 `sct.ftqq.com` 这一版的 `SendKey`。
 
 ## 启动方法
 
