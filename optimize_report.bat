@@ -8,5 +8,12 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
-".venv\Scripts\python.exe" backtest\weekly_log_parameter_optimizer.py
+echo ========================================
+echo OKX log parameter optimizer
+echo ========================================
+echo Reading logs and replaying parameter sets.
+echo This may take a few minutes depending on log size.
+echo.
+
+".venv\Scripts\python.exe" backtest\log_parameter_optimizer.py
 pause

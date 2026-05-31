@@ -29,7 +29,7 @@ C:\okx
 │   ├── notify.py                   # ServerChan 微信推送
 │   └── dashboard.py                # 本地网页看板
 ├── backtest
-│   └── weekly_log_parameter_optimizer.py  # 基于运行日志的参数报告
+│   └── log_parameter_optimizer.py  # 基于运行日志的参数报告
 └── logs                            # 运行日志和本地状态文件，默认不提交
 ```
 
@@ -267,6 +267,13 @@ start.bat
 http://localhost:8080
 ```
 
+看板包含两个视图：
+
+```text
+实时：查看当前价格、布林带、账户、持仓、批次和最近成交
+历史日志：读取 logs/boll_pin_*.log，查看历史价格和布林带变化
+```
+
 日志会写入：
 
 ```text
@@ -320,7 +327,7 @@ TRADING_ACCOUNT_TARGET  固本交易账户目标余额
 日志参数报告：
 
 ```powershell
-.\.venv\Scripts\python.exe backtest\weekly_log_parameter_optimizer.py
+.\.venv\Scripts\python.exe backtest\log_parameter_optimizer.py
 ```
 
 也可以直接运行：
@@ -329,7 +336,16 @@ TRADING_ACCOUNT_TARGET  固本交易账户目标余额
 optimize_report.bat
 ```
 
-这个脚本会读取 `logs/boll_pin_*.log`，用所有历史日志测试多组开仓参数，并输出 CSV 和 Markdown 报告到 `backtest/results/weekly_log_optimizer/`。它只生成报告，不会修改实盘配置。
+这个脚本会读取 `logs/boll_pin_*.log`，用所有历史日志测试多组开仓参数，并输出 CSV 和 Markdown 报告到 `backtest/results/log_parameter_optimizer/`。
+
+报告跑完后，终端会显示参数同步菜单：
+
+```text
+输入 1-20：把对应排名的参数写入 src/config.py
+输入 0 或直接回车：保持当前策略参数不变
+```
+
+同步前需要再次输入 `y` 确认，脚本会先生成 `src/config.py.bak` 备份。
 
 ## 上传 GitHub 时的注意事项
 

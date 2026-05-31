@@ -37,8 +37,9 @@ from src.config import (
 )
 
 
+CONFIG_PATH = ROOT / "src" / "config.py"
 DEFAULT_LOG_DIR = ROOT / "logs"
-DEFAULT_OUT_DIR = ROOT / "backtest" / "results" / "weekly_log_optimizer"
+DEFAULT_OUT_DIR = ROOT / "backtest" / "results" / "log_parameter_optimizer"
 SOURCE_BOLL_STD = 2.0
 TAKER_FEE = 0.0005
 INITIAL_TOTAL_EQUITY = 1000.0
@@ -509,7 +510,7 @@ def write_markdown_report(path: Path, rows: list[dict], ticks: pd.DataFrame) -> 
     """Write a concise Markdown report."""
     best = rows[0]
     lines = [
-        "# Weekly Log Parameter Report",
+        "# Log Parameter Report",
         "",
         f"- 数据范围: {ticks['ts'].min()} -> {ticks['ts'].max()}",
         f"- Tick 数: {len(ticks)}",
@@ -547,15 +548,120 @@ def write_markdown_report(path: Path, rows: list[dict], ticks: pd.DataFrame) -> 
             "## 注意",
             "",
             "- 这个报告只使用日志里记录到的 mark price 和布林带快照，不能替代真实盘口撮合回测。",
-            "- 脚本只输出建议和对比数据，不会修改 `src/config.py`。",
+            "- 运行结束后的选择菜单需要人工确认，只有选择编号后才会同步 `src/config.py`。",
         ]
     )
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _format_config_value(value: float) -> str:
+    """Format a numeric config value with stable Python syntax."""
+    if float(value).is_integer():
+        return str(int(value))
+    return str(float(value))
+
+
+def apply_params_to_config(row: dict, config_path: Path = CONFIG_PATH) -> Path:
+    """Write selected optimizer parameters into ``src/config.py``."""
+    replacements = {
+        "BOLL_STD": row["boll_std"],
+        "MIN_BOLL_WIDTH_USD": row["min_width_usd"],
+        "MIN_ENTRY_GAP_USD": row["min_entry_gap_usd"],
+        "REPRICE_GAP_USD": row["reprice_gap_usd"],
+    }
+    text = config_path.read_text(encoding="utf-8")
+    backup_path = config_path.with_suffix(".py.bak")
+    backup_path.write_text(text, encoding="utf-8")
+
+    for key, value in replacements.items():
+        pattern = re.compile(rf"^({key}\s*=\s*)([-+]?\d+(?:\.\d+)?)(.*)$", re.MULTILINE)
+        text, count = pattern.subn(rf"\g<1>{_format_config_value(value)}\3", text, count=1)
+        if count != 1:
+            raise RuntimeError(f"没有在 {config_path} 中找到配置项 {key}")
+
+    config_path.write_text(text, encoding="utf-8")
+    return backup_path
+
+
+def prompt_apply_params(rows: list[dict], top_n: int = 20) -> None:
+    """Prompt the user to apply one ranked parameter set to live config."""
+    limit = min(top_n, len(rows))
+    print()
+    print("参数同步选择")
+    print(f"输入 1-{limit} 将对应排名的参数写入 src/config.py；输入 0 或直接回车保持现状。")
+    choice = input("请选择: ").strip()
+    if choice in ("", "0"):
+        print("保持现状，未修改 src/config.py")
+        return
+    if not choice.isdigit() or not (1 <= int(choice) <= limit):
+        print("输入无效，未修改 src/config.py")
+        return
+
+    selected = rows[int(choice) - 1]
+    print(
+        "将同步: "
+        f"BOLL_STD={selected['boll_std']}, "
+        f"MIN_BOLL_WIDTH_USD={selected['min_width_usd']}, "
+        f"MIN_ENTRY_GAP_USD={selected['min_entry_gap_usd']}, "
+        f"REPRICE_GAP_USD={selected['reprice_gap_usd']}"
+    )
+    confirm = input("确认写入策略配置？输入 y 确认: ").strip().lower()
+    if confirm != "y":
+        print("已取消，未修改 src/config.py")
+        return
+
+    backup_path = apply_params_to_config(selected)
+    print(f"已更新 src/config.py，原配置备份为 {backup_path}")
+
+
+def print_rankings(rows: list[dict], top_n: int = 10) -> None:
+    """Print a compact, readable optimizer ranking."""
+    best = rows[0]
+    print()
+    print("=" * 86)
+    print("最优参数")
+    print("=" * 86)
+    print(
+        f"BOLL_STD={best['boll_std']}  "
+        f"MIN_BOLL_WIDTH_USD={best['min_width_usd']}  "
+        f"MIN_ENTRY_GAP_USD={best['min_entry_gap_usd']}  "
+        f"REPRICE_GAP_USD={best['reprice_gap_usd']}"
+    )
+    print(
+        f"收益={best['total_pnl']:+.2f} USDT  "
+        f"交易={best['trades']}次  "
+        f"胜率={best['win_rate_pct']:.1f}%  "
+        f"回撤={best['max_drawdown_pct']:.2f}%  "
+        f"均持仓={best['avg_hold_minutes']:.0f}分钟"
+    )
+    print()
+    print("Top 参数对比")
+    print("-" * 86)
+    print("排名  参数(BOLL/宽度/间距/重挂)       收益USDT   交易  胜率    回撤    均持仓  撤单/重挂")
+    print("-" * 86)
+    for idx, row in enumerate(rows[:top_n], start=1):
+        params = (
+            f"{row['boll_std']:g}/"
+            f"{row['min_width_usd']:g}/"
+            f"{row['min_entry_gap_usd']:g}/"
+            f"{row['reprice_gap_usd']:g}"
+        )
+        print(
+            f"{idx:>2}    {params:<27}"
+            f"{row['total_pnl']:>9.2f}  "
+            f"{row['trades']:>3}  "
+            f"{row['win_rate_pct']:>5.1f}%  "
+            f"{row['max_drawdown_pct']:>5.2f}%  "
+            f"{row['avg_hold_minutes']:>5.0f}m  "
+            f"{row['width_cancel']:>2}/{row['reprice_count']:<2}"
+        )
+    print("-" * 86)
+    print("完整字段已保存到 CSV；终端只显示核心排名，方便人工选择。")
+
+
 def main() -> None:
     """CLI entry point."""
-    parser = argparse.ArgumentParser(description="用实盘日志每周优化开仓参数，并生成报告。")
+    parser = argparse.ArgumentParser(description="用实盘日志优化开仓参数，并生成报告。")
     parser.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
     parser.add_argument("--initial-total-equity", type=float, default=INITIAL_TOTAL_EQUITY)
@@ -563,16 +669,36 @@ def main() -> None:
     parser.add_argument("--min-width-usd", default="10,12,15,18,20,25")
     parser.add_argument("--min-entry-gap-usd", default="3,4,5,6,8")
     parser.add_argument("--reprice-gap-usd", default="0.5,1,2")
+    parser.add_argument("--no-prompt", action="store_true", help="只生成报告，不显示参数同步选择。")
+    parser.add_argument("--quiet", action="store_true", help="不显示运行进度，只输出最终结果。")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if not args.quiet:
+        print("正在读取策略日志...", flush=True)
     ticks = parse_logs(Path(args.log_dir))
+    if not args.quiet:
+        print(
+            f"已读取 {len(ticks)} 条 tick，范围 {ticks['ts'].min()} -> {ticks['ts'].max()}",
+            flush=True,
+        )
 
+    grid = build_grid(args)
+    total = len(grid)
+    progress_step = max(1, total // 20)
+    if not args.quiet:
+        print(f"开始参数回放，共 {total} 组参数...", flush=True)
     rows = []
-    for params in build_grid(args):
+    for idx, params in enumerate(grid, start=1):
         rows.append(LogReplay(ticks, params, args.initial_total_equity).run().report())
+        if not args.quiet and (idx == 1 or idx == total or idx % progress_step == 0):
+            pct = idx / total * 100
+            print(f"进度 {idx}/{total} ({pct:.1f}%)", flush=True)
+
+    if not args.quiet:
+        print("正在排序并写入报告...", flush=True)
     rows.sort(key=lambda row: (row["total_pnl"], row["trades"], -row["max_drawdown_pct"]), reverse=True)
 
     stamp = ticks["ts"].max().strftime("%Y%m%d_%H%M%S")
@@ -584,9 +710,11 @@ def main() -> None:
         writer.writerows(rows)
     write_markdown_report(md_path, rows, ticks)
 
-    print(pd.DataFrame(rows[:20]).to_string(index=False))
+    print_rankings(rows)
     print(f"csv={csv_path}")
     print(f"report={md_path}")
+    if not args.no_prompt:
+        prompt_apply_params(rows)
 
 
 if __name__ == "__main__":
