@@ -2,7 +2,7 @@
 
 这是一个运行在 OKX ETH-USDT 永续合约上的 15 分钟布林带均值回归策略程序。程序会监听标记价格和 15m K 线布林带，当价格突破布林带外侧并停止继续创新极值时，按分批方式建立仓位，并在平均成本外固定 10 USDT 距离挂止盈单。
 
-项目包含实盘/模拟盘交易主程序、本地网页看板、微信推送、固本资金管理和若干回测脚本。
+项目包含实盘/模拟盘交易主程序、本地网页看板、微信推送、固本资金管理和日志参数报告工具。
 
 ## 重要提醒
 
@@ -16,10 +16,9 @@
 C:\okx
 ├── main.py                         # 程序入口，启动网页看板和交易策略
 ├── start.bat                       # Windows 一键启动脚本
+├── optimize_report.bat             # 手动生成日志参数报告
 ├── requirements.txt                # Python 依赖
 ├── .env.example                    # 环境变量示例
-├── okx_data_provider.py            # 数据下载/整理辅助脚本
-├── example_integration.py          # 示例集成脚本
 ├── src
 │   ├── config.py                   # 策略参数、账户参数、看板参数
 │   ├── strategy.py                 # 核心交易策略逻辑
@@ -30,10 +29,7 @@ C:\okx
 │   ├── notify.py                   # ServerChan 微信推送
 │   └── dashboard.py                # 本地网页看板
 ├── backtest
-│   ├── backtest.py                 # 历史 K 线回测
-│   ├── orderbook_impact.py         # 盘口/成交影响分析
-│   ├── cancel_policy_compare.py    # 撤单策略对比
-│   └── fixed_capital_cancel_policy_compare.py
+│   └── weekly_log_parameter_optimizer.py  # 基于运行日志的参数报告
 └── logs                            # 运行日志和本地状态文件，默认不提交
 ```
 
@@ -174,16 +170,16 @@ TP_PROFIT_USD = 10.0
 策略采用固定交易账户资金的思路：
 
 ```python
-TRADING_ACCOUNT_TARGET = 100.0
+TRADING_ACCOUNT_TARGET = 200.0
 ```
 
 平仓后程序会检查交易账户 USDT 可用余额：
 
 ```text
-交易账户余额 > 100U：
+交易账户余额 > 200U：
     多出来的利润从交易账户划转到资金账户
 
-交易账户余额 < 100U：
+交易账户余额 < 200U：
     从资金账户划转补足交易账户
 ```
 
@@ -302,7 +298,7 @@ MIN_ENTRY_GAP_USD = 4.0
 REPRICE_GAP_USD = 1.0
 
 TP_PROFIT_USD = 10.0
-TRADING_ACCOUNT_TARGET = 100.0
+TRADING_ACCOUNT_TARGET = 200.0
 ```
 
 参数含义：
@@ -319,17 +315,21 @@ TP_PROFIT_USD           平均成本外固定止盈距离
 TRADING_ACCOUNT_TARGET  固本交易账户目标余额
 ```
 
-## 回测脚本
+## 日志参数报告
 
-`backtest` 目录中包含若干辅助脚本，用于评估参数和撤单策略。
-
-示例：
+日志参数报告：
 
 ```powershell
-.\.venv\Scripts\python.exe backtest\backtest.py
+.\.venv\Scripts\python.exe backtest\weekly_log_parameter_optimizer.py
 ```
 
-部分脚本依赖历史 CSV 或 Tardis 数据。历史数据和回测结果默认不建议提交到 GitHub。
+也可以直接运行：
+
+```text
+optimize_report.bat
+```
+
+这个脚本会读取 `logs/boll_pin_*.log`，用所有历史日志测试多组开仓参数，并输出 CSV 和 Markdown 报告到 `backtest/results/weekly_log_optimizer/`。它只生成报告，不会修改实盘配置。
 
 ## 上传 GitHub 时的注意事项
 
@@ -340,7 +340,6 @@ TRADING_ACCOUNT_TARGET  固本交易账户目标余额
 logs/
 .idea/
 *.zip
-ETH_USDT_15m_history.csv
 backtest/results/
 backtest/results_current_check/
 ```
@@ -362,6 +361,6 @@ git diff --cached --check
 动态补仓：补仓按当前触发价格，不再依赖固定 BATCH_SPACING
 同 K 限制：每根 15m K 线最多新增一批
 固定止盈：按真实平均成本外 10U 止盈
-固本策略：平仓后保持交易账户约 100U，多余利润转资金账户
+固本策略：平仓后保持交易账户约 200U，多余利润转资金账户
 微信通知：挂单、成交、平仓和风险事件均可通知
 ```

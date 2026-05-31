@@ -99,7 +99,7 @@ WEEKLY_EMA_PERIOD = 10
 # After every closed position, the strategy tries to keep the trading account
 # at this available USDT balance by transferring profit to the funding account
 # or topping up losses from it. Set to 0 to disable rebalancing.
-TRADING_ACCOUNT_TARGET = 100.0
+TRADING_ACCOUNT_TARGET = 200.0
 
 
 # Runtime settings.

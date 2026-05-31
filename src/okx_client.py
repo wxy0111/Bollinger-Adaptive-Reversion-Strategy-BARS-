@@ -18,6 +18,24 @@ from src.config import API_KEY, SECRET_KEY, PASSPHRASE, FLAG
 BASE_URL = "https://www.okx.com"
 
 
+def _is_benign_cancel_error(err: Exception) -> bool:
+    """Return whether a cancel failure is likely an already-closed order."""
+    text = str(err).lower()
+    benign_markers = (
+        "all operations failed",
+        "order does not exist",
+        "order not exist",
+        "already canceled",
+        "already cancelled",
+        "already filled",
+        "already closed",
+        "not found",
+        "51603",
+        "51604",
+    )
+    return any(marker in text for marker in benign_markers)
+
+
 def _sign(timestamp: str, method: str, path: str, body: str = "") -> str:
     """Build an OKX API HMAC signature."""
     msg = timestamp + method.upper() + path + body
@@ -191,6 +209,9 @@ class OKXClient:
             await self._post("/api/v5/trade/cancel-order", {"instId": inst_id, "ordId": ord_id})
             logger.info(f"撤单 ordId={ord_id}")
         except Exception as e:
+            if _is_benign_cancel_error(e):
+                logger.info(f"撤单跳过，订单可能已成交/已撤/不存在 ordId={ord_id}: {e}")
+                return
             logger.warning(f"撤单失败(可能已成交/不存在): {e}")
 
     async def place_algo_order(self, inst_id: str, side: str, pos_side: str, sz: str,
@@ -213,6 +234,9 @@ class OKXClient:
             await self._post("/api/v5/trade/cancel-algos", [{"instId": inst_id, "algoId": algo_id}])
             logger.info(f"撤销条件单 algoId={algo_id}")
         except Exception as e:
+            if _is_benign_cancel_error(e):
+                logger.info(f"撤条件单跳过，订单可能已触发/已撤/不存在 algoId={algo_id}: {e}")
+                return
             logger.warning(f"撤条件单失败: {e}")
 
     async def close_position(self, inst_id: str, pos_side: str) -> dict:

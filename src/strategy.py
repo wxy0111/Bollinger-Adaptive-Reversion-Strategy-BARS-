@@ -133,6 +133,7 @@ class BollPinStrategy:
 
     def _state_payload(self) -> dict:
         """Build the runtime-state payload persisted to disk."""
+        self._sanitize_runtime_state()
         return {
             "version": 1,
             "inst_id": INST_ID,
@@ -192,6 +193,15 @@ class BollPinStrategy:
         except Exception as e:
             logger.warning(f"清理本地策略状态失败: {e}")
 
+    def _sanitize_runtime_state(self):
+        """Drop impossible local position residue before persisting or using it."""
+        has_position = self._state.total_sz > 0
+        has_batch = bool(self._state.batches)
+        if self._state.direction in ("long", "short") and not has_position and not has_batch:
+            logger.info("本地策略状态只有方向、没有持仓或批次，已自动清理残留方向")
+            self._reset_probe_state()
+            self._state.reset()
+
     def _load_runtime_state(self):
         """Load local strategy state from disk when available."""
         if not STATE_FILE.exists():
@@ -237,6 +247,7 @@ class BollPinStrategy:
             self._last_inside_band_kline_ts = self._str_to_ts(strategy.get("last_inside_band_kline_ts"))
             self._sizing_equity = float(strategy.get("sizing_equity", 0) or 0)
             self._fixed_batch_sizes = [float(x) for x in strategy.get("fixed_batch_sizes", [])]
+            self._sanitize_runtime_state()
             self._restored_from_file = True
             logger.info(
                 f"已读取本地策略状态: 方向={self._state.direction} "
@@ -447,6 +458,29 @@ class BollPinStrategy:
             self._save_runtime_state()
         return True
 
+    async def _cancel_pending_if_width_too_narrow(self, client: OKXClient, last, mark_price: float) -> bool:
+        """Cancel a pending entry immediately when Bollinger width is too narrow."""
+        pending_batch = self._state.pending_batch()
+        if pending_batch is None:
+            return False
+        if self._boll_width_ok(last, mark_price):
+            return False
+
+        logger.info(f"布林带宽度低于阈值，撤销第{pending_batch.batch_idx+1}批未成交挂单")
+        await self._cancel_entry_orders(client)
+        self._inside_band_kline_count = 0
+        self._last_inside_band_kline_ts = None
+        if not self._state.is_active():
+            self._last_plan_kline_ts = None
+            self._last_batch_kline_ts = None
+            self._last_plan_entry_price = 0.0
+            self._reset_probe_state()
+            self._state.reset()
+            self._clear_runtime_state()
+        else:
+            self._save_runtime_state()
+        return True
+
     def _still_making_new_low(self) -> bool:
         """Return whether recent mark prices are still making new lows."""
         if len(self._recent_prices) < NO_NEW_EXTREME_TICKS + 1:
@@ -485,6 +519,8 @@ class BollPinStrategy:
 
         pending_batch = self._state.pending_batch()
         if pending_batch is not None:
+            if await self._cancel_pending_if_width_too_narrow(client, last, mark_price):
+                return
             if await self._cancel_pending_if_inside_too_long(client, last, mark_price):
                 return
             await self._maybe_reprice_pending_batch(client, df, last, equity, mark_price, pending_batch)
@@ -634,6 +670,9 @@ class BollPinStrategy:
         """Reprice an unfilled first batch once per candle when price moves."""
         pending_batch = self._state.pending_batch()
         if pending_batch is None or pending_batch.batch_idx != 0:
+            return
+
+        if await self._cancel_pending_if_width_too_narrow(client, last, mark_price):
             return
 
         kline_ts = last["ts"]
