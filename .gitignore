@@ -4,3 +4,8 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.idea/
+*.zip
+ETH_USDT_15m_history.csv
+backtest/results/
+backtest/results_current_check/

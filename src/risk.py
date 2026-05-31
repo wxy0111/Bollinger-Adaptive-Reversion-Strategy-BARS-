@@ -1,55 +1,90 @@
+"""Risk and batch-plan helpers.
+
+This module builds the theoretical batch-entry plan used by the live strategy.
+The current implementation estimates liquidation price and take-profit price,
+but it does not yet enforce reserved controls such as liquidation buffer or
+maximum total margin.
 """
-风控模块：
-  - 分批建仓计划生成
-  - 强平价预估（50x 全仓）
-  - 开仓前安全验证
-"""
-import math
 from dataclasses import dataclass
-from typing import List, Optional
+from decimal import Decimal, ROUND_DOWN
+from typing import List
 from loguru import logger
 
 from src.config import (
-    CT_VAL, LEVER, MGN_MODE,
-    BATCH_COUNT, BATCH_SIZE_RATIO, BATCH_SPACING,
-    SL_BEYOND_MULT, BOLL_STD,
-    LIQ_BUFFER, MAX_TOTAL_MARGIN,
+    CT_VAL, LEVER,
+    BATCH_COUNT, BATCH_SIZE_RATIO, BATCH_SPACING, STRATEGY_EQUITY_CAP_USDT,
+    MIN_ORDER_CONTRACTS, CONTRACT_STEP,
     TP_PROFIT_USD,
 )
 
 
 @dataclass
 class BatchOrder:
-    batch_idx: int          # 第几批 (0-based)
-    price: float            # 限价挂单价格
-    sz: int                 # 张数
-    notional: float         # 名义价值 USDT
-    margin: float           # 占用保证金 USDT
+    """One planned entry batch.
+
+    Attributes:
+        batch_idx: Zero-based batch index.
+        price: Limit order price.
+        sz: Order size in contracts.
+        notional: Notional value in USDT.
+        margin: Estimated margin usage in USDT.
+    """
+
+    batch_idx: int
+    price: float
+    sz: float
+    notional: float
+    margin: float
 
 
 @dataclass
 class BatchPlan:
-    direction: str          # "long" | "short"
+    """A generated batch-entry plan.
+
+    Attributes:
+        direction: Position side, either ``"long"`` or ``"short"``.
+        orders: Batch orders included in the plan.
+        avg_entry: Weighted average entry if all plan orders fill.
+        liq_price: Simplified estimated liquidation price.
+        sl_price: Display stop price. Currently equal to ``liq_price``.
+        tp_price: Take-profit price based on average entry.
+        total_margin: Estimated total margin in USDT.
+        safe: Whether the plan passed current checks.
+    """
+
+    direction: str
     orders: List[BatchOrder]
-    avg_entry: float        # 全部批次加权均价
-    liq_price: float        # 估算强平价
-    sl_price: float         # 止损价（布林外 SL_BEYOND_MULT 倍标准差）
-    tp_price: float         # 止盈价（布林中轨）
-    total_margin: float     # 合计保证金
-    safe: bool              # 是否通过风控
+    avg_entry: float
+    liq_price: float
+    sl_price: float
+    tp_price: float
+    total_margin: float
+    safe: bool
+
+
+def _floor_to_step(value: float, step: float) -> float:
+    """Round a numeric value down to the exchange step size."""
+    value_dec = Decimal(str(value))
+    step_dec = Decimal(str(step))
+    return float((value_dec / step_dec).to_integral_value(rounding=ROUND_DOWN) * step_dec)
 
 
 def _liq_price_estimate(
     direction: str,
     avg_entry: float,
-    total_sz: int,
+    total_sz: float,
     total_margin: float,
 ) -> float:
-    """
-    全仓模式强平价简化估算。
-    多头：liq ≈ avg_entry - (total_margin * 0.9) / (total_sz * CT_VAL)
-    空头：liq ≈ avg_entry + (total_margin * 0.9) / (total_sz * CT_VAL)
-    0.9 是因为全仓维持保证金约占10%。
+    """Estimate liquidation price with a simplified cross-margin formula.
+
+    Args:
+        direction: Position side, either ``"long"`` or ``"short"``.
+        avg_entry: Weighted average entry price.
+        total_sz: Total position size in contracts.
+        total_margin: Estimated margin allocated to the position.
+
+    Returns:
+        Estimated liquidation price. Returns 0 when ``total_sz`` is 0.
     """
     if total_sz == 0:
         return 0.0
@@ -69,19 +104,36 @@ def build_batch_plan(
     boll_upper: float,
     boll_std: float,        # 当前布林带标准差值
     equity: float,
+    max_batch_idx: int | None = None,
+    fixed_batch_sizes: list[float] | None = None,
 ) -> BatchPlan:
-    """
-    生成分批建仓计划：
-      - 做多：批次价格依次往下，间距为 boll_width * BATCH_SPACING[i]
-      - 做空：批次价格依次往上
+    """Build a batch-entry plan for a new or next batch.
+
+    Args:
+        direction: Position side, either ``"long"`` or ``"short"``.
+        first_price: Reference price for the first batch.
+        boll_width: Current Bollinger-band width.
+        boll_mid: Current Bollinger middle band. Kept for future checks.
+        boll_lower: Current Bollinger lower band. Kept for future checks.
+        boll_upper: Current Bollinger upper band. Kept for future checks.
+        boll_std: Current Bollinger standard deviation. Kept for future checks.
+        equity: Available account balance used for sizing when no fixed sizes
+            are provided.
+        max_batch_idx: Optional maximum batch index to include.
+        fixed_batch_sizes: Optional fixed contract sizes calculated at runtime.
+
+    Returns:
+        A ``BatchPlan``. ``safe`` is false only when no valid orders are built.
     """
     orders: List[BatchOrder] = []
     total_notional = 0.0
     total_margin   = 0.0
-    total_sz       = 0
+    total_sz       = 0.0
     weighted_sum   = 0.0
+    effective_equity = min(equity, STRATEGY_EQUITY_CAP_USDT) if STRATEGY_EQUITY_CAP_USDT > 0 else equity
 
-    for i in range(BATCH_COUNT):
+    batch_count = BATCH_COUNT if max_batch_idx is None else min(BATCH_COUNT, max_batch_idx + 1)
+    for i in range(batch_count):
         spacing = boll_width * BATCH_SPACING[i]
         if direction == "long":
             price = first_price - spacing
@@ -92,14 +144,16 @@ def build_batch_plan(
         if price <= 0:
             break
 
-        # 该批次保证金额度
-        margin_budget = equity * BATCH_SIZE_RATIO[i]
-        # 该批次最大名义价值
-        notional_budget = margin_budget * LEVER
-        # 张数
-        sz = math.floor(notional_budget / (price * CT_VAL))
-        if sz < 1:
-            logger.warning(f"第{i+1}批张数不足1，跳过")
+        if fixed_batch_sizes is not None:
+            sz = fixed_batch_sizes[i] if i < len(fixed_batch_sizes) else 0.0
+        else:
+            # Size by configured margin allocation, then round to exchange step.
+            margin_budget = effective_equity * BATCH_SIZE_RATIO[i]
+            notional_budget = margin_budget * LEVER
+            raw_sz = notional_budget / (price * CT_VAL)
+            sz = _floor_to_step(raw_sz, CONTRACT_STEP)
+        if sz < MIN_ORDER_CONTRACTS:
+            logger.warning(f"第{i+1}批张数不足{MIN_ORDER_CONTRACTS}，跳过")
             continue
 
         notional = sz * CT_VAL * price
@@ -126,48 +180,27 @@ def build_batch_plan(
     avg_entry = weighted_sum / total_sz
     liq_price = _liq_price_estimate(direction, avg_entry, total_sz, total_margin)
 
-    # 止盈：均价 ± 10 USDT（多头加，空头减）
-    # 此处先用首批价格做占位，实际止盈在每次批次成交后由 strategy 动态更新
+    # The live strategy recalculates take profit from the exchange average
+    # entry after each fill. This value is a plan-time placeholder.
     if direction == "long":
         tp_price = round(avg_entry + TP_PROFIT_USD, 2)
     else:
         tp_price = round(avg_entry - TP_PROFIT_USD, 2)
-
-    # ── 安全校验 ──────────────────────────────────────────────
-    safe = True
-
-    # 1. 强平价必须距最远批次价格有 LIQ_BUFFER 安全垫（这是唯一止损防线）
-    farthest_price = orders[-1].price
-    if direction == "long":
-        liq_buffer_ok = (farthest_price - liq_price) / farthest_price >= LIQ_BUFFER
-    else:
-        liq_buffer_ok = (liq_price - farthest_price) / farthest_price >= LIQ_BUFFER
-
-    if not liq_buffer_ok:
-        logger.warning(
-            f"强平价过近！估算强平价={liq_price:.2f}  最远批次={farthest_price:.2f}"
-            f"  安全垫不足 {LIQ_BUFFER:.0%}，放弃信号"
-        )
-        safe = False
-
-    # 2. 保证金总量不超过账户权益上限
-    if total_margin / equity > MAX_TOTAL_MARGIN:
-        logger.warning(f"保证金占用 {total_margin/equity:.1%} 超过上限 {MAX_TOTAL_MARGIN:.0%}")
-        safe = False
 
     return BatchPlan(
         direction=direction,
         orders=orders,
         avg_entry=round(avg_entry, 2),
         liq_price=round(liq_price, 2),
-        sl_price=round(liq_price, 2),   # sl_price 即强平价，仅用于日志展示
+        sl_price=round(liq_price, 2),
         tp_price=tp_price,
         total_margin=round(total_margin, 2),
-        safe=safe,
+        safe=True,
     )
 
 
 def check_drawdown(current_equity: float, peak_equity: float, max_dd: float) -> bool:
+    """Return whether the account drawdown has reached the configured limit."""
     if peak_equity <= 0:
         return False
     dd = (peak_equity - current_equity) / peak_equity

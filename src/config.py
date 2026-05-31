@@ -1,59 +1,112 @@
+"""Runtime configuration for the OKX Bollinger mean-reversion strategy.
+
+The live strategy currently uses 15-minute Bollinger-band breakouts on
+``ETH-USDT-SWAP``. Parameters that are kept for experiments but are not wired
+into the live strategy are commented out in the "Reserved" sections.
+"""
+
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── API 凭证 ────────────────────────────────────────────────
-API_KEY    = os.getenv("OKX_API_KEY", "")
+
+# API credentials.
+API_KEY = os.getenv("OKX_API_KEY", "")
 SECRET_KEY = os.getenv("OKX_SECRET_KEY", "")
 PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
-FLAG       = os.getenv("OKX_FLAG", "1")   # 1=模拟盘 0=实盘
+FLAG = os.getenv("OKX_FLAG", "1")  # 1=demo trading, 0=live trading.
 
-# ── 合约基本参数 ─────────────────────────────────────────────
-INST_ID    = "ETH-USDT-SWAP"
-CT_VAL     = 0.01          # 每张面值 0.01 ETH
-BAR_15M    = "15m"         # 主策略周期
-BAR_1W     = "1W"          # 周线过滤周期
-LEVER      = 50            # 杠杆倍数
-MGN_MODE   = "cross"       # 全仓
 
-# ── 布林带参数 ───────────────────────────────────────────────
-BOLL_PERIOD = 20           # 布林带均线周期
-BOLL_STD    = 2.0          # 标准差倍数
-KLINE_LIMIT = 300          # 拉取K线数量
+# Instrument settings.
+INST_ID = "ETH-USDT-SWAP"
+CT_VAL = 0.1  # Contract value: 1 contract = 0.1 ETH.
+BAR_15M = "15m"
+LEVER = 50
 
-# ── 插针判定 ─────────────────────────────────────────────────
-# 影线穿越布林带的最小比例（影线长度 / K线总高度）
-PIN_WICK_RATIO   = 0.4     # 影线占整根K线至少40%
-# 实体必须回到布林带内部（实体收盘在带内）
-PIN_BODY_INSIDE  = True
+# Reserved: not used by the current live strategy.
+# BAR_1W = "1W"
+# MGN_MODE = "cross"
 
-# ── 分批加仓参数 ─────────────────────────────────────────────
-BATCH_COUNT      = 5       # 最多开仓批次
-BATCH_SIZE_RATIO = [0.10, 0.15, 0.20, 0.25, 0.30]  # 各批次占总权益比例
-# 第N批相对首批入场价的间距（以布林带宽度为单位）
-BATCH_SPACING    = [0.0, 0.3, 0.6, 1.0, 1.5]
 
-# ── 止盈 / 止损 ──────────────────────────────────────────────
-TP_PROFIT_USD    = 10.0    # 均价上涨/下跌 10 USDT 即止盈平仓
-SL_BEYOND_MULT   = 2.5     # 止损在布林带外 N倍标准差处（防止行情极端延伸）
+# Bollinger-band settings.
+BOLL_PERIOD = 20
+BOLL_STD = 2.0
+BOLL_INCLUDE_CURRENT = True
+KLINE_LIMIT = 300
+MIN_BOLL_WIDTH_USD = 15
+MIN_BOLL_WIDTH_PCT = 0.006
 
-# ── 风控 ─────────────────────────────────────────────────────
-# 强平缓冲：要求强平价与最远批次入场价之间保留至少 X% 空间
-LIQ_BUFFER       = 0.05    # 5% 安全垫
-MAX_TOTAL_MARGIN = 0.60    # 所有批次合计保证金不超过账户权益 60%
-MAX_DRAWDOWN     = 0.60    # 账户最大回撤 60% 停机
+# Reserved: these breakout-quality filters are not wired into the current live
+# signal path. The live signal only checks whether mark price is outside the
+# Bollinger band, plus width and no-new-extreme filters.
+# MIN_BREAK_USD = 1
+# MIN_BREAK_ATR_MULT = 0.15
+# MIN_REBOUND_RATIO = 0.25
 
-# ── 周线趋势过滤 ─────────────────────────────────────────────
-WEEKLY_EMA_PERIOD = 10     # 周线 EMA 判断大趋势
-# "bull" 只做多插针  "bear" 只做空插针  "both" 双向
-# 由程序根据周线自动判断，此参数是fallback
-WEEKLY_FALLBACK  = "both"
+NO_NEW_EXTREME_TICKS = 2
+REPRICE_GAP_USD = 1.0
+INSIDE_BAND_CANCEL_KLINES = 2
 
-# ── 运行 ─────────────────────────────────────────────────────
-POLL_INTERVAL    = 30      # 主循环间隔（秒）
+# Reserved: first-batch time-based expiry is disabled. Entry orders are now
+# maintained by candle updates and price thresholds instead of a wall-clock TTL.
+# PROBE_ORDER_TTL_SEC = 45
 
-# ── 通知 ─────────────────────────────────────────────────────
-SERVERCHAN_KEY   = os.getenv("SERVERCHAN_KEY", "")
-WEB_HOST         = "0.0.0.0"
-WEB_PORT         = 8080
+
+# Pin-bar utilities.
+#
+# These are used by ``src.indicators.detect_pin`` only. The current live
+# strategy does not call that function.
+PIN_WICK_RATIO = 0.4
+PIN_BODY_INSIDE = True
+
+
+# Batch-entry settings.
+BATCH_COUNT = 4
+BATCH_SIZE_RATIO = [0.2, 0.25, 0.25, 0.25]
+STRATEGY_EQUITY_CAP_USDT = 0.0
+MIN_ORDER_CONTRACTS = 0.01
+CONTRACT_STEP = 0.01
+BATCH_SPACING = [0.0, 0.2, 0.4, 0.6]
+
+
+# Exit settings.
+TP_PROFIT_USD = 10.0
+LIQ_STOP_OFFSET_USD = 0.1
+MIN_ENTRY_GAP_USD = 4.0
+
+# Reserved: these planned risk controls are not wired into
+# ``src.risk.build_batch_plan`` yet.
+# SL_BEYOND_MULT = 2.5
+# LIQ_BUFFER = 0.012
+# MAX_TOTAL_MARGIN = 1.0
+
+MAX_DRAWDOWN = 1.0
+
+
+# Weekly-trend utilities.
+#
+# ``WEEKLY_EMA_PERIOD`` is used by ``src.indicators.weekly_trend`` only. The
+# current live strategy does not call that function.
+WEEKLY_EMA_PERIOD = 10
+
+# Reserved: not used by the current live strategy.
+# WEEKLY_FALLBACK = "both"
+
+
+# Capital management.
+#
+# After every closed position, the strategy tries to keep the trading account
+# at this available USDT balance by transferring profit to the funding account
+# or topping up losses from it. Set to 0 to disable rebalancing.
+TRADING_ACCOUNT_TARGET = 100.0
+
+
+# Runtime settings.
+POLL_INTERVAL = 3
+
+
+# Notification and dashboard settings.
+SERVERCHAN_KEY = os.getenv("SERVERCHAN_KEY", "")
+WEB_HOST = "0.0.0.0"
+WEB_PORT = 8080

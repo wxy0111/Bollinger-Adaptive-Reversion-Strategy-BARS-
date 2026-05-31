@@ -1,7 +1,7 @@
-"""
-本地网页看板。
-访问 http://localhost:8080 查看实时状态。
-数据通过共享的 DashboardState 对象在策略主循环中更新。
+"""Local aiohttp dashboard for strategy state.
+
+The strategy updates the module-level ``state`` object on every tick. The web
+server exposes a simple HTML page and a JSON endpoint for that state.
 """
 import asyncio
 import json
@@ -16,15 +16,19 @@ from src.config import WEB_HOST, WEB_PORT
 
 @dataclass
 class TradeRecord:
+    """One dashboard trade-history row."""
+
     time: str
     action: str       # "开多" | "开空" | "平仓"
     price: float
-    sz: int
+    sz: float
     pnl: float = 0.0
 
 
 @dataclass
 class DashboardState:
+    """Mutable state displayed by the local dashboard."""
+
     # 行情
     mark_price: float = 0.0
     boll_lower: float = 0.0
@@ -38,7 +42,7 @@ class DashboardState:
     # 持仓
     direction:  str   = "none"
     avg_entry:  float = 0.0
-    total_sz:   int   = 0
+    total_sz:   float = 0.0
     tp_price:   float = 0.0
     liq_price:  float = 0.0
     unrealized_pnl: float = 0.0
@@ -56,9 +60,11 @@ class DashboardState:
     updated_at: str = ""
 
     def update_time(self):
+        """Refresh the dashboard update timestamp."""
         self.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    def add_trade(self, action: str, price: float, sz: int, pnl: float = 0.0):
+    def add_trade(self, action: str, price: float, sz: float, pnl: float = 0.0):
+        """Add one trade row to the dashboard history."""
         record = {
             "time": datetime.now().strftime("%H:%M:%S"),
             "action": action,
@@ -264,16 +270,19 @@ setInterval(refresh, 5000);
 
 
 async def _handle_index(request):
+    """Return the dashboard HTML page."""
     return web.Response(text=_HTML, content_type="text/html")
 
 
 async def _handle_state(request):
+    """Return the current dashboard state as JSON."""
     data = asdict(state)
     return web.Response(text=json.dumps(data, ensure_ascii=False),
                         content_type="application/json")
 
 
 async def start_dashboard():
+    """Start the dashboard server in the current event loop."""
     app = web.Application()
     app.router.add_get("/", _handle_index)
     app.router.add_get("/api/state", _handle_state)

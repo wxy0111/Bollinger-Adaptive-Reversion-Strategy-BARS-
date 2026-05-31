@@ -1,6 +1,10 @@
-"""布林带计算、插针检测、周线趋势分析。"""
+"""Indicator helpers used by backtests and strategy experiments.
+
+Only ``build_df`` and ``add_boll`` are used by the current live strategy.
+``detect_pin`` and ``weekly_trend`` are kept for experiments and are not wired
+into the live entry path.
+"""
 import pandas as pd
-import numpy as np
 from dataclasses import dataclass
 from typing import Optional
 
@@ -11,24 +15,39 @@ from src.config import (
 )
 
 
-# ── DataFrame 构建 ─────────────────────────────────────────────────────────
+def build_df(raw_klines: list, include_unconfirmed: bool = False) -> pd.DataFrame:
+    """Convert OKX raw candles to an oldest-first DataFrame.
 
-def build_df(raw_klines: list) -> pd.DataFrame:
-    """OKX 原始K线 → DataFrame，oldest-first，只含已确认K线。"""
+    Args:
+        raw_klines: Raw OKX candle rows.
+        include_unconfirmed: Whether to keep the current unconfirmed candle.
+
+    Returns:
+        A typed DataFrame sorted oldest-first.
+    """
     df = pd.DataFrame(raw_klines, columns=[
         "ts", "open", "high", "low", "close",
         "vol", "volCcy", "volCcyQuote", "confirm"
     ])
-    df = df[df["confirm"] == "1"].iloc[::-1].reset_index(drop=True)
+    if not include_unconfirmed:
+        df = df[df["confirm"] == "1"]
+    df = df.iloc[::-1].reset_index(drop=True)
     for col in ("open", "high", "low", "close", "vol"):
         df[col] = df[col].astype(float)
     df["ts"] = pd.to_datetime(df["ts"].astype(int), unit="ms")
     return df
 
 
-# ── 布林带 ────────────────────────────────────────────────────────────────
-
 def add_boll(df: pd.DataFrame) -> pd.DataFrame:
+    """Add Bollinger-band columns to a candle DataFrame.
+
+    Args:
+        df: Candle DataFrame with a ``close`` column.
+
+    Returns:
+        DataFrame with Bollinger columns and rows without a valid middle band
+        removed.
+    """
     close = df["close"]
     df["boll_mid"]   = close.rolling(BOLL_PERIOD).mean()
     rolling_std      = close.rolling(BOLL_PERIOD).std(ddof=0)
@@ -38,32 +57,38 @@ def add_boll(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna(subset=["boll_mid"]).reset_index(drop=True)
 
 
-# ── 插针信号 ──────────────────────────────────────────────────────────────
-
 @dataclass
 class PinSignal:
-    direction: str          # "long" | "short"
-    entry_price: float      # 首批参考入场价（K线收盘）
+    """Pin-bar signal description.
+
+    Attributes:
+        direction: Signal side, either ``"long"`` or ``"short"``.
+        entry_price: Reference entry price, usually candle close.
+        boll_mid: Bollinger middle band.
+        boll_upper: Bollinger upper band.
+        boll_lower: Bollinger lower band.
+        boll_width: Bollinger width.
+        atr_approx: Approximate ATR from recent high-low ranges.
+    """
+
+    direction: str
+    entry_price: float
     boll_mid: float
     boll_upper: float
     boll_lower: float
     boll_width: float
-    atr_approx: float       # 近20根K线真实波幅均值，用于止损估算
+    atr_approx: float
 
 
 def detect_pin(df: pd.DataFrame) -> Optional[PinSignal]:
-    """
-    检测最新已确认K线是否为插针信号。
+    """Detect whether the latest confirmed candle is a pin-bar signal.
 
-    做多插针（下影线）：
-      - 下影线穿过布林下轨
-      - 实体（open/close）收回布林下轨以上
-      - 下影线长度占K线总幅度 >= PIN_WICK_RATIO
+    Args:
+        df: Candle DataFrame with Bollinger columns.
 
-    做空插针（上影线）：
-      - 上影线穿过布林上轨
-      - 实体（open/close）收回布林上轨以下
-      - 上影线长度占K线总幅度 >= PIN_WICK_RATIO
+    Returns:
+        ``PinSignal`` when the latest candle matches a long or short pin-bar
+        pattern; otherwise ``None``.
     """
     if len(df) < BOLL_PERIOD + 5:
         return None
@@ -81,14 +106,13 @@ def detect_pin(df: pd.DataFrame) -> Optional[PinSignal]:
     upper_wick  = h - body_top
     lower_wick  = body_bottom - l
 
-    # 近20根ATR近似
+    # Approximate ATR from recent candle ranges.
     atr = float(df["high"].tail(20).values - df["low"].tail(20).values) if False else \
           float((df["high"] - df["low"]).tail(20).mean())
 
-    # 做多插针：下影线穿下轨，实体收回带内
-    if (l < lower                                       # 低点穿越下轨
-            and lower_wick / total_range >= PIN_WICK_RATIO   # 下影线足够长
-            and (not PIN_BODY_INSIDE or body_bottom >= lower)):  # 实体回到带内
+    if (l < lower
+            and lower_wick / total_range >= PIN_WICK_RATIO
+            and (not PIN_BODY_INSIDE or body_bottom >= lower)):
         return PinSignal(
             direction="long",
             entry_price=c,
@@ -96,7 +120,6 @@ def detect_pin(df: pd.DataFrame) -> Optional[PinSignal]:
             atr_approx=atr,
         )
 
-    # 做空插针：上影线穿上轨，实体收回带内
     if (h > upper
             and upper_wick / total_range >= PIN_WICK_RATIO
             and (not PIN_BODY_INSIDE or body_top <= upper)):
@@ -110,15 +133,14 @@ def detect_pin(df: pd.DataFrame) -> Optional[PinSignal]:
     return None
 
 
-# ── 周线趋势分析 ───────────────────────────────────────────────────────────
-
 def weekly_trend(raw_weekly: list) -> str:
-    """
-    返回 'bull' | 'bear' | 'sideways'
-    逻辑：
-      - 取近 WEEKLY_EMA_PERIOD 根周线
-      - 计算 EMA，若最新收盘 > EMA → bull，< EMA → bear，否则 sideways
-      - 另外判断最近2根周线是否同向，增强过滤
+    """Estimate weekly trend from raw weekly candles.
+
+    Args:
+        raw_weekly: Raw OKX weekly candle rows.
+
+    Returns:
+        ``"bull"``, ``"bear"``, or ``"sideways"``.
     """
     if not raw_weekly or len(raw_weekly) < WEEKLY_EMA_PERIOD + 2:
         return "sideways"
@@ -132,10 +154,7 @@ def weekly_trend(raw_weekly: list) -> str:
     last_close = closes.iloc[-1]
     last_ema   = ema.iloc[-1]
 
-    # 最近2周涨跌方向
-    recent_dir = closes.iloc[-1] - closes.iloc[-3]   # 近2周净变化
-
-    slope = ema.iloc[-1] - ema.iloc[-4]              # EMA 斜率（近3周）
+    slope = ema.iloc[-1] - ema.iloc[-4]
 
     if last_close > last_ema and slope > 0:
         return "bull"

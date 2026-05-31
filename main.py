@@ -1,4 +1,8 @@
-"""入口：同时启动网页看板和交易策略。"""
+"""Application entry point.
+
+Starts the local dashboard first, then runs the live Bollinger mean-reversion
+strategy until interrupted.
+"""
 import asyncio
 import sys
 from loguru import logger
@@ -22,6 +26,7 @@ logger.add(
 
 
 async def main():
+    """Run dashboard and trading strategy."""
     await start_dashboard()          # 先启动看板
     strategy = BollPinStrategy()
     try:
