@@ -132,9 +132,10 @@ def build_batch_plan(
     weighted_sum   = 0.0
     effective_equity = min(equity, STRATEGY_EQUITY_CAP_USDT) if STRATEGY_EQUITY_CAP_USDT > 0 else equity
 
-    batch_count = BATCH_COUNT if max_batch_idx is None else min(BATCH_COUNT, max_batch_idx + 1)
+    batch_count = BATCH_COUNT if max_batch_idx is None else max_batch_idx + 1
     for i in range(batch_count):
-        spacing = boll_width * BATCH_SPACING[i]
+        spacing_ratio = BATCH_SPACING[i] if i < len(BATCH_SPACING) else 0.0
+        spacing = boll_width * spacing_ratio
         if direction == "long":
             price = first_price - spacing
         else:
@@ -148,7 +149,8 @@ def build_batch_plan(
             sz = fixed_batch_sizes[i] if i < len(fixed_batch_sizes) else 0.0
         else:
             # Size by configured margin allocation, then round to exchange step.
-            margin_budget = effective_equity * BATCH_SIZE_RATIO[i]
+            ratio = BATCH_SIZE_RATIO[i] if i < len(BATCH_SIZE_RATIO) else BATCH_SIZE_RATIO[-1]
+            margin_budget = effective_equity * ratio
             notional_budget = margin_budget * LEVER
             raw_sz = notional_budget / (price * CT_VAL)
             sz = _floor_to_step(raw_sz, CONTRACT_STEP)

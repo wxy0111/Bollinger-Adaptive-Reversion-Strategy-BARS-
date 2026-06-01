@@ -31,7 +31,7 @@ LEVER = 50
 
 # Bollinger-band settings.
 BOLL_PERIOD = 20
-BOLL_STD = 2.0
+BOLL_STD = 2
 BOLL_INCLUDE_CURRENT = True
 KLINE_LIMIT = 300
 MIN_BOLL_WIDTH_USD = 15
@@ -45,7 +45,7 @@ MIN_BOLL_WIDTH_PCT = 0.006
 # MIN_REBOUND_RATIO = 0.25
 
 NO_NEW_EXTREME_TICKS = 2
-REPRICE_GAP_USD = 1.0
+REPRICE_GAP_USD = 0.5
 INSIDE_BAND_CANCEL_KLINES = 2
 
 # Reserved: first-batch time-based expiry is disabled. Entry orders are now
@@ -62,8 +62,18 @@ PIN_BODY_INSIDE = True
 
 
 # Batch-entry settings.
+MAX_ENTRY_BATCHES = 12
+MAX_TOTAL_ENTRY_RATIO = 0.8
+FIRST_BATCH_RATIO = 0.15
+SECOND_BATCH_RATIO = 0.15
+DYNAMIC_BASE_ENTRY_RATIO = 0.1
+DYNAMIC_MIN_ENTRY_RATIO = 0.05
+DYNAMIC_MAX_ENTRY_RATIO = 0.15
+
+# Reserved: legacy fixed-batch optimizer/backtest settings. The live strategy
+# now uses the dynamic entry ratios above instead of this fixed ratio list.
 BATCH_COUNT = 4
-BATCH_SIZE_RATIO = [0.2, 0.25, 0.25, 0.25]
+BATCH_SIZE_RATIO = [0.2, 0.2, 0.2, 0.2]
 STRATEGY_EQUITY_CAP_USDT = 0.0
 MIN_ORDER_CONTRACTS = 0.01
 CONTRACT_STEP = 0.01
@@ -73,7 +83,9 @@ BATCH_SPACING = [0.0, 0.2, 0.4, 0.6]
 # Exit settings.
 TP_PROFIT_USD = 10.0
 LIQ_STOP_OFFSET_USD = 0.1
-MIN_ENTRY_GAP_USD = 4.0
+LIQ_WARNING_DISTANCE_USD = 10.0
+LIQ_WARNING_REPEAT_SEC = 3600
+MIN_ENTRY_GAP_USD = 3
 
 # Reserved: these planned risk controls are not wired into
 # ``src.risk.build_batch_plan`` yet.
@@ -103,6 +115,7 @@ TRADING_ACCOUNT_TARGET = 200.0
 
 
 # Runtime settings.
+PRICE_LOG_INTERVAL = 1
 POLL_INTERVAL = 3
 
 

@@ -36,6 +36,30 @@ async def notify_entry_order(direction: str, price: float, sz: float,
     await wx_push(title, content)
 
 
+async def notify_capital_shortage(trading_balance: float, target: float, funding_balance: float, top_up: float):
+    """Notify that the funding account cannot fully restore trading capital."""
+    title = "ETH 资金不足提醒"
+    content = (
+        f"**交易账户可用**：{trading_balance:.2f} USDT\n\n"
+        f"**目标额度**：{target:.2f} USDT\n\n"
+        f"**资金账户可用**：{funding_balance:.2f} USDT\n\n"
+        f"**本次补充**：{top_up:.2f} USDT\n\n"
+        "资金账户不足以补满目标额度，策略会按当前可用额度继续运行。"
+    )
+    await wx_push(title, content)
+
+
+async def notify_capital_restored(trading_balance: float, target: float):
+    """Notify that trading capital has recovered to the configured target."""
+    title = "ETH 资金已补足"
+    content = (
+        f"**交易账户可用**：{trading_balance:.2f} USDT\n\n"
+        f"**目标额度**：{target:.2f} USDT\n\n"
+        "交易账户可用额度已达到目标，策略继续按目标资金运行。"
+    )
+    await wx_push(title, content)
+
+
 async def notify_open(direction: str, avg_entry: float, sz: float,
                       tp: float, liq: float, batch: int, total: int):
     """Notify that an entry batch has filled."""
@@ -65,14 +89,21 @@ async def notify_close(direction: str, avg_entry: float, close_price: float,
     await wx_push(title, content)
 
 
-async def notify_liq_warning(direction: str, mark_price: float, liq_price: float, gap_pct: float):
+async def notify_liq_warning(
+    direction: str,
+    mark_price: float,
+    liq_price: float,
+    gap_pct: float,
+    gap_usd: float | None = None,
+):
     """Notify when mark price is close to liquidation price."""
-    title = f"⚠️ ETH 强平预警  距强平还剩 {gap_pct:.1f}%"
+    distance = f"{gap_usd:.2f} USDT / " if gap_usd is not None else ""
+    title = f"ETH liquidation warning: {distance}{gap_pct:.1f}% left"
     content = (
-        f"**方向**：{direction.upper()}\n\n"
-        f"**当前价**：{mark_price:.2f}\n\n"
-        f"**强平价**：{liq_price:.2f}\n\n"
-        f"**距离**：{gap_pct:.2f}%"
+        f"**Direction**: {direction.upper()}\n\n"
+        f"**Mark price**: {mark_price:.2f}\n\n"
+        f"**Liquidation price**: {liq_price:.2f}\n\n"
+        f"**Distance**: {distance}{gap_pct:.2f}%"
     )
     await wx_push(title, content)
 

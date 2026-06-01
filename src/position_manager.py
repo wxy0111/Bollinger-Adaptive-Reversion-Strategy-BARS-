@@ -104,15 +104,21 @@ class PositionState:
         """Remove a local batch by OKX order id."""
         self.batches = [b for b in self.batches if b.ord_id != ord_id]
 
-    def mark_filled(self, ord_id: str, sz: float):
-        """Mark a local batch as fully filled and add its size locally."""
+    def mark_filled(self, ord_id: str, sz: float, fill_price: Optional[float] = None):
+        """Mark a local batch as fully filled and add its real filled size."""
         for b in self.batches:
             if b.ord_id == ord_id:
                 if b.filled:
                     return
+                if fill_price and fill_price > 0:
+                    b.price = fill_price
+                b.sz = sz
                 b.filled = True
                 self.total_sz += sz
-                logger.info(f"第{b.batch_idx+1}批成交 sz={sz} 累计持仓={self.total_sz}张")
+                logger.info(
+                    f"第{b.batch_idx+1}批成交 price={b.price:.2f} "
+                    f"sz={sz} 累计持仓={self.total_sz}张"
+                )
                 return
 
     def update_position(self, sz: float, avg_entry: float, liq_price: float):

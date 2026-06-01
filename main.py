@@ -8,12 +8,15 @@ import sys
 from loguru import logger
 from src.strategy import BollPinStrategy
 from src.dashboard import start_dashboard
+from src.logging_utils import setup_log_levels
 
+setup_log_levels()
 logger.remove()
 logger.add(
     sys.stdout,
-    format="{time:HH:mm:ss} | {level:<8} | {message}",
-    level="INFO",
+    format="{time:HH:mm:ss} | <level>{level:<8}</level> | <level>{message}</level>",
+    level="DEBUG",
+    filter=lambda record: record["level"].name != "MARKET" or record["extra"].get("terminal", False),
     colorize=True,
 )
 logger.add(

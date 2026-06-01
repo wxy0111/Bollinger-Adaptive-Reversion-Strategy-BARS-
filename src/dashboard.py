@@ -14,12 +14,13 @@ from src.config import WEB_HOST, WEB_PORT
 
 LOG_DIR = Path("logs")
 TICK_RE = re.compile(
-    r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+).*?"
-    r"价格=(?P<price>\d+(?:\.\d+)?)\s+"
-    r"布林\[(?P<lower>\d+(?:\.\d+)?)\s+\|\s+"
-    r"(?P<mid>\d+(?:\.\d+)?)\s+\|\s+"
-    r"(?P<upper>\d+(?:\.\d+)?)\]\s+"
-    r"持仓=(?P<direction>\w+)\s+权益=(?P<equity>-?\d+(?:\.\d+)?)"
+    "^(?P<ts>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d+).*?"
+    "(?:price|\\u4ef7\\u683c)=(?P<price>\\d+(?:\\.\\d+)?)\\s+"
+    "(?:Boll|\\u5e03\\u6797)\\[(?P<lower>\\d+(?:\\.\\d+)?)\\s+\\|\\s+"
+    "(?P<mid>\\d+(?:\\.\\d+)?)\\s+\\|\\s+"
+    "(?P<upper>\\d+(?:\\.\\d+)?)\\]\\s+"
+    "(?:position|\\u6301\\u4ed3)=(?P<direction>\\w+)\\s+"
+    "(?:equity|\\u6743\\u76ca)=(?P<equity>-?\\d+(?:\\.\\d+)?)"
 )
 
 

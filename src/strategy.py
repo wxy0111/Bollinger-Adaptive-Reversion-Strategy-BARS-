@@ -7,6 +7,7 @@ the exchange average entry price and a liquidation-line stop order.
 """
 import asyncio
 import json
+import time
 import aiohttp
 import pandas as pd
 from pathlib import Path
@@ -15,21 +16,28 @@ from loguru import logger
 from src.config import (
     INST_ID, BAR_15M, LEVER, KLINE_LIMIT,
     BOLL_INCLUDE_CURRENT,
-    POLL_INTERVAL, MAX_DRAWDOWN, BOLL_PERIOD,
+    PRICE_LOG_INTERVAL, POLL_INTERVAL, MAX_DRAWDOWN, BOLL_PERIOD,
     TP_PROFIT_USD, MIN_ENTRY_GAP_USD,
     MIN_BOLL_WIDTH_USD, MIN_BOLL_WIDTH_PCT,
-    LIQ_STOP_OFFSET_USD,
+    LIQ_STOP_OFFSET_USD, LIQ_WARNING_DISTANCE_USD,
+    LIQ_WARNING_REPEAT_SEC,
     NO_NEW_EXTREME_TICKS,
-    BATCH_COUNT,
     REPRICE_GAP_USD, INSIDE_BAND_CANCEL_KLINES,
-    BATCH_SIZE_RATIO, STRATEGY_EQUITY_CAP_USDT, CT_VAL, CONTRACT_STEP,
+    STRATEGY_EQUITY_CAP_USDT, CT_VAL, CONTRACT_STEP,
     TRADING_ACCOUNT_TARGET,
+    MAX_ENTRY_BATCHES, MAX_TOTAL_ENTRY_RATIO,
+    FIRST_BATCH_RATIO, SECOND_BATCH_RATIO,
+    DYNAMIC_BASE_ENTRY_RATIO, DYNAMIC_MIN_ENTRY_RATIO, DYNAMIC_MAX_ENTRY_RATIO,
 )
 from src.okx_client import OKXClient
 from src.indicators import build_df, add_boll
 from src.risk import build_batch_plan, check_drawdown
 from src.position_manager import PositionState, OpenBatch
-from src.notify import notify_entry_order, notify_open, notify_close, notify_liq_warning, notify_drawdown
+from src.notify import (
+    notify_entry_order, notify_open, notify_close, notify_liq_warning,
+    notify_drawdown, notify_capital_shortage, notify_capital_restored,
+)
+from src.logging_utils import log_action, log_check, log_market
 import src.dashboard as dashboard
 
 
@@ -54,7 +62,6 @@ class BollPinStrategy:
         self._last_batch_kline_ts = None
         self._last_recovery_kline_ts = None
         self._last_entry_check_kline_ts = None
-        self._block_recovery_on_first_tick = False
         self._probe_kline_ts = None
         self._probe_direction = "none"
         self._probe_entry_price = 0.0
@@ -64,53 +71,196 @@ class BollPinStrategy:
         self._sizing_equity = 0.0
         self._fixed_batch_sizes = []
         self._restored_from_file = False
+        self._capital_shortage_active = False
+        self._last_liq_warning_ts = 0.0
+        self._last_liq_warning_gap_usd = None
 
     async def run(self):
         """Run the strategy loop until stopped."""
         self._running = True
-        logger.info("策略启动  {} 布林破轨均值回归 {}x", INST_ID, LEVER)
+        logger.info("Strategy started: {} Bollinger mean-reversion {}x", INST_ID, LEVER)
 
         async with aiohttp.ClientSession() as session:
             client = OKXClient(session)
             try:
                 await client.set_leverage(INST_ID, LEVER)
             except Exception as e:
-                logger.warning(f"设置杠杆失败（请在OKX App手动设置为{LEVER}x）: {e}")
+                logger.warning(f"Set leverage failed; please verify {LEVER}x in OKX App: {e}")
             self._load_runtime_state()
-            if not self._fixed_batch_sizes:
-                await self._init_fixed_batch_sizes(client)
-            else:
-                logger.info(
-                    f"使用本地保存的固定分批张数继续运行 计入资金={self._sizing_equity:.2f} "
-                    f"张数={self._fixed_batch_sizes}"
-                )
+            await self._ensure_fixed_batch_sizes(client)
             await self._sync_state(client)
 
+            last_strategy_tick = 0.0
             while self._running:
                 try:
-                    await self._tick(client)
+                    now = time.monotonic()
+                    if now - last_strategy_tick >= POLL_INTERVAL:
+                        await self._tick(client)
+                        last_strategy_tick = time.monotonic()
+                    else:
+                        await self._log_market_snapshot(client)
                 except Exception as e:
                     logger.exception(f"tick 异常: {e}")
-                await asyncio.sleep(POLL_INTERVAL)
+                await asyncio.sleep(PRICE_LOG_INTERVAL)
 
-    # ── 单次 tick ─────────────────────────────────────────────────────────
+    # ┢┢ 单次 tick ┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢
 
-    async def _init_fixed_batch_sizes(self, client: OKXClient):
-        """Calculate fixed batch sizes from current available trading balance."""
-        equity = await client.get_balance("USDT")
-        self._sizing_equity = min(equity, STRATEGY_EQUITY_CAP_USDT) if STRATEGY_EQUITY_CAP_USDT > 0 else equity
+    def _desired_sizing_equity(self, account_equity: float) -> float:
+        """Return the fixed equity base used to size strategy batches."""
+        if self._capital_shortage_active and TRADING_ACCOUNT_TARGET > 0:
+            base_equity = min(account_equity, TRADING_ACCOUNT_TARGET)
+        else:
+            base_equity = TRADING_ACCOUNT_TARGET if TRADING_ACCOUNT_TARGET > 0 else account_equity
+        if STRATEGY_EQUITY_CAP_USDT > 0:
+            return min(base_equity, STRATEGY_EQUITY_CAP_USDT)
+        return base_equity
+
+    def _floor_contract_size(self, raw_sz: float) -> float:
+        """Floor a raw contract size to the exchange contract step."""
+        step_count = int(raw_sz / CONTRACT_STEP)
+        return round(step_count * CONTRACT_STEP, 8)
+
+    def _set_fixed_batch_size(self, batch_idx: int, sz: float) -> None:
+        """Store a planned size for a batch index."""
+        while len(self._fixed_batch_sizes) <= batch_idx:
+            self._fixed_batch_sizes.append(0.0)
+        self._fixed_batch_sizes[batch_idx] = sz
+
+    def _used_entry_ratio(self, exclude_batch_idx: int | None = None) -> float:
+        """Estimate used entry margin ratio from filled and pending batches."""
+        if self._sizing_equity <= 0:
+            return 0.0
+        used_margin = 0.0
+        for batch in self._state.batches:
+            if exclude_batch_idx is not None and batch.batch_idx == exclude_batch_idx:
+                continue
+            if batch.sz <= 0 or batch.price <= 0:
+                continue
+            used_margin += batch.sz * CT_VAL * batch.price / LEVER
+        return used_margin / self._sizing_equity
+
+    def _dynamic_entry_ratio(self, batch_idx: int, candidate_price: float) -> float:
+        """Calculate the next entry margin ratio from recent price gaps."""
+        if batch_idx == 0:
+            return FIRST_BATCH_RATIO
+        if batch_idx == 1:
+            return SECOND_BATCH_RATIO
+
+        filled = sorted(self._state.filled_batches(), key=lambda batch: batch.batch_idx)
+        if len(filled) < 2:
+            dynamic_ratio = DYNAMIC_BASE_ENTRY_RATIO
+        else:
+            prev_batch = filled[-2]
+            last_batch = filled[-1]
+            prev_gap = abs(last_batch.price - prev_batch.price)
+            current_gap = abs(candidate_price - last_batch.price)
+            if prev_gap <= 0:
+                dynamic_ratio = DYNAMIC_BASE_ENTRY_RATIO
+            else:
+                dynamic_ratio = DYNAMIC_BASE_ENTRY_RATIO * (current_gap / prev_gap)
+        dynamic_ratio = max(DYNAMIC_MIN_ENTRY_RATIO, dynamic_ratio)
+        dynamic_ratio = min(DYNAMIC_MAX_ENTRY_RATIO, dynamic_ratio)
+        return dynamic_ratio
+
+    def _prepare_dynamic_batch_size(self, batch_idx: int, candidate_price: float) -> bool:
+        """Calculate and store the dynamic size for the next planned batch."""
+        if batch_idx >= MAX_ENTRY_BATCHES:
+            return False
+        if candidate_price <= 0 or self._sizing_equity <= 0:
+            return False
+
+        ratio = self._dynamic_entry_ratio(batch_idx, candidate_price)
+        if ratio <= 0:
+            return False
+
+        margin_budget = self._sizing_equity * ratio
+        raw_sz = margin_budget * LEVER / (candidate_price * CT_VAL)
+        sz = self._floor_contract_size(raw_sz)
+        if sz <= 0:
+            return False
+
+        used_ratio = self._used_entry_ratio(exclude_batch_idx=batch_idx)
+        candidate_margin = candidate_price * sz * CT_VAL / LEVER
+        candidate_ratio = candidate_margin / self._sizing_equity
+        if used_ratio + candidate_ratio > MAX_TOTAL_ENTRY_RATIO:
+            log_check(
+                f"Dynamic batch skipped: batch={batch_idx + 1} "
+                f"used={used_ratio:.2%} candidate={candidate_ratio:.2%} "
+                f"limit={MAX_TOTAL_ENTRY_RATIO:.2%}"
+            )
+            return False
+
+        self._set_fixed_batch_size(batch_idx, sz)
+        log_check(
+            f"Dynamic batch prepared: batch={batch_idx + 1} "
+            f"ratio={ratio:.2%} price={candidate_price:.2f} sz={sz}"
+        )
+        return True
+    def _sync_known_batch_sizes(self) -> bool:
+        """Keep only known filled or pending batch sizes in local runtime state."""
+        known_batches = [batch for batch in self._state.batches if batch.batch_idx >= 0 and batch.sz > 0]
+        if not known_batches:
+            changed = bool(self._fixed_batch_sizes)
+            self._fixed_batch_sizes = []
+            return changed
+
+        max_idx = max(batch.batch_idx for batch in known_batches)
+        synced_sizes = [0.0] * (max_idx + 1)
+        for batch in known_batches:
+            synced_sizes[batch.batch_idx] = batch.sz
+
+        if synced_sizes == self._fixed_batch_sizes:
+            return False
+        self._fixed_batch_sizes = synced_sizes
+        return True
+
+    async def _ensure_fixed_batch_sizes(self, client: OKXClient):
+        """Keep known batch sizes aligned with the current sizing target."""
+        account_equity = await client.get_balance("USDT")
+        desired_equity = self._desired_sizing_equity(account_equity)
+        previous_sizing_equity = self._sizing_equity
+        self._sizing_equity = desired_equity
+        if self._state.batches:
+            changed = self._sync_known_batch_sizes()
+            log_check(
+                f"Known batch sizes synced sizing_equity={self._sizing_equity:.2f} "
+                f"sizes={self._fixed_batch_sizes}; future add-ons use dynamic sizing"
+            )
+            if changed:
+                self._save_runtime_state()
+            return
+
+        has_valid_sizes = len(self._fixed_batch_sizes) >= 2 and all(sz > 0 for sz in self._fixed_batch_sizes[:2])
+        if has_valid_sizes and abs(previous_sizing_equity - desired_equity) <= 0.01:
+            log_check(
+                f"Using saved first/second batch sizes sizing_equity={self._sizing_equity:.2f} "
+                f"sizes={self._fixed_batch_sizes}"
+            )
+            return
+
+        if self._fixed_batch_sizes:
+            log_check(
+                f"Saved batch sizing_equity={previous_sizing_equity:.2f} "
+                f"differs from target={desired_equity:.2f}; recalculating first/second sizes"
+            )
+        await self._init_fixed_batch_sizes(client, account_equity=account_equity, sizing_equity=desired_equity)
+
+    async def _init_fixed_batch_sizes(self, client: OKXClient, account_equity: float | None = None, sizing_equity: float | None = None):
+        """Calculate first and second batch sizes; later add-ons are dynamic."""
+        equity = account_equity if account_equity is not None else await client.get_balance("USDT")
+        self._sizing_equity = sizing_equity if sizing_equity is not None else self._desired_sizing_equity(equity)
         mark_price = await client.get_mark_price(INST_ID)
         batch_sizes = []
-        for i in range(BATCH_COUNT):
-            margin_budget = self._sizing_equity * BATCH_SIZE_RATIO[i]
+        for i in range(2):
+            ratio = FIRST_BATCH_RATIO if i == 0 else SECOND_BATCH_RATIO
+            margin_budget = self._sizing_equity * ratio
             raw_sz = margin_budget * LEVER / (mark_price * CT_VAL)
-            step_count = int(raw_sz / CONTRACT_STEP)
-            sz = round(step_count * CONTRACT_STEP, 8)
+            sz = self._floor_contract_size(raw_sz)
             batch_sizes.append(sz)
         self._fixed_batch_sizes = batch_sizes
-        logger.info(
-            f"固定分批张数已计算 可用资金={equity:.2f} 计入资金={self._sizing_equity:.2f} "
-            f"张数={self._fixed_batch_sizes}"
+        log_check(
+            f"First/second batch sizes calculated available={equity:.2f} sizing_equity={self._sizing_equity:.2f} "
+            f"sizes={self._fixed_batch_sizes}; future add-ons use dynamic sizing"
         )
 
     def _ts_to_str(self, value):
@@ -172,6 +322,7 @@ class BollPinStrategy:
                 "last_inside_band_kline_ts": self._ts_to_str(self._last_inside_band_kline_ts),
                 "sizing_equity": self._sizing_equity,
                 "fixed_batch_sizes": self._fixed_batch_sizes,
+                "capital_shortage_active": self._capital_shortage_active,
             },
         }
 
@@ -183,7 +334,7 @@ class BollPinStrategy:
             tmp.write_text(json.dumps(self._state_payload(), ensure_ascii=False, indent=2), encoding="utf-8")
             tmp.replace(STATE_FILE)
         except Exception as e:
-            logger.warning(f"保存本地策略状态失败: {e}")
+            logger.warning(f"Save runtime state failed: {e}")
 
     def _clear_runtime_state(self):
         """Delete the persisted runtime-state file."""
@@ -191,14 +342,14 @@ class BollPinStrategy:
             if STATE_FILE.exists():
                 STATE_FILE.unlink()
         except Exception as e:
-            logger.warning(f"清理本地策略状态失败: {e}")
+            logger.warning(f"Clear runtime state failed: {e}")
 
     def _sanitize_runtime_state(self):
         """Drop impossible local position residue before persisting or using it."""
         has_position = self._state.total_sz > 0
         has_batch = bool(self._state.batches)
         if self._state.direction in ("long", "short") and not has_position and not has_batch:
-            logger.info("本地策略状态只有方向、没有持仓或批次，已自动清理残留方向")
+            logger.info("本地策略状只有方向没有持仓或批次，已自动清理残留方向")
             self._reset_probe_state()
             self._state.reset()
 
@@ -209,7 +360,7 @@ class BollPinStrategy:
         try:
             payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
             if payload.get("inst_id") != INST_ID:
-                logger.warning("本地策略状态交易对不匹配，忽略")
+                logger.warning("本地策略状交易对不匹配，忽略")
                 return
 
             state = payload.get("state", {})
@@ -247,18 +398,52 @@ class BollPinStrategy:
             self._last_inside_band_kline_ts = self._str_to_ts(strategy.get("last_inside_band_kline_ts"))
             self._sizing_equity = float(strategy.get("sizing_equity", 0) or 0)
             self._fixed_batch_sizes = [float(x) for x in strategy.get("fixed_batch_sizes", [])]
+            self._capital_shortage_active = bool(strategy.get("capital_shortage_active", False))
             self._sanitize_runtime_state()
+            if self._sync_known_batch_sizes():
+                self._save_runtime_state()
             self._restored_from_file = True
             logger.info(
-                f"已读取本地策略状态: 方向={self._state.direction} "
-                f"批次={len(self._state.batches)} 固定张数={self._fixed_batch_sizes}"
+                f"Loaded local strategy state: direction={self._state.direction} "
+                f"batches={len(self._state.batches)} known_sizes={self._fixed_batch_sizes}"
             )
         except Exception as e:
-            logger.warning(f"读取本地策略状态失败，忽略: {e}")
+            logger.warning(f"读取本地策略状失败，忽略: {e}")
+
+    async def _fetch_market_snapshot(self, client: OKXClient):
+        """Return latest candles, Bollinger row, and mark price."""
+        raw = await client.get_klines(INST_ID, BAR_15M, KLINE_LIMIT)
+        if not raw:
+            logger.warning("Kline data is empty; skip this cycle")
+            return None
+        current_kline_ts = pd.to_datetime(int(raw[0][0]), unit="ms")
+        df = build_df(raw, include_unconfirmed=BOLL_INCLUDE_CURRENT)
+        df = add_boll(df)
+        if df.empty:
+            logger.warning("Kline or Bollinger data is not ready; skip this cycle")
+            return None
+        mark_price = await client.get_mark_price(INST_ID)
+        last = df.iloc[-1].copy()
+        last["ts"] = current_kline_ts
+        return df, last, mark_price
+
+    async def _log_market_snapshot(self, client: OKXClient):
+        """Write a market snapshot without running trading decisions."""
+        snapshot = await self._fetch_market_snapshot(client)
+        if snapshot is None:
+            return
+        _, last, mark_price = snapshot
+        equity = dashboard.state.equity
+        log_market(
+            f"price={mark_price:.2f}  Boll[{last['boll_lower']:.2f}"
+            f" | {last['boll_mid']:.2f} | {last['boll_upper']:.2f}]"
+            f"  position={self._state.direction}  equity={equity:.2f}"
+        )
+        self._update_dashboard(mark_price, last, equity)
 
     async def _tick(self, client: OKXClient):
         """Run one strategy iteration."""
-        # 1. K线 + 布林带
+        # 1. K?+ 布林?
         raw = await client.get_klines(INST_ID, BAR_15M, KLINE_LIMIT)
         if not raw:
             logger.warning("K线数据为空，本轮跳过")
@@ -272,12 +457,13 @@ class BollPinStrategy:
 
         # 2. 账户权益 & 回撤
         equity = await client.get_balance("USDT")
+        await self._check_capital_restored(client, equity)
         if self._peak_eq == 0:
             self._peak_eq = equity
         self._peak_eq = max(self._peak_eq, equity)
 
         if check_drawdown(equity, self._peak_eq, MAX_DRAWDOWN):
-            logger.error("触发最大回撤，清仓停机")
+            logger.error("触发朢大回撤，清仓停机")
             dd = (self._peak_eq - equity) / self._peak_eq
             await notify_drawdown(equity, self._peak_eq, dd)
             await self._emergency_close(client)
@@ -288,38 +474,40 @@ class BollPinStrategy:
         self._remember_price(mark_price)
         last = df.iloc[-1].copy()
         last["ts"] = current_kline_ts
-        if self._block_recovery_on_first_tick and self._state.is_active():
-            self._last_batch_kline_ts = last["ts"]
-            self._last_recovery_kline_ts = last["ts"]
-            self._block_recovery_on_first_tick = False
-            logger.info("启动恢复持仓，本根K线不再新增补仓单，等待下一根K重新判断")
-
-        logger.info(
+        log_market(
             f"价格={mark_price:.2f}  布林[{last['boll_lower']:.2f}"
             f" | {last['boll_mid']:.2f} | {last['boll_upper']:.2f}]"
-            f"  持仓={self._state.direction}  权益={equity:.2f}"
+            f"  持仓={self._state.direction}  权益={equity:.2f}",
+            terminal=True,
         )
 
         # 3. 同步成交
         await self._sync_fills(client, mark_price, last["ts"])
 
-        # 4. 检查持仓是否已平，并恢复旧仓位缺失的补仓单
+        # 4. 棢查持仓是否已平，并恢复旧仓位缺失的补仓单
         if self._state.is_active():
             await self._check_position_closed(client, mark_price)
         if self._state.is_active():
             await self._recover_missing_entry_orders(client, df, last, equity, mark_price)
 
-        # 5. 强平预警（距强平价 < 3%）
-        if self._state.is_active() and self._state.plan_liq_price > 0:
-            liq = self._state.plan_liq_price
-            if self._state.direction == "long":
-                gap_pct = (mark_price - liq) / mark_price * 100
-            else:
-                gap_pct = (liq - mark_price) / mark_price * 100
-            if 0 < gap_pct < 3:
-                await notify_liq_warning(self._state.direction, mark_price, liq, gap_pct)
+        # 5. 强平预警（距强平?< 3%?
+        await self._maybe_notify_liq_warning(mark_price)
 
-        # 6. 盘中评分通过后逐批挂单，每根K线最多新增一批
+        # 6. 盘中评分通过后批挂单，每根K线最多新增一?
+        if self._capital_shortage_active:
+            pending_batch = self._state.pending_batch()
+            if pending_batch is not None:
+                logger.warning("Capital shortage active; cancel pending entry order and pause new entries")
+                await self._cancel_entry_orders(client)
+                if not self._state.is_active():
+                    self._reset_probe_state()
+                    self._state.reset()
+                    self._save_runtime_state()
+            else:
+                logger.info("Capital shortage active; pause new entries until trading balance reaches target")
+            self._update_dashboard(mark_price, last, equity)
+            return
+
         if self._state.has_working_plan():
             if self._state.is_active():
                 await self._maybe_place_next_batch(client, df, last, equity, mark_price)
@@ -327,7 +515,7 @@ class BollPinStrategy:
                 await self._maybe_reprice_probe_batch(client, df, last, equity, mark_price)
         else:
             if not self._boll_width_ok(last, mark_price):
-                pass
+                self._log_boll_width_skip("开仓跳过", last, mark_price)
             else:
                 await self._maybe_place_probe_batch(client, df, last, mark_price, equity)
 
@@ -338,15 +526,40 @@ class BollPinStrategy:
         """Return whether current Bollinger width allows new entries."""
         width = float(last["boll_width"])
         width_pct = width / mark_price if mark_price > 0 else 0.0
+        return width >= MIN_BOLL_WIDTH_USD and width_pct >= MIN_BOLL_WIDTH_PCT
 
-        if width < MIN_BOLL_WIDTH_USD or width_pct < MIN_BOLL_WIDTH_PCT:
-            logger.info(
-                f"布林带过窄，跳过开仓 width={width:.2f} "
-                f"width_pct={width_pct:.2%} 阈值={MIN_BOLL_WIDTH_USD:.2f}/{MIN_BOLL_WIDTH_PCT:.2%}"
-            )
-            return False
+    def _log_boll_width_skip(self, reason: str, last, mark_price: float) -> None:
+        """Log a contextual reason when Bollinger width blocks an action."""
+        width = float(last["boll_width"])
+        width_pct = width / mark_price if mark_price > 0 else 0.0
+        log_check(
+            f"{reason}：布林宽度不足 width={width:.2f} < {MIN_BOLL_WIDTH_USD:.2f} "
+            f"width_pct={width_pct:.2%} threshold={MIN_BOLL_WIDTH_PCT:.2%}"
+        )
 
-        return True
+    async def _maybe_notify_liq_warning(self, mark_price: float) -> None:
+        """Send liquidation warning with throttling to avoid message spam."""
+        if not self._state.is_active() or self._state.plan_liq_price <= 0:
+            self._last_liq_warning_gap_usd = None
+            return
+
+        liq = self._state.plan_liq_price
+        gap_usd = mark_price - liq if self._state.direction == "long" else liq - mark_price
+        gap_pct = gap_usd / mark_price * 100
+
+        if gap_usd <= 0 or gap_usd > LIQ_WARNING_DISTANCE_USD:
+            self._last_liq_warning_gap_usd = None
+            return
+
+        now = time.time()
+        first_warning = self._last_liq_warning_gap_usd is None
+        repeat_due = now - self._last_liq_warning_ts >= LIQ_WARNING_REPEAT_SEC
+        if not (first_warning or repeat_due):
+            return
+
+        self._last_liq_warning_ts = now
+        self._last_liq_warning_gap_usd = gap_usd
+        await notify_liq_warning(self._state.direction, mark_price, liq, gap_pct, gap_usd)
 
     def _remember_price(self, mark_price: float):
         """Store recent mark prices for no-new-extreme checks."""
@@ -363,13 +576,16 @@ class BollPinStrategy:
             return
 
         if direction == "long" and self._still_making_new_low():
-            logger.info("价格仍在继续创新低，暂不开首批多单")
+            logger.info("价格仍在继续创新低，暂不弢首批多单")
             return
         if direction == "short" and self._still_making_new_high():
-            logger.info("价格仍在继续创新高，暂不开首批空单")
+            logger.info("价格仍在继续创新高，暂不弢首批空单")
             return
 
         if not self._can_open_new_plan(last["ts"], mark_price):
+            return
+
+        if not self._prepare_dynamic_batch_size(0, mark_price):
             return
 
         boll_std_val = float(df["close"].tail(BOLL_PERIOD).std(ddof=0))
@@ -385,14 +601,14 @@ class BollPinStrategy:
             fixed_batch_sizes = self._fixed_batch_sizes,
         )
         if not plan.safe:
-            logger.warning("盘中破轨信号风控未通过，放弃本次信号")
+            logger.warning("Probe signal rejected by risk checks; skip this signal")
             return
 
         first_order = self._plan_order_at(plan, 0)
         if first_order is None:
             return
 
-        logger.info(f"盘中破轨预入场 方向={direction}  第一批参考价≈{mark_price:.2f}")
+        log_check(f"Probe entry prepared direction={direction} first_ref_price={mark_price:.2f}")
         self._log_plan(first_order, mark_price)
         if await self._place_batch_orders(client, first_order, remaining_batches_placed=False):
             self._probe_kline_ts = last["ts"]
@@ -434,15 +650,15 @@ class BollPinStrategy:
         self._inside_band_kline_count += 1
         self._save_runtime_state()
         if self._inside_band_kline_count < INSIDE_BAND_CANCEL_KLINES:
-            logger.info(
-                f"挂单已回到布林带内 {self._inside_band_kline_count}/"
-                f"{INSIDE_BAND_CANCEL_KLINES} 根K线，暂不撤单"
+            log_check(
+                f"Pending order inside band {self._inside_band_kline_count}/"
+                f"{INSIDE_BAND_CANCEL_KLINES} klines; keep waiting"
             )
             return False
 
-        logger.info(
-            f"挂单连续 {self._inside_band_kline_count} 根K线未重新触发轨外，"
-            f"撤销第{pending_batch.batch_idx+1}批挂单"
+        log_check(
+            f"Pending order stayed inside band for {self._inside_band_kline_count} klines; "
+            f"cancel batch {pending_batch.batch_idx + 1}"
         )
         await self._cancel_entry_orders(client)
         self._inside_band_kline_count = 0
@@ -466,7 +682,11 @@ class BollPinStrategy:
         if self._boll_width_ok(last, mark_price):
             return False
 
-        logger.info(f"布林带宽度低于阈值，撤销第{pending_batch.batch_idx+1}批未成交挂单")
+        self._log_boll_width_skip(
+            f"挂单撤销：第{pending_batch.batch_idx + 1}批",
+            last,
+            mark_price,
+        )
         await self._cancel_entry_orders(client)
         self._inside_band_kline_count = 0
         self._last_inside_band_kline_ts = None
@@ -498,15 +718,15 @@ class BollPinStrategy:
     def _can_open_new_plan(self, kline_ts, entry_price: float) -> bool:
         """Return whether a new first-batch plan can be opened."""
         if self._last_plan_kline_ts is not None and kline_ts == self._last_plan_kline_ts:
-            logger.info(f"本根K线已开过一套分批计划，跳过信号 ts={kline_ts}")
+            log_check(f"This kline already opened one plan; skip signal ts={kline_ts}")
             return False
 
         if self._last_plan_entry_price > 0:
             gap = abs(entry_price - self._last_plan_entry_price)
             if gap < MIN_ENTRY_GAP_USD:
-                logger.info(
-                    f"入场价与上次计划差距不足 {MIN_ENTRY_GAP_USD:.2f} USDT，"
-                    f"上次={self._last_plan_entry_price:.2f} 本次={entry_price:.2f} 差距={gap:.2f}"
+                log_check(
+                    f"Entry plan gap below {MIN_ENTRY_GAP_USD:.2f} USDT: "
+                    f"last={self._last_plan_entry_price:.2f} current={entry_price:.2f} gap={gap:.2f}"
                 )
                 return False
 
@@ -527,6 +747,7 @@ class BollPinStrategy:
             return
 
         if not self._boll_width_ok(last, mark_price):
+            self._log_boll_width_skip("补仓跳过", last, mark_price)
             return
 
         trigger_direction = self._intrabar_probe_direction(df, last, mark_price)
@@ -534,14 +755,14 @@ class BollPinStrategy:
             return
 
         if self._state.direction == "long" and self._still_making_new_low():
-            logger.info("价格仍在继续创新低，暂不挂下一批多单")
+            log_check("Price is still making new lows; delay next long batch")
             return
         if self._state.direction == "short" and self._still_making_new_high():
-            logger.info("价格仍在继续创新高，暂不挂下一批空单")
+            log_check("Price is still making new highs; delay next short batch")
             return
 
         next_idx = self._state.next_batch_idx()
-        if next_idx >= BATCH_COUNT:
+        if next_idx >= MAX_ENTRY_BATCHES:
             self._state.remaining_batches_placed = True
             return
 
@@ -553,10 +774,14 @@ class BollPinStrategy:
         if last_batch is None:
             return
         if self._state.direction == "long" and self._still_making_new_low():
-            logger.info(f"价格仍在继续创新低，暂不挂第{next_idx+1}批多单")
+            log_check(f"Price is still making new lows; delay long batch {next_idx + 1}")
             return
         if self._state.direction == "short" and self._still_making_new_high():
-            logger.info(f"价格仍在继续创新高，暂不挂第{next_idx+1}批空单")
+            log_check(f"Price is still making new highs; delay short batch {next_idx + 1}")
+            return
+
+        if not self._prepare_dynamic_batch_size(next_idx, mark_price):
+            self._state.remaining_batches_placed = True
             return
 
         boll_std_val = float(df["close"].tail(BOLL_PERIOD).std(ddof=0))
@@ -573,7 +798,7 @@ class BollPinStrategy:
             fixed_batch_sizes = self._fixed_batch_sizes,
         )
         if not plan.safe:
-            logger.warning("下一批补仓风控未通过，暂不挂新批次")
+            logger.warning("Next add-on batch rejected by risk checks; skip")
             return
 
         next_plan = self._plan_order_at_price(plan, next_idx, mark_price)
@@ -584,9 +809,9 @@ class BollPinStrategy:
         next_order = next_plan.orders[0]
         gap = abs(next_order.price - last_batch.price)
         if gap < MIN_ENTRY_GAP_USD:
-            logger.info(
-                f"下一批与上一批价格差距不足 {MIN_ENTRY_GAP_USD:.2f} USDT，"
-                f"上一批={last_batch.price:.2f} 下一批={next_order.price:.2f} 差距={gap:.2f}"
+            log_check(
+                f"Next batch gap below {MIN_ENTRY_GAP_USD:.2f} USDT: "
+                f"last_fill={last_batch.price:.2f} next={next_order.price:.2f} gap={gap:.2f}"
             )
             return
 
@@ -595,7 +820,7 @@ class BollPinStrategy:
         if self._state.direction == "short" and mark_price < last_batch.price:
             return
 
-        logger.info(f"逐批补仓触发 第{next_idx+1}批 方向={self._state.direction}")
+        log_check(f"Add-on batch triggered: batch={next_idx + 1} direction={self._state.direction}")
         self._log_plan(next_plan, mark_price)
         if await self._place_batch_orders(client, next_plan, remaining_batches_placed=False):
             self._last_batch_kline_ts = kline_ts
@@ -614,6 +839,7 @@ class BollPinStrategy:
             return
 
         if not self._boll_width_ok(last, mark_price):
+            self._log_boll_width_skip("补仓重挂跳过", last, mark_price)
             self._save_runtime_state()
             return
 
@@ -626,6 +852,14 @@ class BollPinStrategy:
             self._save_runtime_state()
             return
         if self._state.direction == "short" and self._still_making_new_high():
+            self._save_runtime_state()
+            return
+
+        next_idx = max(1, self._state.next_batch_idx())
+        if next_idx >= MAX_ENTRY_BATCHES:
+            self._state.remaining_batches_placed = True
+            return
+        if not self._prepare_dynamic_batch_size(next_idx, mark_price):
             self._save_runtime_state()
             return
 
@@ -656,9 +890,9 @@ class BollPinStrategy:
             self._save_runtime_state()
             return
 
-        logger.info(
-            f"K线更新后重挂第{pending_batch.batch_idx+1}批挂单 "
-            f"旧价={pending_batch.price:.2f} 新价={next_order.price:.2f}"
+        log_check(
+            f"Reprice pending batch {pending_batch.batch_idx + 1}: "
+            f"old={pending_batch.price:.2f} new={next_order.price:.2f}"
         )
         await client.cancel_order(INST_ID, pending_batch.ord_id)
         self._state.remove_batch(pending_batch.ord_id)
@@ -684,6 +918,7 @@ class BollPinStrategy:
             return
 
         if not self._boll_width_ok(last, mark_price):
+            self._log_boll_width_skip("首批重挂跳过", last, mark_price)
             self._save_runtime_state()
             return
 
@@ -695,6 +930,10 @@ class BollPinStrategy:
             self._save_runtime_state()
             return
         if direction == "short" and self._still_making_new_high():
+            self._save_runtime_state()
+            return
+
+        if not self._prepare_dynamic_batch_size(0, mark_price):
             self._save_runtime_state()
             return
 
@@ -724,8 +963,8 @@ class BollPinStrategy:
             self._save_runtime_state()
             return
 
-        logger.info(
-            f"K线更新后重挂第1批头仓挂单 "
+        log_check(
+            f"Reprice first batch after kline update"
             f"旧价={pending_batch.price:.2f} 新价={next_order.price:.2f}"
         )
         await client.cancel_order(INST_ID, pending_batch.ord_id)
@@ -787,7 +1026,7 @@ class BollPinStrategy:
             total_margin=round(margin, 2),
         )
 
-    # ── 下批次限价单 ──────────────────────────────────────────────────────
+    # ┢┢ 下批次限价单 ┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢
 
     async def _place_batch_orders(self, client: OKXClient, plan, remaining_batches_placed: bool = True) -> bool:
         """Submit all entry orders in a batch plan."""
@@ -822,18 +1061,18 @@ class BollPinStrategy:
                     price=bo.price,
                     sz=bo.sz,
                     batch=bo.batch_idx + 1,
-                    total=BATCH_COUNT,
+                    total=MAX_ENTRY_BATCHES,
                     ord_id=ord_id,
                 )
-                logger.info(f"第{bo.batch_idx+1}批挂单 价格={bo.price}  张数={bo.sz}  ordId={ord_id}")
+                log_action(f"Batch {bo.batch_idx + 1} order placed price={bo.price} sz={bo.sz} ordId={ord_id}")
             except Exception as e:
-                logger.error(f"第{bo.batch_idx+1}批下单失败: {e}")
+                logger.error(f"Batch {bo.batch_idx + 1} order failed: {e}")
 
         if not placed_any:
             if had_batches:
-                logger.warning("本次新批次下单未成功，保留现有持仓状态")
+                logger.warning("New batch order failed; keep current position state")
                 return False
-            logger.warning("本次计划没有任何批次挂单成功，重置状态")
+            logger.warning("No batch order placed; reset strategy state")
             self._state.reset()
             self._clear_runtime_state()
             return False
@@ -870,7 +1109,7 @@ class BollPinStrategy:
         try:
             open_orders = await client.get_open_orders(INST_ID)
         except Exception as e:
-            logger.warning(f"恢复补仓单前查询未成交订单失败: {e}")
+            logger.warning(f"Query pending orders before recovery failed: {e}")
             return
 
         entry_side = "buy" if self._state.direction == "long" else "sell"
@@ -884,6 +1123,16 @@ class BollPinStrategy:
             self._state.remaining_batches_placed = True
             return
 
+        next_idx = self._state.next_batch_idx()
+        if next_idx >= MAX_ENTRY_BATCHES:
+            self._state.remaining_batches_placed = True
+            self._save_runtime_state()
+            return
+
+        if not self._prepare_dynamic_batch_size(next_idx, mark_price):
+            self._save_runtime_state()
+            return
+
         boll_std_val = float(df["close"].tail(BOLL_PERIOD).std(ddof=0))
         plan = build_batch_plan(
             direction   = self._state.direction,
@@ -894,28 +1143,27 @@ class BollPinStrategy:
             boll_upper  = float(last["boll_upper"]),
             boll_std    = boll_std_val,
             equity      = equity,
-            max_batch_idx = max(1, self._state.next_batch_idx()),
+            max_batch_idx = next_idx,
             fixed_batch_sizes = self._fixed_batch_sizes,
         )
         if not plan.safe:
-            logger.warning("已有持仓恢复补仓单风控未通过，暂不补挂")
+            logger.warning("Recovery add-on order rejected by risk checks; skip")
             self._last_recovery_kline_ts = last["ts"]
             return
 
-        next_idx = max(1, self._state.next_batch_idx())
         recovery_plan = self._plan_order_at_price(plan, next_idx, mark_price)
         if recovery_plan is None:
             self._state.remaining_batches_placed = True
             return
 
-        last_batch = self._state.last_batch()
+        last_batch = self._state.last_filled_batch()
         if last_batch is not None:
             next_order = recovery_plan.orders[0]
             gap = abs(next_order.price - last_batch.price)
             if gap < MIN_ENTRY_GAP_USD:
                 logger.info(
-                    f"恢复下一批与上一批价格差距不足 {MIN_ENTRY_GAP_USD:.2f} USDT，"
-                    f"上一批={last_batch.price:.2f} 下一批={next_order.price:.2f} 差距={gap:.2f}"
+                    f"Recovery add-on gap below {MIN_ENTRY_GAP_USD:.2f} USDT: "
+                    f"last_fill={last_batch.price:.2f} next={next_order.price:.2f} gap={gap:.2f}"
                 )
                 self._last_recovery_kline_ts = last["ts"]
                 return
@@ -927,15 +1175,45 @@ class BollPinStrategy:
                 return
 
         logger.info(
-            f"检测到已有{self._state.direction}持仓但无补仓单，"
-            f"按真实均价={self._state.avg_entry:.2f} 恢复第{next_idx+1}批"
+            f"Recovered missing add-on order: direction={self._state.direction} "
+            f"avg_entry={self._state.avg_entry:.2f} batch={next_idx + 1}"
         )
         self._log_plan(recovery_plan, mark_price)
         if await self._place_batch_orders(client, recovery_plan, remaining_batches_placed=False):
             self._last_batch_kline_ts = last["ts"]
             self._last_recovery_kline_ts = last["ts"]
 
-    # ── 检查挂单成交 ──────────────────────────────────────────────────────
+    # ┢┢ 棢查挂单成?┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢
+
+    def _kline_floor_freq(self) -> str:
+        """Return a pandas floor frequency matching the configured bar size."""
+        if BAR_15M.endswith("m"):
+            return f"{BAR_15M[:-1]}min"
+        if BAR_15M.endswith("H"):
+            return f"{BAR_15M[:-1]}h"
+        return BAR_15M
+
+    def _extract_order_fill(self, order_info: dict, fallback_sz: float, fallback_price: float):
+        """Extract real filled size, average fill price, and fill candle."""
+        raw_sz = order_info.get("accFillSz") or order_info.get("fillSz") or fallback_sz
+        raw_price = order_info.get("avgPx") or order_info.get("fillPx") or order_info.get("px") or fallback_price
+        try:
+            fill_sz = float(raw_sz or fallback_sz)
+        except (TypeError, ValueError):
+            fill_sz = fallback_sz
+        try:
+            fill_price = float(raw_price or fallback_price)
+        except (TypeError, ValueError):
+            fill_price = fallback_price
+
+        fill_kline_ts = None
+        raw_time = order_info.get("fillTime") or order_info.get("uTime")
+        try:
+            if raw_time:
+                fill_kline_ts = pd.to_datetime(int(raw_time), unit="ms").floor(self._kline_floor_freq())
+        except Exception:
+            fill_kline_ts = None
+        return fill_sz, fill_price, fill_kline_ts
 
     async def _sync_fills(self, client: OKXClient, mark_price: float, kline_ts=None):
         """Synchronize filled and canceled entry orders from OKX."""
@@ -944,6 +1222,7 @@ class BollPinStrategy:
 
         prev_sz = self._state.total_sz
         filled_this_tick = False
+        filled_kline_ts = None
         canceled_batches = []
         for batch in self._state.batches:
             if batch.filled:
@@ -951,22 +1230,28 @@ class BollPinStrategy:
             try:
                 order_info = await client.get_order(INST_ID, batch.ord_id)
                 if order_info.get("state") == "filled":
-                    self._state.mark_filled(batch.ord_id, batch.sz)
+                    fill_sz, fill_price, fill_ts = self._extract_order_fill(order_info, batch.sz, batch.price)
+                    self._state.mark_filled(batch.ord_id, fill_sz, fill_price)
+                    if fill_ts is not None:
+                        filled_kline_ts = fill_ts
                     filled_this_tick = True
                 elif order_info.get("state") in ("canceled", "cancelled"):
                     canceled_batches.append(batch)
-                    logger.info(f"第{batch.batch_idx+1}批已撤销 ordId={batch.ord_id}")
+                    logger.info(f"Batch {batch.batch_idx + 1} canceled ordId={batch.ord_id}")
             except Exception as e:
-                logger.warning(f"查询订单 {batch.ord_id} 失败: {e}")
+                logger.warning(f"Query order {batch.ord_id} failed: {e}")
 
         for batch in canceled_batches:
             self._state.remove_batch(batch.ord_id)
         if canceled_batches:
             self._save_runtime_state()
 
-        if filled_this_tick and kline_ts is not None:
-            self._last_batch_kline_ts = kline_ts
-            logger.info(f"本根K线已有入场批次成交，后续补仓等待下一根K线 ts={kline_ts}")
+        if filled_this_tick:
+            self._last_batch_kline_ts = filled_kline_ts or kline_ts
+            if kline_ts is not None and self._last_batch_kline_ts == kline_ts:
+                logger.info(f"This kline already has an entry fill; wait for next kline ts={kline_ts}")
+            elif filled_kline_ts is not None:
+                logger.info(f"Synced historical fill at kline={filled_kline_ts}; current kline can continue")
 
         if self._state.total_sz != prev_sz:
             avg = await self._sync_exchange_position(client)
@@ -1000,7 +1285,7 @@ class BollPinStrategy:
             self._state.plan_tp_price = round(avg_entry + TP_PROFIT_USD, 2)
         else:
             self._state.plan_tp_price = round(avg_entry - TP_PROFIT_USD, 2)
-        logger.info(f"均价={avg_entry:.2f}  新止盈={self._state.plan_tp_price}")
+        log_check(f"Average entry={avg_entry:.2f} new_tp={self._state.plan_tp_price}")
         return avg_entry
 
     async def _replace_exit_orders(self, client: OKXClient):
@@ -1034,8 +1319,8 @@ class BollPinStrategy:
                 self._state.plan_tp_price = round(avg_entry - TP_PROFIT_USD, 2)
 
         logger.info(
-            f"交易所持仓同步 均价={avg_entry:.2f} 张数={total_sz} "
-            f"真实强平={liq_price:.2f} 新止盈={self._state.plan_tp_price:.2f}"
+            f"交易扢持仓同步 均价={avg_entry:.2f} 张数={total_sz} "
+            f"real_liq={liq_price:.2f} new_tp={self._state.plan_tp_price:.2f}"
         )
         return avg_entry
 
@@ -1058,7 +1343,7 @@ class BollPinStrategy:
         self._probe_entry_price = self._state.avg_entry
         self._last_plan_entry_price = self._state.avg_entry
         logger.info(
-            f"按现有持仓恢复本地第1批记录 均价={self._state.avg_entry:.2f} "
+            f"Recovered local first batch from existing position avg_entry={self._state.avg_entry:.2f} "
             f"张数={self._state.total_sz}"
         )
 
@@ -1083,11 +1368,11 @@ class BollPinStrategy:
                 reduce_only=True,
             )
             self._state.tp_ord_id = r.get("ordId", "")
-            logger.info(f"止盈挂单 价格={self._state.plan_tp_price}  张数={self._state.total_sz}")
+            log_action(f"止盈挂单 价格={self._state.plan_tp_price}  张数={self._state.total_sz}")
         except Exception as e:
-            logger.error(f"挂止盈失败: {e}")
+            logger.error(f"Place take-profit order failed: {e}")
 
-        logger.info(f"当前强平价={self._state.plan_liq_price}（强平线作为最终风险边界）")
+        log_check(f"Current liquidation price={self._state.plan_liq_price} final risk boundary")
 
     async def _update_sl(self, client: OKXClient):
         """Place the current reduce-only liquidation-line stop order."""
@@ -1102,7 +1387,7 @@ class BollPinStrategy:
             sl_price = round(self._state.plan_liq_price - LIQ_STOP_OFFSET_USD, 2)
 
         if sl_price <= 0:
-            logger.warning(f"止损价无效，跳过挂止损 sl={sl_price}")
+            logger.warning(f"Invalid stop-loss price; skip sl={sl_price}")
             return
 
         if self._state.sl_ord_id:
@@ -1119,14 +1404,14 @@ class BollPinStrategy:
             )
             self._state.sl_ord_id = r.get("algoId", "")
             self._state.plan_sl_price = sl_price
-            logger.info(
-                f"强平线止损挂单 触发价={sl_price} "
-                f"强平价={self._state.plan_liq_price} 张数={self._state.total_sz}"
+            log_action(
+                f"Liquidation stop order trigger={sl_price} "
+                f"liq={self._state.plan_liq_price} sz={self._state.total_sz}"
             )
         except Exception as e:
             logger.error(f"挂强平线止损失败: {e}")
 
-    # ── 检查持仓是否已平 ──────────────────────────────────────────────────
+    # ┢┢ 棢查持仓是否已?┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢
 
     async def _check_position_closed(self, client: OKXClient, mark_price: float):
         """Detect external position close and reset local state."""
@@ -1156,7 +1441,7 @@ class BollPinStrategy:
             await self._cancel_entry_orders(client)
             await self._cancel_exchange_exit_orders(client)
             await self._cancel_exit_orders(client)
-            logger.info("持仓已关闭，重置状态")
+            log_action("Position closed; reset strategy state")
             self._last_plan_kline_ts = None
             self._last_batch_kline_ts = None
             self._last_plan_entry_price = 0.0
@@ -1166,7 +1451,7 @@ class BollPinStrategy:
             await self._rebalance_accounts(client)
             await self._init_fixed_batch_sizes(client)
 
-    # ── 恢复状态 ──────────────────────────────────────────────────────────
+    # ┢┢ 恢复状?┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢
 
     async def _sync_state(self, client: OKXClient):
         """Reconcile local state with the exchange on startup."""
@@ -1174,10 +1459,13 @@ class BollPinStrategy:
         if pos and float(pos.get("pos", 0)) != 0:
             pos_side = pos.get("posSide", "")
             sz       = float(pos.get("pos", 0))
-            logger.info(f"检测到现有持仓: {pos_side} {sz}张，继续监控")
+            logger.info(f"Existing position detected: {pos_side} {sz} contracts; continue monitoring")
             self._state.direction = pos_side
-            self._block_recovery_on_first_tick = True
             await self._sync_exchange_position(client)
+            await self._refresh_filled_batches_from_orders(client)
+            self._repair_filled_batches_after_restart()
+            if self._sync_known_batch_sizes():
+                self._save_runtime_state()
             await self._reconcile_entry_orders_after_restart(client)
             await self._replace_exit_orders(client)
         else:
@@ -1187,9 +1475,9 @@ class BollPinStrategy:
             self._clear_runtime_state()
             if not self._fixed_batch_sizes:
                 await self._init_fixed_batch_sizes(client)
-            logger.info("无现有持仓，策略就绪")
+            logger.info("No existing position; strategy ready")
 
-    # ── 紧急平仓 ──────────────────────────────────────────────────────────
+    # ┢┢ 紧平?┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢
 
     async def _emergency_close(self, client: OKXClient):
         """Close the active position and clear local state after drawdown stop."""
@@ -1214,7 +1502,7 @@ class BollPinStrategy:
                 self._clear_runtime_state()
                 await self._init_fixed_batch_sizes(client)
             except Exception as e:
-                logger.error(f"紧急平仓失败: {e}")
+                logger.error(f"Emergency close failed: {e}")
 
     async def _cancel_entry_orders(self, client: OKXClient):
         """Cancel all local unfilled entry orders."""
@@ -1226,7 +1514,7 @@ class BollPinStrategy:
             try:
                 await client.cancel_order(INST_ID, batch.ord_id)
             except Exception as e:
-                logger.warning(f"撤销剩余补仓单失败 ordId={batch.ord_id}: {e}")
+                logger.warning(f"Cancel remaining add-on order failed ordId={batch.ord_id}: {e}")
         self._state.batches = kept_batches
         self._save_runtime_state()
 
@@ -1257,7 +1545,7 @@ class BollPinStrategy:
         if not has_local_pending and not entry_orders:
             return
 
-        logger.info("价格未突破布林轨，撤销未成交补仓单，等待下一次突破")
+        log_check("Price no longer breaks Bollinger band; cancel unfilled add-on order")
         await self._cancel_entry_orders(client)
         self._last_batch_kline_ts = None
         self._last_recovery_kline_ts = None
@@ -1282,14 +1570,14 @@ class BollPinStrategy:
         if pending is None:
             return
 
-        logger.info("价格收回布林带内，撤销未成交第一批挂单")
+        log_check("Price returned inside Bollinger band; cancel unfilled first batch")
         await client.cancel_order(INST_ID, pending.ord_id)
         self._state.remove_batch(pending.ord_id)
         if pending.batch_idx == 0 and self._last_plan_kline_ts == last["ts"]:
             self._last_plan_kline_ts = None
             self._last_batch_kline_ts = None
             self._last_plan_entry_price = 0.0
-            logger.info("首批未成交已撤销，本根K线开仓限制已释放")
+            logger.info("Unfilled first batch canceled; current kline entry lock released")
         self._reset_probe_state()
         self._state.reset()
         self._clear_runtime_state()
@@ -1299,7 +1587,7 @@ class BollPinStrategy:
         try:
             orders = await client.get_open_orders(INST_ID)
         except Exception as e:
-            logger.warning(f"查询未成交订单失败: {e}")
+            logger.warning(f"Query pending orders failed: {e}")
             return
 
         for order in orders:
@@ -1317,7 +1605,7 @@ class BollPinStrategy:
         try:
             orders = await client.get_open_orders(INST_ID)
         except Exception as e:
-            logger.warning(f"重启校验交易所补仓单失败: {e}")
+            logger.warning(f"Restart reconciliation for exchange add-on orders failed: {e}")
             return
 
         entry_orders = [
@@ -1336,12 +1624,23 @@ class BollPinStrategy:
         for batch in sorted(local_pending, key=lambda b: b.batch_idx):
             if batch.ord_id not in live_ids:
                 if unmatched_filled_sz + 1e-8 >= batch.sz:
+                    try:
+                        order_info = await client.get_order(INST_ID, batch.ord_id)
+                        fill_sz, fill_price, fill_kline_ts = self._extract_order_fill(
+                            order_info, batch.sz, batch.price
+                        )
+                        batch.sz = fill_sz
+                        batch.price = fill_price
+                        if fill_kline_ts is not None:
+                            self._last_batch_kline_ts = fill_kline_ts
+                    except Exception:
+                        pass
                     batch.filled = True
                     unmatched_filled_sz -= batch.sz
-                    logger.info(f"本地记录的第{batch.batch_idx+1}批挂单已在停机期间成交 ordId={batch.ord_id}")
+                    logger.info(f"Local batch {batch.batch_idx + 1} filled while offline ordId={batch.ord_id}")
                 else:
                     removed.append(batch)
-                    logger.info(f"本地记录的第{batch.batch_idx+1}批挂单已不在交易所，移除 ordId={batch.ord_id}")
+                    logger.info(f"Local batch {batch.batch_idx + 1} no longer on exchange; remove ordId={batch.ord_id}")
         for batch in removed:
             self._state.remove_batch(batch.ord_id)
         local_pending_ids = {b.ord_id for b in self._state.batches if not b.filled and b.ord_id}
@@ -1350,11 +1649,74 @@ class BollPinStrategy:
             ord_id = order.get("ordId")
             if not ord_id or ord_id in local_pending_ids:
                 continue
-            logger.info(f"重启发现非本地记录的补仓挂单，撤销 ordId={ord_id}")
+            logger.info(f"重启发现非本地记录的补仓挂单，撤锢 ordId={ord_id}")
             await client.cancel_order(INST_ID, ord_id)
 
         if local_pending_ids:
-            logger.info(f"重启已接续交易所未成交补仓单 ordId={sorted(local_pending_ids)}")
+            logger.info(f"Restart kept exchange pending add-on orders ordId={sorted(local_pending_ids)}")
+        self._save_runtime_state()
+
+    async def _refresh_filled_batches_from_orders(self, client: OKXClient):
+        """Refresh filled batch prices and sizes from OKX order details."""
+        changed = False
+        for batch in self._state.filled_batches():
+            if not batch.ord_id or batch.ord_id == "existing-position":
+                continue
+            try:
+                order_info = await client.get_order(INST_ID, batch.ord_id)
+                fill_sz, fill_price, fill_kline_ts = self._extract_order_fill(order_info, batch.sz, batch.price)
+            except Exception as e:
+                logger.warning(f"Restart refresh batch {batch.batch_idx + 1} fill failed ordId={batch.ord_id}: {e}")
+                continue
+            if fill_kline_ts is not None:
+                self._last_batch_kline_ts = fill_kline_ts
+                changed = True
+            if fill_sz > 0 and abs(fill_sz - batch.sz) > 1e-8:
+                batch.sz = fill_sz
+                changed = True
+            if fill_price > 0 and abs(fill_price - batch.price) > 1e-8:
+                logger.info(
+                    f"Restart refreshed batch {batch.batch_idx + 1} fill price "
+                    f"{batch.price:.2f} -> {fill_price:.2f}"
+                )
+                batch.price = fill_price
+                changed = True
+        if changed:
+            self._save_runtime_state()
+
+    def _repair_filled_batches_after_restart(self):
+        """Replace stale filled batches when they do not match the exchange position."""
+        if not self._state.is_active():
+            return
+
+        filled = self._state.filled_batches()
+        pending = [batch for batch in self._state.batches if not batch.filled]
+        filled_sz = sum(batch.sz for batch in filled)
+        has_invalid_order_id = any(
+            batch.ord_id
+            and batch.ord_id != "existing-position"
+            and not str(batch.ord_id).isdigit()
+            for batch in filled
+        )
+        size_mismatch = abs(filled_sz - self._state.total_sz) > CONTRACT_STEP
+        if not has_invalid_order_id and not size_mismatch:
+            return
+
+        logger.warning(
+            "本地已成交批次与交易扢持仓不一致，"
+            f"按交易所均价重建本地批次 filled_sz={filled_sz} real_sz={self._state.total_sz}"
+        )
+        self._state.batches = [
+            OpenBatch(
+                batch_idx=0,
+                ord_id="existing-position",
+                price=self._state.avg_entry,
+                sz=self._state.total_sz,
+                filled=True,
+            )
+        ] + pending
+        self._probe_entry_price = self._state.avg_entry
+        self._last_plan_entry_price = self._state.avg_entry
         self._save_runtime_state()
 
     async def _cancel_exchange_entry_orders(self, client: OKXClient):
@@ -1366,7 +1728,7 @@ class BollPinStrategy:
         try:
             orders = await client.get_open_orders(INST_ID)
         except Exception as e:
-            logger.warning(f"查询交易所补仓单失败: {e}")
+            logger.warning(f"Query exchange add-on orders failed: {e}")
             return
 
         for order in orders:
@@ -1378,7 +1740,7 @@ class BollPinStrategy:
                 continue
             ord_id = order.get("ordId")
             if ord_id:
-                logger.info(f"启动/恢复时撤销交易所未成交补仓单 ordId={ord_id}")
+                logger.info(f"启动/恢复时撤锢交易扢未成交补仓单 ordId={ord_id}")
                 await client.cancel_order(INST_ID, ord_id)
 
     async def _cancel_exchange_exit_orders(self, client: OKXClient):
@@ -1415,7 +1777,7 @@ class BollPinStrategy:
 
         Reserved helper. It is not called by the current live path.
         """
-        last_batch = self._state.last_batch()
+        last_batch = self._state.last_filled_batch()
         if last_batch is None:
             return
 
@@ -1423,7 +1785,7 @@ class BollPinStrategy:
         try:
             orders = await client.get_open_orders(INST_ID)
         except Exception as e:
-            logger.warning(f"查询补仓单失败: {e}")
+            logger.warning(f"Query add-on orders failed: {e}")
             return
 
         for order in orders:
@@ -1448,8 +1810,8 @@ class BollPinStrategy:
                 ord_id = order.get("ordId")
                 if ord_id:
                     logger.info(
-                        f"撤销无效补仓单 ordId={ord_id} 价格={px:.2f} "
-                        f"上一批={last_batch.price:.2f} 差距={gap:.2f}"
+                        f"Cancel invalid add-on order ordId={ord_id} price={px:.2f} "
+                        f"last_fill={last_batch.price:.2f} gap={gap:.2f}"
                     )
                     await client.cancel_order(INST_ID, ord_id)
 
@@ -1470,7 +1832,7 @@ class BollPinStrategy:
         try:
             orders = await client.get_open_orders(INST_ID)
         except Exception as e:
-            logger.warning(f"检查未成交订单失败: {e}")
+            logger.warning(f"棢查未成交订单失败: {e}")
             return
 
         live_ids = {o.get("ordId") for o in orders}
@@ -1482,7 +1844,7 @@ class BollPinStrategy:
             self._last_plan_kline_ts = None
             self._last_batch_kline_ts = None
             self._last_plan_entry_price = 0.0
-            logger.info("分批计划没有持仓和未成交补仓单，重置状态")
+            logger.info("No position or pending entry orders; reset strategy state")
             self._reset_probe_state()
             self._state.reset()
             self._clear_runtime_state()
@@ -1493,7 +1855,7 @@ class BollPinStrategy:
         self._probe_direction = "none"
         self._probe_entry_price = 0.0
 
-    # ── 更新看板状态 ──────────────────────────────────────────────────────
+    # ┢┢ 更新看板状?┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢
 
     def _update_dashboard(self, mark_price: float, last, equity: float):
         """Copy the current strategy snapshot into dashboard state."""
@@ -1528,30 +1890,30 @@ class BollPinStrategy:
             s.unrealized_pnl = 0.0
         s.update_time()
 
-    # ── 日志输出建仓计划 ──────────────────────────────────────────────────
+    # ┢┢ 日志输出建仓计划 ┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢
 
     def _log_plan(self, plan, mark_price: float):
         """Log a human-readable batch-entry plan."""
-        logger.info("=" * 60)
-        logger.info(f"建仓计划 方向={plan.direction}  当前价={mark_price:.2f}")
-        logger.info(f"  止盈={plan.tp_price}  估算强平={plan.liq_price}")
-        logger.info(f"  合计保证金={plan.total_margin:.2f} USDT")
+        log_check("=" * 60)
+        log_check(f"Entry plan direction={plan.direction} mark_price={mark_price:.2f}")
+        log_check(f"  tp={plan.tp_price} estimated_liq={plan.liq_price}")
+        log_check(f"  total_margin={plan.total_margin:.2f} USDT")
         for bo in plan.orders:
-            logger.info(
-                f"  第{bo.batch_idx+1}批: 价格={bo.price}  张数={bo.sz}"
-                f"  名义={bo.notional:.2f}  保证金={bo.margin:.2f}"
+            log_check(
+                f"  batch={bo.batch_idx + 1} price={bo.price} sz={bo.sz}"
+                f" notional={bo.notional:.2f} margin={bo.margin:.2f}"
             )
-        logger.info("=" * 60)
+        log_check("=" * 60)
 
-    # ── 资金账户再平衡 ────────────────────────────────────────────────────
+    # ┢┢ 资金账户再平?┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢
 
     async def _rebalance_accounts(self, client: OKXClient) -> None:
         """Keep the trading account near ``TRADING_ACCOUNT_TARGET``."""
         """
         每次平仓后调用：
-          盈利 -> 将超出 TRADING_ACCOUNT_TARGET 的部分划转到资金账户
+          盈利 -> 将超?TRADING_ACCOUNT_TARGET 的部分划转到资金账户
           亏损 -> 从资金账户补回交易账户，使可用余额恢复到 TRADING_ACCOUNT_TARGET
-        TRADING_ACCOUNT_TARGET = 0 时跳过。
+        TRADING_ACCOUNT_TARGET = 0 时跳过?
         """
         if TRADING_ACCOUNT_TARGET <= 0:
             return
@@ -1561,9 +1923,8 @@ class BollPinStrategy:
 
             if diff > 0.01:
                 logger.info(
-                    f"[资金管理] 盈利 +{diff:.4f} USDT，"
-                    f"交易账户 {trading_bal:.4f} -> {TRADING_ACCOUNT_TARGET:.4f}，"
-                    f"划入资金账户"
+                    f"[Capital] Profit +{diff:.4f} USDT; "
+                    f"trading {trading_bal:.4f} -> {TRADING_ACCOUNT_TARGET:.4f}; transfer to funding"
                 )
                 await client.transfer(amt=diff, from_acct="18", to_acct="6")
 
@@ -1571,26 +1932,63 @@ class BollPinStrategy:
                 needed = abs(diff)
                 funding_bal = await client.get_funding_balance("USDT")
                 top_up = round(min(needed, funding_bal), 4)
+                shortage = top_up < needed
+                if shortage and top_up >= 0.01 and not self._capital_shortage_active:
+                    self._capital_shortage_active = True
+                    await notify_capital_shortage(trading_bal + top_up, TRADING_ACCOUNT_TARGET, funding_bal, top_up)
+                    self._save_runtime_state()
                 if top_up < 0.01:
+                    if not self._capital_shortage_active:
+                        self._capital_shortage_active = True
+                        await notify_capital_shortage(trading_bal, TRADING_ACCOUNT_TARGET, funding_bal, 0.0)
+                        self._save_runtime_state()
                     logger.warning(
-                        f"[资金管理] 资金账户余额不足（{funding_bal:.4f} USDT），"
-                        f"无法补充交易账户"
+                        f"[Capital] Funding balance insufficient ({funding_bal:.4f} USDT); "
+                        f"cannot top up trading account"
                     )
                     return
-                partial = "（资金账户不足，仅补部分）" if top_up < needed else ""
+                partial = " (partial top-up; funding insufficient)" if top_up < needed else ""
                 logger.info(
-                    f"[资金管理] 亏损 {diff:.4f} USDT，"
-                    f"从资金账户划入 {top_up:.4f} USDT{partial}"
+                    f"[Capital] Loss {diff:.4f} USDT; "
+                    f"transfer {top_up:.4f} USDT from funding to trading{partial}"
                 )
                 await client.transfer(amt=top_up, from_acct="6", to_acct="18")
 
             else:
-                logger.debug("[资金管理] 余额与目标相差不足 0.01 USDT，跳过划转")
+                logger.debug("[Capital] Balance is within 0.01 USDT of target; skip transfer")
 
         except Exception as e:
-            logger.warning(f"[资金管理] 划转失败，不影响策略继续运行: {e}")
+            logger.warning(f"[Capital] Transfer failed; strategy continues: {e}")
+
+    async def _check_capital_restored(self, client: OKXClient, trading_balance: float | None = None) -> None:
+        """Notify once when trading capital recovers after a shortage."""
+        if not self._capital_shortage_active or TRADING_ACCOUNT_TARGET <= 0:
+            return
+
+        if trading_balance is None:
+            trading_balance = await client.get_balance("USDT")
+        if trading_balance + 0.01 < TRADING_ACCOUNT_TARGET:
+            return
+
+        excess = round(trading_balance - TRADING_ACCOUNT_TARGET, 4)
+        if excess > 0.01:
+            logger.info(
+                f"[Capital] Balance above target after top-up; "
+                f"{trading_balance:.4f} -> {TRADING_ACCOUNT_TARGET:.4f}; transfer {excess:.4f} USDT to funding"
+            )
+            await client.transfer(amt=excess, from_acct="18", to_acct="6")
+            trading_balance = TRADING_ACCOUNT_TARGET
+
+        self._capital_shortage_active = False
+        self._save_runtime_state()
+        logger.info(
+            f"[Capital] Trading balance restored to target "
+            f"{trading_balance:.4f}/{TRADING_ACCOUNT_TARGET:.4f} USDT"
+        )
+        await notify_capital_restored(trading_balance, TRADING_ACCOUNT_TARGET)
+        await self._ensure_fixed_batch_sizes(client)
 
     def stop(self):
         """Request the main strategy loop to stop."""
         self._running = False
-        logger.info("策略停止")
+        logger.info("Strategy stopped")

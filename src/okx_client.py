@@ -14,6 +14,7 @@ import aiohttp
 from loguru import logger
 
 from src.config import API_KEY, SECRET_KEY, PASSPHRASE, FLAG
+from src.logging_utils import log_action
 
 BASE_URL = "https://www.okx.com"
 
@@ -148,7 +149,7 @@ class OKXClient:
         payload = {"ccy": ccy, "amt": f"{amt:.4f}", "from": from_acct, "to": to_acct, "type": "0"}
         await self._post("/api/v5/asset/transfer", payload)
         direction = "交易->资金" if from_acct == "18" else "资金->交易"
-        logger.info(f"划转 {direction}  {amt:.4f} {ccy}")
+        log_action(f"划转 {direction}  {amt:.4f} {ccy}")
 
     async def place_order(self, inst_id: str, side: str, pos_side: str, sz: str,
                           ord_type: str = "market", px: Optional[str] = None,
@@ -184,7 +185,7 @@ class OKXClient:
         if sl_px:
             payload.update({"slTriggerPx": sl_px, "slOrdPx": "-1", "slTriggerPxType": "mark"})
         result = await self._post("/api/v5/trade/order", payload)
-        logger.info(f"下单 {side}/{pos_side} sz={sz} px={px or 'market'}")
+        log_action(f"下单 {side}/{pos_side} sz={sz} px={px or 'market'}")
         return result["data"][0]
 
     async def get_order(self, inst_id: str, ord_id: str) -> dict:
@@ -207,10 +208,10 @@ class OKXClient:
         """Cancel a normal OKX order, ignoring already-closed failures."""
         try:
             await self._post("/api/v5/trade/cancel-order", {"instId": inst_id, "ordId": ord_id})
-            logger.info(f"撤单 ordId={ord_id}")
+            log_action(f"撤单 ordId={ord_id}")
         except Exception as e:
             if _is_benign_cancel_error(e):
-                logger.info(f"撤单跳过，订单可能已成交/已撤/不存在 ordId={ord_id}: {e}")
+                log_action(f"撤单跳过，订单可能已成交/已撤/不存在 ordId={ord_id}: {e}")
                 return
             logger.warning(f"撤单失败(可能已成交/不存在): {e}")
 
@@ -225,17 +226,17 @@ class OKXClient:
             "slTriggerPxType": sl_trigger_px_type, "reduceOnly": "true",
         }
         result = await self._post("/api/v5/trade/order-algo", payload)
-        logger.info(f"条件止损单 触发={sl_trigger_px}  sz={sz}")
+        log_action(f"条件止损单 触发={sl_trigger_px}  sz={sz}")
         return result["data"][0]
 
     async def cancel_algo_order(self, inst_id: str, algo_id: str) -> None:
         """Cancel a conditional algo order, ignoring already-closed failures."""
         try:
             await self._post("/api/v5/trade/cancel-algos", [{"instId": inst_id, "algoId": algo_id}])
-            logger.info(f"撤销条件单 algoId={algo_id}")
+            log_action(f"撤销条件单 algoId={algo_id}")
         except Exception as e:
             if _is_benign_cancel_error(e):
-                logger.info(f"撤条件单跳过，订单可能已触发/已撤/不存在 algoId={algo_id}: {e}")
+                log_action(f"撤条件单跳过，订单可能已触发/已撤/不存在 algoId={algo_id}: {e}")
                 return
             logger.warning(f"撤条件单失败: {e}")
 
@@ -243,5 +244,5 @@ class OKXClient:
         """Close the full position for one position side at market."""
         result = await self._post("/api/v5/trade/close-position",
                                   {"instId": inst_id, "posSide": pos_side, "mgnMode": "cross"})
-        logger.info(f"市价平仓 {pos_side}")
+        log_action(f"市价平仓 {pos_side}")
         return result["data"][0]
