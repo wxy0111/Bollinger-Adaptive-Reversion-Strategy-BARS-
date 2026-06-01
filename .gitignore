@@ -1,5 +1,6 @@
 .env
 logs/
+logs_cleaned/
 __pycache__/
 *.pyc
 *.pyo
@@ -9,3 +10,5 @@ __pycache__/
 ETH_USDT_15m_history.csv
 backtest/results/
 backtest/results_current_check/
+backtest/extreme_log_simulator.py
+src/config.py.bak

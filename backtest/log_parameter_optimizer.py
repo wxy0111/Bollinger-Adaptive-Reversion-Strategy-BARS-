@@ -26,17 +26,31 @@ if str(ROOT) not in sys.path:
 from src.config import (
     CONTRACT_STEP,
     CT_VAL,
+    BOLL_WIDTH_BASE_PRICE,
+    BOLL_WIDTH_BASE_USD,
+    BOLL_WIDTH_GAP_MULT,
     DYNAMIC_BASE_ENTRY_RATIO,
+    DYNAMIC_ENTRY_GAP_ENABLED,
+    DYNAMIC_ENTRY_GAP_MAX_USD,
     DYNAMIC_MAX_ENTRY_RATIO,
     DYNAMIC_MIN_ENTRY_RATIO,
+    DYNAMIC_TP_ARM_RETURN,
+    DYNAMIC_TP_ENABLED,
+    DYNAMIC_TP_REPRICE_GAP_USD,
+    DYNAMIC_TP_RESTORE_RETURN,
     FIRST_BATCH_RATIO,
     LEVER,
     MAX_ENTRY_BATCHES,
     MAX_TOTAL_ENTRY_RATIO,
     MIN_BOLL_WIDTH_PCT,
+    MIN_BOLL_WIDTH_FLOOR_USD,
+    MIN_HEAD_LIQ_BUFFER_PCT,
     MIN_ORDER_CONTRACTS,
     NO_NEW_EXTREME_TICKS,
+    OKX_LIQ_FEE_RATE,
+    OKX_MAINTENANCE_MARGIN_RATE,
     SECOND_BATCH_RATIO,
+    TP_TARGET_MARGIN_RETURN,
     TP_PROFIT_USD,
     TRADING_ACCOUNT_TARGET,
 )
@@ -72,6 +86,16 @@ class Params:
     dynamic_min_ratio: float = DYNAMIC_MIN_ENTRY_RATIO
     dynamic_max_ratio: float = DYNAMIC_MAX_ENTRY_RATIO
     max_total_entry_ratio: float = MAX_TOTAL_ENTRY_RATIO
+    boll_width_base_price: float = BOLL_WIDTH_BASE_PRICE
+    boll_width_base_usd: float = BOLL_WIDTH_BASE_USD
+    boll_width_floor_usd: float = MIN_BOLL_WIDTH_FLOOR_USD
+    boll_width_gap_mult: float = BOLL_WIDTH_GAP_MULT
+    tp_target_margin_return: float = TP_TARGET_MARGIN_RETURN
+    min_head_liq_buffer_pct: float = MIN_HEAD_LIQ_BUFFER_PCT
+    dynamic_tp_enabled: int = int(DYNAMIC_TP_ENABLED)
+    dynamic_tp_arm_return: float = DYNAMIC_TP_ARM_RETURN
+    dynamic_tp_restore_return: float = DYNAMIC_TP_RESTORE_RETURN
+    dynamic_tp_reprice_gap_usd: float = DYNAMIC_TP_REPRICE_GAP_USD
 
 
 @dataclass
@@ -157,9 +181,12 @@ class LogReplay:
         self.last_plan_price = 0.0
         self.last_batch_kline = None
         self.last_entry_check_kline = None
+        self.last_close_kline = None
         self.capital_shortage_active = False
         self.entry_time = ""
         self.trades: list[Trade] = []
+        self.events: list[dict] = []
+        self.equity_points: list[dict] = []
         self.equity_curve: list[float] = []
         self.signal_count = 0
         self.skipped_entry_cap = 0
@@ -171,15 +198,21 @@ class LogReplay:
         self.inside_cancel = 0
         self.reprice_count = 0
         self.same_k_block = 0
+        self.close_kline_block = 0
         self.profit_transferred = 0.0
         self.loss_topup = 0.0
+        self.dynamic_tp_active = False
+        self.dynamic_tp_activated = 0
+        self.dynamic_tp_restored = 0
 
     def run(self) -> "LogReplay":
         """Run the replay and return self."""
         for row in self.ticks.itertuples(index=False):
             self._remember_price(float(row.price))
             self._process_tick(row)
-            self.equity_curve.append(self.total_equity() + self._unrealized(float(row.price)))
+            equity = self.total_equity() + self._unrealized(float(row.price))
+            self.equity_curve.append(equity)
+            self.equity_points.append({"ts": str(row.ts), "equity": round(float(equity), 4)})
         return self
 
     def total_equity(self) -> float:
@@ -213,8 +246,145 @@ class LogReplay:
 
     def _width_ok(self, row) -> bool:
         _, _, _, width = self._bands(row)
+        return width >= self._effective_min_boll_width(float(row.price))
+
+    def _effective_boll_width_pct(self) -> float:
+        base_pct = (
+            self.params.boll_width_base_usd / self.params.boll_width_base_price
+            if self.params.boll_width_base_price > 0
+            else 0.0
+        )
+        return max(MIN_BOLL_WIDTH_PCT, base_pct)
+
+    def _head_entry_price(self, fallback_price: float) -> float:
+        filled = sorted(self.pos.filled, key=lambda batch: batch.idx)
+        if filled:
+            return filled[0].price
+        if self.pos.pending is not None and self.pos.pending.idx == 0:
+            return self.pos.pending.price
+        return fallback_price
+
+    def _min_ratio_ladder(self) -> list[float]:
+        ratios = [self.params.first_batch_ratio, self.params.second_batch_ratio]
+        while (
+            sum(ratios) + self.params.dynamic_min_ratio <= self.params.max_total_entry_ratio + 1e-12
+            and len(ratios) < MAX_ENTRY_BATCHES
+        ):
+            ratios.append(self.params.dynamic_min_ratio)
+        if sum(ratios) < self.params.max_total_entry_ratio and len(ratios) < MAX_ENTRY_BATCHES:
+            ratios.append(self.params.max_total_entry_ratio - sum(ratios))
+        return ratios
+
+    def _liq_price_for_ladder(self, head_price: float, gap: float) -> float | None:
+        ratios = self._min_ratio_ladder()
+        prices = [head_price - idx * gap for idx in range(len(ratios))]
+        if not prices or prices[-1] <= 0:
+            return None
+        sizes = []
+        for ratio, price in zip(ratios, prices):
+            raw_sz = self._sizing_equity() * ratio * LEVER / (price * CT_VAL)
+            sz = math.floor(raw_sz / CONTRACT_STEP) * CONTRACT_STEP
+            if sz <= 0:
+                return None
+            sizes.append(sz)
+        qty = sum(sizes) * CT_VAL
+        avg = sum(sz * CT_VAL * price for sz, price in zip(sizes, prices)) / qty
+        entry_fee = sum(sz * CT_VAL * price * OKX_LIQ_FEE_RATE for sz, price in zip(sizes, prices))
+        margin_balance = max(TRADING_ACCOUNT_TARGET - entry_fee, 0.0)
+        denominator = qty * (OKX_MAINTENANCE_MARGIN_RATE + OKX_LIQ_FEE_RATE - 1)
+        if denominator == 0:
+            return None
+        return (margin_balance - qty * avg) / denominator
+
+    def _required_entry_gap_for_head_buffer(self, head_price: float) -> float:
+        if not DYNAMIC_ENTRY_GAP_ENABLED or head_price <= 0:
+            return self.params.min_entry_gap_usd
+
+        def buffer_pct(gap: float) -> float:
+            liq = self._liq_price_for_ladder(head_price, gap)
+            if liq is None:
+                return 999.0
+            return (head_price - liq) / head_price
+
+        if buffer_pct(self.params.min_entry_gap_usd) >= self.params.min_head_liq_buffer_pct:
+            return self.params.min_entry_gap_usd
+        lo = self.params.min_entry_gap_usd
+        hi = DYNAMIC_ENTRY_GAP_MAX_USD
+        for _ in range(25):
+            mid = (lo + hi) / 2
+            if buffer_pct(mid) >= self.params.min_head_liq_buffer_pct:
+                hi = mid
+            else:
+                lo = mid
+        return round(hi, 2)
+
+    def _effective_entry_gap(self, price: float) -> float:
+        head_price = self._head_entry_price(price)
+        return max(self.params.min_entry_gap_usd, self._required_entry_gap_for_head_buffer(head_price))
+
+    def _effective_min_boll_width(self, price: float) -> float:
+        pct_rule = price * self._effective_boll_width_pct() if price > 0 else 0.0
+        gap_rule = self._effective_entry_gap(price) * self.params.boll_width_gap_mult
+        return max(self.params.min_width_usd, self.params.boll_width_floor_usd, pct_rule, gap_rule)
+
+    def _dynamic_tp_distance(self, avg_entry: float) -> float:
+        if avg_entry <= 0:
+            return TP_PROFIT_USD
+        return round(avg_entry * self.params.tp_target_margin_return / LEVER, 2)
+
+    def _refresh_tp(self) -> None:
+        if not self.pos.is_active():
+            return
+        if self.dynamic_tp_active:
+            return
+        distance = self._dynamic_tp_distance(self.pos.avg_entry)
+        self.pos.tp_price = (
+            round(self.pos.avg_entry + distance, 2)
+            if self.pos.direction == "long"
+            else round(self.pos.avg_entry - distance, 2)
+        )
+
+    def _position_margin_return(self, price: float) -> float:
+        if not self.pos.is_active() or self.pos.avg_entry <= 0:
+            return 0.0
+        if self.pos.direction == "long":
+            move = (price - self.pos.avg_entry) / self.pos.avg_entry
+        else:
+            move = (self.pos.avg_entry - price) / self.pos.avg_entry
+        return move * LEVER
+
+    def _target_tp_price(self) -> float:
+        distance = self._dynamic_tp_distance(self.pos.avg_entry)
+        return (
+            round(self.pos.avg_entry + distance, 2)
+            if self.pos.direction == "long"
+            else round(self.pos.avg_entry - distance, 2)
+        )
+
+    def _maybe_update_dynamic_tp(self, row) -> None:
+        if not self.params.dynamic_tp_enabled:
+            return
         price = float(row.price)
-        return width >= self.params.min_width_usd and width / price >= MIN_BOLL_WIDTH_PCT
+        ret = self._position_margin_return(price)
+        target = self._target_tp_price()
+        if self.dynamic_tp_active:
+            if ret < self.params.dynamic_tp_restore_return:
+                self.pos.tp_price = target
+                self.dynamic_tp_active = False
+                self.dynamic_tp_restored += 1
+            return
+        if ret < self.params.dynamic_tp_arm_return or ret >= self.params.tp_target_margin_return:
+            return
+        if self.pos.direction == "long" and self._still_making_new_high():
+            return
+        if self.pos.direction == "short" and self._still_making_new_low():
+            return
+        lock_price = round(price, 2)
+        if abs(lock_price - self.pos.tp_price) < self.params.dynamic_tp_reprice_gap_usd:
+            return
+        self.pos.tp_price = lock_price
+        self.dynamic_tp_active = True
+        self.dynamic_tp_activated += 1
 
     def _outside_direction(self, row) -> str:
         lower, _, upper, _ = self._bands(row)
@@ -246,6 +416,8 @@ class LogReplay:
             self._try_fill_pending(row)
         if self.pos.is_active():
             self._try_take_profit(row)
+        if self.pos.is_active():
+            self._maybe_update_dynamic_tp(row)
         if self.capital_shortage_active and self.trading_balance + 0.01 >= TRADING_ACCOUNT_TARGET:
             self.capital_shortage_active = False
         if self.pos.has_plan():
@@ -260,17 +432,34 @@ class LogReplay:
         if direction == "none":
             return
         price = float(row.price)
-        if self.last_plan_price > 0 and abs(price - self.last_plan_price) < self.params.min_entry_gap_usd:
+        if self.last_plan_price > 0 and abs(price - self.last_plan_price) < self._effective_entry_gap(price):
             self.blocked_gap += 1
             return
         if self.last_batch_kline is not None and row.kline_ts == self.last_batch_kline:
             self.same_k_block += 1
             return
+        if self.last_close_kline is not None:
+            if row.kline_ts == self.last_close_kline:
+                self.close_kline_block += 1
+                return
+            self.last_close_kline = None
         order = self._order_at(0, price)
         if order is None:
             return
         self.pos.direction = direction
         self.pos.pending = order
+        self.events.append(
+            {
+                "ts": str(row.ts),
+                "type": "entry_order",
+                "direction": direction,
+                "batch": 1,
+                "price": order.price,
+                "sz": order.sz,
+                "pnl": 0.0,
+                "note": "头仓挂单",
+            }
+        )
         self.last_plan_price = price
         self.last_batch_kline = row.kline_ts
         self.last_entry_check_kline = row.kline_ts
@@ -322,13 +511,25 @@ class LogReplay:
             return
         if self.pos.direction == "short" and price < last.price:
             return
-        if abs(price - last.price) < self.params.min_entry_gap_usd:
+        if abs(price - last.price) < self._effective_entry_gap(price):
             self.blocked_gap += 1
             return
         order = self._order_at(self.pos.next_idx(), price)
         if order is None:
             return
         self.pos.pending = order
+        self.events.append(
+            {
+                "ts": str(row.ts),
+                "type": "entry_order",
+                "direction": self.pos.direction,
+                "batch": order.idx + 1,
+                "price": order.price,
+                "sz": order.sz,
+                "pnl": 0.0,
+                "note": "补仓挂单",
+            }
+        )
         self.last_batch_kline = row.kline_ts
         self.last_entry_check_kline = row.kline_ts
         self._try_fill_pending(row)
@@ -344,11 +545,23 @@ class LogReplay:
         if replacement is None:
             return
         last = self.pos.last_filled()
-        if last is not None and abs(replacement.price - last.price) < self.params.min_entry_gap_usd:
+        if last is not None and abs(replacement.price - last.price) < self._effective_entry_gap(float(row.price)):
             return
         if abs(replacement.price - self.pos.pending.price) < self.params.reprice_gap_usd:
             return
         self.pos.pending = replacement
+        self.events.append(
+            {
+                "ts": str(row.ts),
+                "type": "reprice",
+                "direction": self.pos.direction,
+                "batch": replacement.idx + 1,
+                "price": replacement.price,
+                "sz": replacement.sz,
+                "pnl": 0.0,
+                "note": "挂单重挂",
+            }
+        )
         self.reprice_count += 1
 
     def _sizing_equity(self) -> float:
@@ -424,8 +637,23 @@ class LogReplay:
         self.trading_balance -= fee
         self.pos.filled.append(pending)
         self.pos.pending = None
+        self.dynamic_tp_active = False
         self.pos.recalc()
+        self._refresh_tp()
         self.last_batch_kline = row.kline_ts
+        event_type = "first_fill" if pending.idx == 0 else "add_fill"
+        self.events.append(
+            {
+                "ts": str(row.ts),
+                "type": event_type,
+                "direction": self.pos.direction,
+                "batch": pending.idx + 1,
+                "price": pending.price,
+                "sz": pending.sz,
+                "pnl": 0.0,
+                "note": "头仓成交" if pending.idx == 0 else "补仓成交",
+            }
+        )
 
     def _try_take_profit(self, row) -> None:
         price = float(row.price)
@@ -433,9 +661,9 @@ class LogReplay:
             return
         if self.pos.direction == "short" and price > self.pos.tp_price:
             return
-        self._close(self.pos.tp_price, str(row.ts), price)
+        self._close(self.pos.tp_price, str(row.ts), price, row.kline_ts)
 
-    def _close(self, exit_price: float, ts: str, mark_price: float) -> None:
+    def _close(self, exit_price: float, ts: str, mark_price: float, kline_ts) -> None:
         avg = self.pos.avg_entry
         sz = self.pos.total_sz
         if self.pos.direction == "long":
@@ -446,6 +674,18 @@ class LogReplay:
         pnl = raw_pnl - fee
         self.trading_balance += pnl
         self._rebalance()
+        self.events.append(
+            {
+                "ts": ts,
+                "type": "close",
+                "direction": self.pos.direction,
+                "batch": len(self.pos.filled),
+                "price": round(exit_price, 4),
+                "sz": round(sz, 8),
+                "pnl": round(pnl, 4),
+                "note": "止盈平仓",
+            }
+        )
         self.trades.append(
             Trade(
                 entry_time=self.entry_time,
@@ -459,9 +699,11 @@ class LogReplay:
             )
         )
         self.pos.reset()
+        self.dynamic_tp_active = False
         self.entry_time = ""
         self.last_batch_kline = None
         self.last_entry_check_kline = None
+        self.last_close_kline = kline_ts
 
     def _rebalance(self) -> None:
         diff = self.trading_balance - TRADING_ACCOUNT_TARGET
@@ -508,6 +750,16 @@ class LogReplay:
             "dynamic_min_ratio": self.params.dynamic_min_ratio,
             "dynamic_max_ratio": self.params.dynamic_max_ratio,
             "max_total_entry_ratio": self.params.max_total_entry_ratio,
+            "boll_width_base_price": self.params.boll_width_base_price,
+            "boll_width_base_usd": self.params.boll_width_base_usd,
+            "boll_width_floor_usd": self.params.boll_width_floor_usd,
+            "boll_width_gap_mult": self.params.boll_width_gap_mult,
+            "tp_target_margin_return": self.params.tp_target_margin_return,
+            "min_head_liq_buffer_pct": self.params.min_head_liq_buffer_pct,
+            "dynamic_tp_enabled": self.params.dynamic_tp_enabled,
+            "dynamic_tp_arm_return": self.params.dynamic_tp_arm_return,
+            "dynamic_tp_restore_return": self.params.dynamic_tp_restore_return,
+            "dynamic_tp_reprice_gap_usd": self.params.dynamic_tp_reprice_gap_usd,
             "final_total_equity": round(self.total_equity(), 4),
             "total_pnl": round(self.total_equity() - self.initial_total, 4),
             "return_pct": round((self.total_equity() / self.initial_total - 1) * 100, 4),
@@ -522,6 +774,9 @@ class LogReplay:
             "inside_cancel": self.inside_cancel,
             "reprice_count": self.reprice_count,
             "same_k_block": self.same_k_block,
+            "close_kline_block": self.close_kline_block,
+            "dynamic_tp_activated": self.dynamic_tp_activated,
+            "dynamic_tp_restored": self.dynamic_tp_restored,
             "blocked_width": self.blocked_width,
             "blocked_gap": self.blocked_gap,
             "blocked_extreme": self.blocked_extreme,
@@ -532,7 +787,7 @@ class LogReplay:
         }
 
 
-def parse_logs(log_dir: Path) -> pd.DataFrame:
+def parse_logs(log_dir: Path, sample_sec: int = 0) -> pd.DataFrame:
     """Parse live tick snapshots from strategy logs."""
     rows = []
     for path in sorted(log_dir.glob("boll_pin_*.log")):
@@ -553,6 +808,14 @@ def parse_logs(log_dir: Path) -> pd.DataFrame:
     if not rows:
         raise RuntimeError(f"没有从 {log_dir} 解析到策略 tick 日志")
     df = pd.DataFrame(rows).sort_values("ts").drop_duplicates("ts")
+    if sample_sec and sample_sec > 0:
+        df = (
+            df.set_index("ts")
+            .resample(f"{int(sample_sec)}s")
+            .last()
+            .dropna(subset=["price"])
+            .reset_index()
+        )
     df["kline_ts"] = df["ts"].dt.floor("15min")
     return df.reset_index(drop=True)
 
@@ -560,6 +823,11 @@ def parse_logs(log_dir: Path) -> pd.DataFrame:
 def parse_float_list(text: str) -> list[float]:
     """Parse comma-separated floats."""
     return [float(item.strip()) for item in text.split(",") if item.strip()]
+
+
+def parse_int_list(text: str) -> list[int]:
+    """Parse comma-separated integers."""
+    return [int(float(item.strip())) for item in text.split(",") if item.strip()]
 
 
 def build_grid(args) -> list[Params]:
@@ -577,16 +845,30 @@ def build_grid(args) -> list[Params]:
             parse_float_list(args.dynamic_min_ratio),
             parse_float_list(args.dynamic_max_ratio),
             parse_float_list(args.max_total_entry_ratio),
+            parse_float_list(args.boll_width_base_price),
+            parse_float_list(args.boll_width_base_usd),
+            parse_float_list(args.boll_width_floor_usd),
+            parse_float_list(args.boll_width_gap_mult),
+            parse_float_list(args.tp_target_margin_return),
+            parse_float_list(args.min_head_liq_buffer_pct),
+            parse_int_list(args.dynamic_tp_enabled),
+            parse_float_list(args.dynamic_tp_arm_return),
+            parse_float_list(args.dynamic_tp_restore_return),
+            parse_float_list(args.dynamic_tp_reprice_gap_usd),
         )
     ]
 
 
 FOCUSED_GROUPS = [
+    ("BOLL/Width", ("boll_std", "min_width_usd")),
     ("Width", ("min_width_usd",)),
     ("Entry Gap", ("min_entry_gap_usd",)),
     ("First/Second", ("first_batch_ratio", "second_batch_ratio")),
     ("Dyn Base/Min/Max", ("dynamic_base_ratio", "dynamic_min_ratio", "dynamic_max_ratio")),
     ("Max Total", ("max_total_entry_ratio",)),
+    ("Boll Dynamic", ("boll_width_base_usd", "boll_width_gap_mult")),
+    ("TP Return", ("tp_target_margin_return",)),
+    ("Head Buffer", ("min_head_liq_buffer_pct",)),
 ]
 
 
@@ -652,7 +934,11 @@ def write_markdown_report(path: Path, rows: list[dict], ticks: pd.DataFrame) -> 
             f"`DYNAMIC_BASE_ENTRY_RATIO={best['dynamic_base_ratio']}`, "
             f"`DYNAMIC_MIN_ENTRY_RATIO={best['dynamic_min_ratio']}`, "
             f"`DYNAMIC_MAX_ENTRY_RATIO={best['dynamic_max_ratio']}`, "
-            f"`MAX_TOTAL_ENTRY_RATIO={best['max_total_entry_ratio']}`"
+            f"`MAX_TOTAL_ENTRY_RATIO={best['max_total_entry_ratio']}`, "
+            f"`BOLL_WIDTH_BASE_USD={best['boll_width_base_usd']}`, "
+            f"`BOLL_WIDTH_GAP_MULT={best['boll_width_gap_mult']}`, "
+            f"`TP_TARGET_MARGIN_RETURN={best['tp_target_margin_return']}`, "
+            f"`MIN_HEAD_LIQ_BUFFER_PCT={best['min_head_liq_buffer_pct']}`"
         ),
         "",
         (
@@ -724,6 +1010,12 @@ def apply_params_to_config(row: dict, config_path: Path = CONFIG_PATH) -> Path:
         "DYNAMIC_MIN_ENTRY_RATIO": row["dynamic_min_ratio"],
         "DYNAMIC_MAX_ENTRY_RATIO": row["dynamic_max_ratio"],
         "MAX_TOTAL_ENTRY_RATIO": row["max_total_entry_ratio"],
+        "BOLL_WIDTH_BASE_PRICE": row["boll_width_base_price"],
+        "BOLL_WIDTH_BASE_USD": row["boll_width_base_usd"],
+        "MIN_BOLL_WIDTH_FLOOR_USD": row["boll_width_floor_usd"],
+        "BOLL_WIDTH_GAP_MULT": row["boll_width_gap_mult"],
+        "TP_TARGET_MARGIN_RETURN": row["tp_target_margin_return"],
+        "MIN_HEAD_LIQ_BUFFER_PCT": row["min_head_liq_buffer_pct"],
     }
     text = config_path.read_text(encoding="utf-8")
     backup_path = config_path.with_suffix(".py.bak")
@@ -846,8 +1138,9 @@ def main() -> None:
     parser.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
     parser.add_argument("--initial-total-equity", type=float, default=INITIAL_TOTAL_EQUITY)
+    parser.add_argument("--sample-sec", type=int, default=0, help="Optional replay resample interval in seconds; 0 uses every parsed tick.")
     parser.add_argument("--boll-std", default="1.8,2.0,2.2")
-    parser.add_argument("--min-width-usd", default="10,12,15,18,20,25")
+    parser.add_argument("--min-width-usd", default="10,12,13.5,15,16.5,18,20,25")
     parser.add_argument("--min-entry-gap-usd", default="3,4,5,6,8")
     parser.add_argument("--reprice-gap-usd", default="0.5,1,2")
     parser.add_argument("--first-batch-ratio", default=str(FIRST_BATCH_RATIO))
@@ -856,6 +1149,16 @@ def main() -> None:
     parser.add_argument("--dynamic-min-ratio", default=str(DYNAMIC_MIN_ENTRY_RATIO))
     parser.add_argument("--dynamic-max-ratio", default=str(DYNAMIC_MAX_ENTRY_RATIO))
     parser.add_argument("--max-total-entry-ratio", default=str(MAX_TOTAL_ENTRY_RATIO))
+    parser.add_argument("--boll-width-base-price", default=str(BOLL_WIDTH_BASE_PRICE))
+    parser.add_argument("--boll-width-base-usd", default=str(BOLL_WIDTH_BASE_USD))
+    parser.add_argument("--boll-width-floor-usd", default=str(MIN_BOLL_WIDTH_FLOOR_USD))
+    parser.add_argument("--boll-width-gap-mult", default=str(BOLL_WIDTH_GAP_MULT))
+    parser.add_argument("--tp-target-margin-return", default=str(TP_TARGET_MARGIN_RETURN))
+    parser.add_argument("--min-head-liq-buffer-pct", default=str(MIN_HEAD_LIQ_BUFFER_PCT))
+    parser.add_argument("--dynamic-tp-enabled", default=str(int(DYNAMIC_TP_ENABLED)))
+    parser.add_argument("--dynamic-tp-arm-return", default=str(DYNAMIC_TP_ARM_RETURN))
+    parser.add_argument("--dynamic-tp-restore-return", default=str(DYNAMIC_TP_RESTORE_RETURN))
+    parser.add_argument("--dynamic-tp-reprice-gap-usd", default=str(DYNAMIC_TP_REPRICE_GAP_USD))
     parser.add_argument("--no-prompt", action="store_true", help="Generate report only; do not show config sync prompt.")
     parser.add_argument("--quiet", action="store_true", help="Hide progress output and print only final results.")
     args = parser.parse_args()
@@ -865,7 +1168,7 @@ def main() -> None:
 
     if not args.quiet:
         print("Reading strategy logs...", flush=True)
-    ticks = parse_logs(Path(args.log_dir))
+    ticks = parse_logs(Path(args.log_dir), sample_sec=args.sample_sec)
     if not args.quiet:
         print(
             f"Loaded {len(ticks)} ticks, range {ticks['ts'].min()} -> {ticks['ts'].max()}",

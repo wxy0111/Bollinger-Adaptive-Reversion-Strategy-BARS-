@@ -7,6 +7,7 @@ the exchange average entry price and a liquidation-line stop order.
 """
 import asyncio
 import json
+import math
 import time
 import aiohttp
 import pandas as pd
@@ -19,6 +20,14 @@ from src.config import (
     PRICE_LOG_INTERVAL, POLL_INTERVAL, MAX_DRAWDOWN, BOLL_PERIOD,
     TP_PROFIT_USD, MIN_ENTRY_GAP_USD,
     MIN_BOLL_WIDTH_USD, MIN_BOLL_WIDTH_PCT,
+    BOLL_WIDTH_BASE_PRICE, BOLL_WIDTH_BASE_USD,
+    MIN_BOLL_WIDTH_FLOOR_USD, BOLL_WIDTH_GAP_MULT,
+    TP_TARGET_MARGIN_RETURN, DYNAMIC_TP_ENABLED,
+    DYNAMIC_TP_ARM_RETURN, DYNAMIC_TP_RESTORE_RETURN,
+    DYNAMIC_TP_REPRICE_GAP_USD,
+    MIN_HEAD_LIQ_BUFFER_PCT, DYNAMIC_ENTRY_GAP_ENABLED,
+    DYNAMIC_ENTRY_GAP_MAX_USD, OKX_MAINTENANCE_MARGIN_RATE,
+    OKX_LIQ_FEE_RATE,
     LIQ_STOP_OFFSET_USD, LIQ_WARNING_DISTANCE_USD,
     LIQ_WARNING_REPEAT_SEC,
     NO_NEW_EXTREME_TICKS,
@@ -42,6 +51,7 @@ import src.dashboard as dashboard
 
 
 STATE_FILE = Path("logs/runtime_state.json")
+COOLDOWN_FILE = Path("logs/close_cooldown.json")
 
 
 class BollPinStrategy:
@@ -62,6 +72,7 @@ class BollPinStrategy:
         self._last_batch_kline_ts = None
         self._last_recovery_kline_ts = None
         self._last_entry_check_kline_ts = None
+        self._last_close_kline_ts = None
         self._probe_kline_ts = None
         self._probe_direction = "none"
         self._probe_entry_price = 0.0
@@ -74,6 +85,7 @@ class BollPinStrategy:
         self._capital_shortage_active = False
         self._last_liq_warning_ts = 0.0
         self._last_liq_warning_gap_usd = None
+        self._dynamic_tp_active = False
 
     async def run(self):
         """Run the strategy loop until stopped."""
@@ -87,6 +99,7 @@ class BollPinStrategy:
             except Exception as e:
                 logger.warning(f"Set leverage failed; please verify {LEVER}x in OKX App: {e}")
             self._load_runtime_state()
+            self._load_close_cooldown()
             await self._ensure_fixed_batch_sizes(client)
             await self._sync_state(client)
 
@@ -323,6 +336,7 @@ class BollPinStrategy:
                 "sizing_equity": self._sizing_equity,
                 "fixed_batch_sizes": self._fixed_batch_sizes,
                 "capital_shortage_active": self._capital_shortage_active,
+                "dynamic_tp_active": self._dynamic_tp_active and self._state.is_active(),
             },
         }
 
@@ -338,11 +352,46 @@ class BollPinStrategy:
 
     def _clear_runtime_state(self):
         """Delete the persisted runtime-state file."""
+        self._dynamic_tp_active = False
         try:
             if STATE_FILE.exists():
                 STATE_FILE.unlink()
         except Exception as e:
             logger.warning(f"Clear runtime state failed: {e}")
+
+    def _save_close_cooldown(self):
+        """Persist the last close kline so restart cannot re-enter too soon."""
+        if self._last_close_kline_ts is None:
+            return
+        try:
+            COOLDOWN_FILE.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "inst_id": INST_ID,
+                "last_close_kline_ts": self._ts_to_str(self._last_close_kline_ts),
+            }
+            COOLDOWN_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"Save close cooldown failed: {e}")
+
+    def _load_close_cooldown(self):
+        """Load the last close-kline cooldown marker if it exists."""
+        if not COOLDOWN_FILE.exists():
+            return
+        try:
+            payload = json.loads(COOLDOWN_FILE.read_text(encoding="utf-8"))
+            if payload.get("inst_id") != INST_ID:
+                return
+            self._last_close_kline_ts = self._str_to_ts(payload.get("last_close_kline_ts"))
+        except Exception as e:
+            logger.warning(f"Load close cooldown failed: {e}")
+
+    def _clear_close_cooldown(self):
+        """Clear the close-kline cooldown marker after the next kline arrives."""
+        try:
+            if COOLDOWN_FILE.exists():
+                COOLDOWN_FILE.unlink()
+        except Exception as e:
+            logger.warning(f"Clear close cooldown failed: {e}")
 
     def _sanitize_runtime_state(self):
         """Drop impossible local position residue before persisting or using it."""
@@ -399,6 +448,7 @@ class BollPinStrategy:
             self._sizing_equity = float(strategy.get("sizing_equity", 0) or 0)
             self._fixed_batch_sizes = [float(x) for x in strategy.get("fixed_batch_sizes", [])]
             self._capital_shortage_active = bool(strategy.get("capital_shortage_active", False))
+            self._dynamic_tp_active = bool(strategy.get("dynamic_tp_active", False))
             self._sanitize_runtime_state()
             if self._sync_known_batch_sizes():
                 self._save_runtime_state()
@@ -486,12 +536,14 @@ class BollPinStrategy:
 
         # 4. 棢查持仓是否已平，并恢复旧仓位缺失的补仓单
         if self._state.is_active():
-            await self._check_position_closed(client, mark_price)
+            await self._check_position_closed(client, mark_price, last["ts"])
         if self._state.is_active():
             await self._recover_missing_entry_orders(client, df, last, equity, mark_price)
 
         # 5. 强平预警（距强平?< 3%?
         await self._maybe_notify_liq_warning(mark_price)
+        if self._state.is_active():
+            await self._maybe_update_dynamic_tp(client, mark_price)
 
         # 6. 盘中评分通过后批挂单，每根K线最多新增一?
         if self._capital_shortage_active:
@@ -525,17 +577,170 @@ class BollPinStrategy:
     def _boll_width_ok(self, last, mark_price: float) -> bool:
         """Return whether current Bollinger width allows new entries."""
         width = float(last["boll_width"])
-        width_pct = width / mark_price if mark_price > 0 else 0.0
-        return width >= MIN_BOLL_WIDTH_USD and width_pct >= MIN_BOLL_WIDTH_PCT
+        return width >= self._effective_min_boll_width(mark_price)
 
     def _log_boll_width_skip(self, reason: str, last, mark_price: float) -> None:
         """Log a contextual reason when Bollinger width blocks an action."""
         width = float(last["boll_width"])
         width_pct = width / mark_price if mark_price > 0 else 0.0
+        required = self._effective_min_boll_width(mark_price)
+        required_pct = self._effective_boll_width_pct()
         log_check(
+            f"{reason}: Bollinger width too narrow "
+            f"width={width:.2f} < {required:.2f} "
+            f"width_pct={width_pct:.2%} threshold={required_pct:.2%}"
+        )
+        return
+        _old_log_check_disabled(
             f"{reason}：布林宽度不足 width={width:.2f} < {MIN_BOLL_WIDTH_USD:.2f} "
             f"width_pct={width_pct:.2%} threshold={MIN_BOLL_WIDTH_PCT:.2%}"
         )
+
+    def _effective_boll_width_pct(self) -> float:
+        """Return the active percentage width threshold."""
+        base_pct = BOLL_WIDTH_BASE_USD / BOLL_WIDTH_BASE_PRICE if BOLL_WIDTH_BASE_PRICE > 0 else 0.0
+        return max(MIN_BOLL_WIDTH_PCT, base_pct)
+
+    def _head_entry_price(self, fallback_price: float) -> float:
+        """Return the first filled batch price for dynamic risk calculations."""
+        filled = sorted(self._state.filled_batches(), key=lambda b: b.batch_idx)
+        if filled:
+            return filled[0].price
+        pending = self._state.pending_batch()
+        if pending is not None and pending.batch_idx == 0:
+            return pending.price
+        return fallback_price
+
+    def _min_ratio_ladder(self) -> list[float]:
+        """Return the assumed minimum-size ladder up to the total-entry cap."""
+        ratios = [FIRST_BATCH_RATIO, SECOND_BATCH_RATIO]
+        while (
+            sum(ratios) + DYNAMIC_MIN_ENTRY_RATIO <= MAX_TOTAL_ENTRY_RATIO + 1e-12
+            and len(ratios) < MAX_ENTRY_BATCHES
+        ):
+            ratios.append(DYNAMIC_MIN_ENTRY_RATIO)
+        if sum(ratios) < MAX_TOTAL_ENTRY_RATIO and len(ratios) < MAX_ENTRY_BATCHES:
+            ratios.append(MAX_TOTAL_ENTRY_RATIO - sum(ratios))
+        return ratios
+
+    def _liq_price_for_ladder(self, head_price: float, gap: float) -> float | None:
+        """Estimate OKX long liquidation price after minimum-ratio ladder fills."""
+        ratios = self._min_ratio_ladder()
+        prices = [head_price - idx * gap for idx in range(len(ratios))]
+        if not prices or prices[-1] <= 0:
+            return None
+
+        sizes = []
+        for ratio, price in zip(ratios, prices):
+            raw_sz = TRADING_ACCOUNT_TARGET * ratio * LEVER / (price * CT_VAL)
+            sz = math.floor(raw_sz / CONTRACT_STEP) * CONTRACT_STEP
+            if sz <= 0:
+                return None
+            sizes.append(sz)
+
+        qty = sum(sizes) * CT_VAL
+        avg = sum(sz * CT_VAL * price for sz, price in zip(sizes, prices)) / qty
+        entry_fee = sum(sz * CT_VAL * price * OKX_LIQ_FEE_RATE for sz, price in zip(sizes, prices))
+        margin_balance = max(TRADING_ACCOUNT_TARGET - entry_fee, 0.0)
+        denominator = qty * (OKX_MAINTENANCE_MARGIN_RATE + OKX_LIQ_FEE_RATE - 1)
+        if denominator == 0:
+            return None
+        return (margin_balance - qty * avg) / denominator
+
+    def _required_entry_gap_for_head_buffer(self, head_price: float) -> float:
+        """Return minimum gap that keeps full-ladder liq distance above target."""
+        if not DYNAMIC_ENTRY_GAP_ENABLED or head_price <= 0:
+            return MIN_ENTRY_GAP_USD
+
+        def buffer_pct(gap: float) -> float:
+            liq = self._liq_price_for_ladder(head_price, gap)
+            if liq is None:
+                return 999.0
+            return (head_price - liq) / head_price
+
+        if buffer_pct(MIN_ENTRY_GAP_USD) >= MIN_HEAD_LIQ_BUFFER_PCT:
+            return MIN_ENTRY_GAP_USD
+
+        lo = MIN_ENTRY_GAP_USD
+        hi = DYNAMIC_ENTRY_GAP_MAX_USD
+        for _ in range(25):
+            mid = (lo + hi) / 2
+            if buffer_pct(mid) >= MIN_HEAD_LIQ_BUFFER_PCT:
+                hi = mid
+            else:
+                lo = mid
+        return round(hi, 2)
+
+    def _effective_entry_gap(self, mark_price: float) -> float:
+        """Return current entry spacing after head-price liquidation buffer."""
+        head_price = self._head_entry_price(mark_price)
+        return max(MIN_ENTRY_GAP_USD, self._required_entry_gap_for_head_buffer(head_price))
+
+    def _effective_min_boll_width(self, mark_price: float) -> float:
+        """Return dynamic Bollinger-width threshold."""
+        pct_rule = mark_price * self._effective_boll_width_pct() if mark_price > 0 else 0.0
+        gap_rule = self._effective_entry_gap(mark_price) * BOLL_WIDTH_GAP_MULT
+        return max(MIN_BOLL_WIDTH_USD, MIN_BOLL_WIDTH_FLOOR_USD, pct_rule, gap_rule)
+
+    def _dynamic_tp_distance(self, avg_entry: float) -> float:
+        """Return take-profit distance targeting a margin-return percentage."""
+        if avg_entry <= 0:
+            return TP_PROFIT_USD
+        return round(avg_entry * TP_TARGET_MARGIN_RETURN / LEVER, 2)
+
+    def _tp_price_from_avg(self, direction: str, avg_entry: float) -> float:
+        """Return dynamic take-profit price from average entry."""
+        distance = self._dynamic_tp_distance(avg_entry)
+        return round(avg_entry + distance, 2) if direction == "long" else round(avg_entry - distance, 2)
+
+    def _position_margin_return(self, mark_price: float) -> float:
+        """Return current leveraged return from average entry."""
+        if not self._state.is_active() or self._state.avg_entry <= 0:
+            return 0.0
+        if self._state.direction == "long":
+            move = (mark_price - self._state.avg_entry) / self._state.avg_entry
+        else:
+            move = (self._state.avg_entry - mark_price) / self._state.avg_entry
+        return move * LEVER
+
+    async def _maybe_update_dynamic_tp(self, client: OKXClient, mark_price: float) -> None:
+        """Switch take-profit to a live-price lock when profit momentum stalls."""
+        if not DYNAMIC_TP_ENABLED or not self._state.is_active():
+            return
+        ret = self._position_margin_return(mark_price)
+        target_tp = self._tp_price_from_avg(self._state.direction, self._state.avg_entry)
+
+        if self._dynamic_tp_active:
+            if ret < DYNAMIC_TP_RESTORE_RETURN:
+                self._state.plan_tp_price = target_tp
+                self._dynamic_tp_active = False
+                log_check(
+                    f"Dynamic TP restored: return={ret:.2%} tp={target_tp:.2f}"
+                )
+                await self._update_tp(client)
+                self._save_runtime_state()
+            return
+
+        if ret < DYNAMIC_TP_ARM_RETURN or ret >= TP_TARGET_MARGIN_RETURN:
+            return
+        if self._state.direction == "long" and self._still_making_new_high():
+            return
+        if self._state.direction == "short" and self._still_making_new_low():
+            return
+
+        lock_price = round(mark_price, 2)
+        if abs(lock_price - self._state.plan_tp_price) < DYNAMIC_TP_REPRICE_GAP_USD:
+            return
+
+        old_tp = self._state.plan_tp_price
+        self._state.plan_tp_price = lock_price
+        self._dynamic_tp_active = True
+        log_action(
+            f"Dynamic TP lock: return={ret:.2%} old_tp={old_tp:.2f} "
+            f"new_tp={lock_price:.2f}"
+        )
+        await self._update_tp(client)
+        self._save_runtime_state()
 
     async def _maybe_notify_liq_warning(self, mark_price: float) -> None:
         """Send liquidation warning with throttling to avoid message spam."""
@@ -717,15 +922,23 @@ class BollPinStrategy:
 
     def _can_open_new_plan(self, kline_ts, entry_price: float) -> bool:
         """Return whether a new first-batch plan can be opened."""
+        if self._last_close_kline_ts is not None:
+            if kline_ts == self._last_close_kline_ts:
+                log_check(f"平仓同K跳过：本根K线刚平仓，等待下一根K线再开仓 ts={kline_ts}")
+                return False
+            self._last_close_kline_ts = None
+            self._clear_close_cooldown()
+
         if self._last_plan_kline_ts is not None and kline_ts == self._last_plan_kline_ts:
             log_check(f"This kline already opened one plan; skip signal ts={kline_ts}")
             return False
 
         if self._last_plan_entry_price > 0:
             gap = abs(entry_price - self._last_plan_entry_price)
-            if gap < MIN_ENTRY_GAP_USD:
+            required_gap = self._effective_entry_gap(entry_price)
+            if gap < required_gap:
                 log_check(
-                    f"Entry plan gap below {MIN_ENTRY_GAP_USD:.2f} USDT: "
+                    f"Entry plan gap below {required_gap:.2f} USDT: "
                     f"last={self._last_plan_entry_price:.2f} current={entry_price:.2f} gap={gap:.2f}"
                 )
                 return False
@@ -739,6 +952,8 @@ class BollPinStrategy:
 
         pending_batch = self._state.pending_batch()
         if pending_batch is not None:
+            if self._last_batch_kline_ts is not None and last["ts"] == self._last_batch_kline_ts:
+                return
             if await self._cancel_pending_if_width_too_narrow(client, last, mark_price):
                 return
             if await self._cancel_pending_if_inside_too_long(client, last, mark_price):
@@ -808,9 +1023,10 @@ class BollPinStrategy:
 
         next_order = next_plan.orders[0]
         gap = abs(next_order.price - last_batch.price)
-        if gap < MIN_ENTRY_GAP_USD:
+        required_gap = self._effective_entry_gap(mark_price)
+        if gap < required_gap:
             log_check(
-                f"Next batch gap below {MIN_ENTRY_GAP_USD:.2f} USDT: "
+                f"Next batch gap below {required_gap:.2f} USDT: "
                 f"last_fill={last_batch.price:.2f} next={next_order.price:.2f} gap={gap:.2f}"
             )
             return
@@ -855,11 +1071,11 @@ class BollPinStrategy:
             self._save_runtime_state()
             return
 
-        next_idx = max(1, self._state.next_batch_idx())
-        if next_idx >= MAX_ENTRY_BATCHES:
+        pending_idx = pending_batch.batch_idx
+        if pending_idx >= MAX_ENTRY_BATCHES:
             self._state.remaining_batches_placed = True
             return
-        if not self._prepare_dynamic_batch_size(next_idx, mark_price):
+        if not self._prepare_dynamic_batch_size(pending_idx, mark_price):
             self._save_runtime_state()
             return
 
@@ -882,7 +1098,7 @@ class BollPinStrategy:
 
         next_order = next_plan.orders[0]
         gap_from_filled = abs(next_order.price - last_filled.price)
-        if gap_from_filled < MIN_ENTRY_GAP_USD:
+        if gap_from_filled < self._effective_entry_gap(mark_price):
             self._save_runtime_state()
             return
 
@@ -1011,10 +1227,10 @@ class BollPinStrategy:
         )
         if plan.direction == "long":
             liq_price = price - ((margin * 0.9) / (order.sz * CT_VAL))
-            tp_price = price + TP_PROFIT_USD
+            tp_price = price + self._dynamic_tp_distance(price)
         else:
             liq_price = price + ((margin * 0.9) / (order.sz * CT_VAL))
-            tp_price = price - TP_PROFIT_USD
+            tp_price = price - self._dynamic_tp_distance(price)
 
         return replace(
             one_order_plan,
@@ -1160,9 +1376,10 @@ class BollPinStrategy:
         if last_batch is not None:
             next_order = recovery_plan.orders[0]
             gap = abs(next_order.price - last_batch.price)
-            if gap < MIN_ENTRY_GAP_USD:
+            required_gap = self._effective_entry_gap(mark_price)
+            if gap < required_gap:
                 logger.info(
-                    f"Recovery add-on gap below {MIN_ENTRY_GAP_USD:.2f} USDT: "
+                    f"Recovery add-on gap below {required_gap:.2f} USDT: "
                     f"last_fill={last_batch.price:.2f} next={next_order.price:.2f} gap={gap:.2f}"
                 )
                 self._last_recovery_kline_ts = last["ts"]
@@ -1254,6 +1471,7 @@ class BollPinStrategy:
                 logger.info(f"Synced historical fill at kline={filled_kline_ts}; current kline can continue")
 
         if self._state.total_sz != prev_sz:
+            self._dynamic_tp_active = False
             avg = await self._sync_exchange_position(client)
             if avg <= 0:
                 avg = self._recalc_tp()
@@ -1281,10 +1499,8 @@ class BollPinStrategy:
         weighted_price = sum(b.price * b.sz for b in filled)
         avg_entry      = weighted_price / total_sz
         self._state.avg_entry = avg_entry
-        if self._state.direction == "long":
-            self._state.plan_tp_price = round(avg_entry + TP_PROFIT_USD, 2)
-        else:
-            self._state.plan_tp_price = round(avg_entry - TP_PROFIT_USD, 2)
+        self._dynamic_tp_active = False
+        self._state.plan_tp_price = self._tp_price_from_avg(self._state.direction, avg_entry)
         log_check(f"Average entry={avg_entry:.2f} new_tp={self._state.plan_tp_price}")
         return avg_entry
 
@@ -1312,11 +1528,8 @@ class BollPinStrategy:
         self._state.update_position(total_sz, avg_entry, liq_price)
         self._seed_existing_position_batch()
 
-        if avg_entry > 0:
-            if pos_side == "long":
-                self._state.plan_tp_price = round(avg_entry + TP_PROFIT_USD, 2)
-            else:
-                self._state.plan_tp_price = round(avg_entry - TP_PROFIT_USD, 2)
+        if avg_entry > 0 and (not self._dynamic_tp_active or self._state.plan_tp_price <= 0):
+            self._state.plan_tp_price = self._tp_price_from_avg(pos_side, avg_entry)
 
         logger.info(
             f"交易扢持仓同步 均价={avg_entry:.2f} 张数={total_sz} "
@@ -1356,7 +1569,10 @@ class BollPinStrategy:
             return
 
         if self._state.tp_ord_id:
-            await client.cancel_order(INST_ID, self._state.tp_ord_id)
+            try:
+                await client.cancel_order(INST_ID, self._state.tp_ord_id)
+            except Exception as e:
+                logger.warning(f"Cancel old take-profit order failed: {e}")
             self._state.tp_ord_id = None
 
         try:
@@ -1413,42 +1629,52 @@ class BollPinStrategy:
 
     # ┢┢ 棢查持仓是否已?┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢
 
-    async def _check_position_closed(self, client: OKXClient, mark_price: float):
+    async def _check_position_closed(self, client: OKXClient, mark_price: float, kline_ts=None):
         """Detect external position close and reset local state."""
         pos = await client.get_position(INST_ID)
         if pos is None or float(pos.get("pos", 0)) == 0:
+            self._last_close_kline_ts = kline_ts
+            self._save_close_cooldown()
             # 计算本次盈亏
             filled = self._state.filled_batches()
             avg_entry = self._state.avg_entry
             total_sz = self._state.total_sz
+            direction = self._state.direction
+            close_price = self._state.plan_tp_price if self._state.plan_tp_price > 0 else mark_price
             if filled and avg_entry <= 0:
                 total_sz       = sum(b.sz for b in filled)
                 avg_entry      = sum(b.price * b.sz for b in filled) / total_sz
             if total_sz > 0 and avg_entry > 0:
                 from src.config import CT_VAL
-                if self._state.direction == "long":
-                    pnl = (mark_price - avg_entry) * total_sz * CT_VAL
+                if direction == "long":
+                    pnl = (close_price - avg_entry) * total_sz * CT_VAL
                 else:
-                    pnl = (avg_entry - mark_price) * total_sz * CT_VAL
+                    pnl = (avg_entry - close_price) * total_sz * CT_VAL
+                log_action(
+                    f"止盈平仓 {direction} 均价={avg_entry:.2f} "
+                    f"平仓价={close_price:.2f} 张数={total_sz:.2f} 估算收益={pnl:+.4f} USDT"
+                )
                 dashboard.state.add_trade(
-                    action="平多" if self._state.direction == "long" else "平空",
-                    price=mark_price,
+                    action="平多" if direction == "long" else "平空",
+                    price=close_price,
                     sz=total_sz,
                     pnl=pnl,
                 )
-                await notify_close(self._state.direction, avg_entry, mark_price, pnl, total_sz)
+                await notify_close(direction, avg_entry, close_price, pnl, total_sz)
 
             await self._cancel_entry_orders(client)
             await self._cancel_exchange_exit_orders(client)
             await self._cancel_exit_orders(client)
-            log_action("Position closed; reset strategy state")
+            log_action("持仓状态已重置")
             self._last_plan_kline_ts = None
             self._last_batch_kline_ts = None
             self._last_plan_entry_price = 0.0
             self._reset_probe_state()
             self._state.reset()
             self._clear_runtime_state()
-            await self._rebalance_accounts(client)
+            actual_profit = await self._rebalance_accounts(client)
+            if actual_profit > 0:
+                log_action(f"固本收益确认 实际落袋=+{actual_profit:.4f} USDT")
             await self._init_fixed_batch_sizes(client)
 
     # ┢┢ 恢复状?┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢
@@ -1800,7 +2026,7 @@ class BollPinStrategy:
                 continue
 
             gap = abs(px - last_batch.price)
-            invalid = gap < MIN_ENTRY_GAP_USD
+            invalid = gap < self._effective_entry_gap(px)
             if self._state.direction == "long" and px >= last_batch.price:
                 invalid = True
             if self._state.direction == "short" and px <= last_batch.price:
@@ -1907,7 +2133,7 @@ class BollPinStrategy:
 
     # ┢┢ 资金账户再平?┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢┢
 
-    async def _rebalance_accounts(self, client: OKXClient) -> None:
+    async def _rebalance_accounts(self, client: OKXClient) -> float:
         """Keep the trading account near ``TRADING_ACCOUNT_TARGET``."""
         """
         每次平仓后调用：
@@ -1916,7 +2142,7 @@ class BollPinStrategy:
         TRADING_ACCOUNT_TARGET = 0 时跳过?
         """
         if TRADING_ACCOUNT_TARGET <= 0:
-            return
+            return 0.0
         try:
             trading_bal = await client.get_balance("USDT")
             diff = round(trading_bal - TRADING_ACCOUNT_TARGET, 4)
@@ -1927,6 +2153,7 @@ class BollPinStrategy:
                     f"trading {trading_bal:.4f} -> {TRADING_ACCOUNT_TARGET:.4f}; transfer to funding"
                 )
                 await client.transfer(amt=diff, from_acct="18", to_acct="6")
+                return diff
 
             elif diff < -0.01:
                 needed = abs(diff)
@@ -1946,19 +2173,21 @@ class BollPinStrategy:
                         f"[Capital] Funding balance insufficient ({funding_bal:.4f} USDT); "
                         f"cannot top up trading account"
                     )
-                    return
+                    return diff
                 partial = " (partial top-up; funding insufficient)" if top_up < needed else ""
                 logger.info(
                     f"[Capital] Loss {diff:.4f} USDT; "
                     f"transfer {top_up:.4f} USDT from funding to trading{partial}"
                 )
                 await client.transfer(amt=top_up, from_acct="6", to_acct="18")
+                return diff
 
             else:
                 logger.debug("[Capital] Balance is within 0.01 USDT of target; skip transfer")
 
         except Exception as e:
             logger.warning(f"[Capital] Transfer failed; strategy continues: {e}")
+        return 0.0
 
     async def _check_capital_restored(self, client: OKXClient, trading_balance: float | None = None) -> None:
         """Notify once when trading capital recovers after a shortage."""

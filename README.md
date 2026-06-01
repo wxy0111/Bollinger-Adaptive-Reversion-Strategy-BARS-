@@ -1,14 +1,14 @@
 # OKX ETH-USDT-SWAP Bollinger Strategy
 
-这是一个运行在 OKX `ETH-USDT-SWAP` 永续合约上的 15 分钟布林带均值回归策略程序。程序会读取 OKX 15m K 线和标记价格，当价格突破布林带外侧并停止继续创新极值时，按分批方式建立仓位，并以真实持仓均价外固定 `10 USDT` 距离挂止盈单。
+这是一个运行在 OKX `ETH-USDT-SWAP` 永续合约上的 15 分钟布林带均值回归策略程序。程序会读取 OKX 15m K 线和实时标记价格，当价格突破布林带外侧并停止继续创新极值时，按动态分批方式建立仓位，并用真实持仓均价管理止盈、止损和固本资金划转。
 
-项目包含实盘/模拟盘交易主程序、本地网页看板、ServerChan 微信推送、固本资金管理和基于运行日志的参数优化报告工具。
+项目包含实盘/模拟盘交易主程序、本地网页看板、ServerChan 微信推送、固本资金管理、日志清理工具和基于运行日志的参数优化报告工具。
 
 ## 重要提醒
 
 本程序涉及高杠杆合约交易，存在快速亏损和强平风险。默认配置使用 `OKX_FLAG=1`，即 OKX 模拟盘。正式使用前请先在模拟盘运行，确认下单、撤单、止盈、资金划转和通知都符合预期。
 
-不要把 `.env`、运行日志、历史数据、压缩包或真实 API 密钥提交到 GitHub。
+不要把 `.env`、运行日志、历史数据、压缩包、优化结果、真实 API 密钥或极端行情模拟文件提交到 GitHub。
 
 ## 程序结构
 
@@ -30,66 +30,84 @@ C:\okx
 │   ├── logging_utils.py            # 终端日志颜色和类别
 │   └── dashboard.py                # 本地网页看板
 ├── backtest
-│   └── log_parameter_optimizer.py  # 基于运行日志的参数优化报告
+│   ├── log_parameter_optimizer.py  # 基于运行日志的参数优化报告
+│   └── clean_strategy_logs.py      # 日志行情行清理和格式统一
 └── logs                            # 运行日志和本地状态文件，默认不提交
 ```
 
-## 运行原理
+## 运行方式
 
-### 行情采样和交易节奏
+1. 复制 `.env.example` 为 `.env`，填写 OKX API、ServerChan 等配置。
+2. 确认 `src/config.py` 中的策略参数。
+3. 双击或运行：
 
-程序现在把“行情记录”和“交易主逻辑”分开：
+```powershell
+start.bat
+```
+
+程序启动后会同时运行交易策略和本地看板。看板默认地址：
+
+```text
+http://localhost:8080
+```
+
+## 微信推送
+
+项目使用 ServerChan 发送微信通知。需要在 `.env` 中配置：
+
+```text
+SERVERCHAN_KEY=你的SendKey
+```
+
+获取方式：
+
+1. 打开 [ServerChan](https://sct.ftqq.com/)。
+2. 使用微信扫码登录。
+3. 在 SendKey 页面复制自己的 SendKey。
+4. 写入 `.env` 的 `SERVERCHAN_KEY`。
+
+程序会在策略触发的开仓挂单、开仓成交、补仓挂单、补仓成交、平仓、资金不足、资金恢复和强平风险事件中发送通知。强平预警只在距离强平价 `10U` 内发送，且最多每 1 小时发送一次。
+
+## 行情采样和交易节奏
+
+当前设置：
 
 ```python
 PRICE_LOG_INTERVAL = 1
 POLL_INTERVAL = 3
 ```
 
-- 每 `1s` 记录一次价格和布林带快照到日志文件，便于后续用更高精度的历史日志做评估。
+- 每 `1s` 记录一次价格和布林带快照到日志文件，用于后续更高精度评估。
 - 每 `3s` 执行一次交易主逻辑，包括余额检查、成交同步、持仓检查、开仓、补仓、撤单、重挂、止盈和资金管理。
-- 终端只显示每 `3s` 的主逻辑行情和策略判断，避免 1s 行情刷屏。
+- 终端按主逻辑节奏显示行情和策略判断，避免 1s 行情刷屏。
 
-### 布林带
+## 布林带和入场过滤
 
-当前布林带参数：
+当前核心参数：
 
 ```python
 BOLL_PERIOD = 20
-BOLL_STD = 2
+BOLL_STD = 2.0
 BOLL_INCLUDE_CURRENT = True
+MIN_BOLL_WIDTH_USD = 15
+MIN_BOLL_WIDTH_PCT = 0.006
+BOLL_WIDTH_BASE_PRICE = 2000.0
+BOLL_WIDTH_BASE_USD = 15.0
+MIN_BOLL_WIDTH_FLOOR_USD = 10.0
+BOLL_WIDTH_GAP_MULT = 2.5
 ```
 
 `BOLL_INCLUDE_CURRENT=True` 表示布林带会包含当前未收盘 K 线，因此布林带会随盘中价格动态变化。
 
-当前入场宽度过滤：
-
-```python
-MIN_BOLL_WIDTH_USD = 15
-MIN_BOLL_WIDTH_PCT = 0.006
-```
-
-实际要求是：
-
-```text
-布林带宽度 >= 15 USDT
-且
-布林带宽度 / 当前价格 >= 0.6%
-```
-
-`_boll_width_ok()` 只做纯判断，不直接打印日志。具体场景会打印更明确的原因，例如：
-
-```text
-CHECK | 开仓跳过：布林宽度不足 width=14.30 < 15.00 width_pct=0.72% threshold=0.60%
-CHECK | 补仓跳过：布林宽度不足 width=14.30 < 15.00 width_pct=0.72% threshold=0.60%
-```
+布林宽度使用动态阈值：以 `2000 USDT` 价格对应 `15U` 布林宽度为基准，价格变化时按比例调整，同时结合当前有效补仓间距乘以 `BOLL_WIDTH_GAP_MULT`，取更严格的阈值。
 
 ## 开仓逻辑
 
-当没有持仓、也没有正在工作的入场挂单时，程序判断是否满足头仓条件：
+当没有持仓、也没有正在工作的入场挂单时，程序判断头仓条件：
 
 ```text
 价格突破布林带外
-+ 布林带宽度满足要求
++ 布林带宽度满足动态阈值
 + 价格不再继续创新高/新低
 + 当前 K 线没有开过新计划
 + 入场价和上一套计划价格距离足够
@@ -105,30 +123,33 @@ CHECK | 补仓跳过：布林宽度不足 width=14.30 < 15.00 width_pct=0.72% th
 
 同一根 15m K 线最多新增一笔入场批次。头仓成交后，本根 K 线不继续补仓，等待下一根 K 线重新判断。
 
+平仓完成后，平仓所在的这根 15m K 线不再开新的头仓。程序会把最近平仓 K 线记录到 `logs/close_cooldown.json`，所以平仓后如果立刻重启，只要仍在同一根 K 线内，也会继续等待下一根 K 线再允许开仓。
+
 ## 补仓逻辑
 
-头仓成交后，后续补仓不再依赖旧的 `BATCH_SPACING` 固定间距，而是按当前触发价格和最近批次成交价动态判断。
-
-补仓条件：
+补仓不再依赖旧的 `BATCH_SPACING` 固定间距，而是按当前触发价格和最近批次真实成交价动态判断。
 
 ```text
 已有持仓
 + 当前没有未成交补仓单
 + 再次触发同方向布林带外
-+ 布林带宽度满足要求
++ 布林带宽度满足动态阈值
 + 价格不再继续创新高/新低
 + 当前 K 线没有新增过入场批次
-+ 和上一批真实成交价距离 >= MIN_ENTRY_GAP_USD
++ 和上一批真实成交价距离 >= 有效入场间距
 => 按当前 mark_price 挂下一批限价单
 ```
 
-当前补仓最小间距：
+基础入场间距：
 
 ```python
-MIN_ENTRY_GAP_USD = 3
+MIN_ENTRY_GAP_USD = 4
+MIN_HEAD_LIQ_BUFFER_PCT = 0.03
+DYNAMIC_ENTRY_GAP_ENABLED = True
+DYNAMIC_ENTRY_GAP_MAX_USD = 40.0
 ```
 
-做多时，下一批价格必须低于或等于上一批真实成交价，并至少相差 `3U`。做空时相反。
+有效入场间距会根据头仓价格估算：如果按最小补仓一路补到 `MAX_TOTAL_ENTRY_RATIO` 后，头仓到预估强平价的距离不足 `3%`，程序会自动提高补仓间距。
 
 ## 动态分批张数
 
@@ -143,8 +164,6 @@ DYNAMIC_MAX_ENTRY_RATIO = 0.15
 MAX_TOTAL_ENTRY_RATIO = 0.80
 MAX_ENTRY_BATCHES = 12
 ```
-
-含义：
 
 - 第 1 批头仓使用目标交易资金的 `15%` 保证金。
 - 第 2 批补仓使用目标交易资金的 `15%` 保证金。
@@ -174,31 +193,50 @@ REPRICE_GAP_USD = 0.5
 
 如果挂单后布林带宽度低于阈值，会撤销未成交入场单。程序不再使用 45 秒未成交自动撤单逻辑。
 
-## 止盈和风控
+## 止盈、动态锁盈和止损
 
-程序会根据交易所真实持仓均价重新计算止盈价：
-
-```python
-TP_PROFIT_USD = 10.0
-```
-
-做多：
-
-```text
-止盈价 = 真实平均成本 + 10U
-```
-
-做空：
-
-```text
-止盈价 = 真实平均成本 - 10U
-```
-
-每次有新批次成交后，程序会撤掉旧止盈单，并重新挂 reduce-only 止盈单。
-
-强平线作为最终风险边界，程序会挂条件止损单。强平预警只在距离强平价 `10U` 内发送，且最多每 1 小时发送一次：
+当前默认止盈不是固定 `10U`，而是按保证金收益率计算：
 
 ```python
+TP_TARGET_MARGIN_RETURN = 0.25
+```
+
+止盈距离：
+
+```text
+止盈距离 = 平均成本 * TP_TARGET_MARGIN_RETURN / LEVER
+```
+
+在 ETH 价格约 `2000`、杠杆 `50x` 时，`25%` 保证金收益约等于 `10U` 价格距离。
+
+动态锁盈参数：
+
+```python
+DYNAMIC_TP_ENABLED = True
+DYNAMIC_TP_ARM_RETURN = 0.235
+DYNAMIC_TP_RESTORE_RETURN = 0.22
+DYNAMIC_TP_REPRICE_GAP_USD = 0.5
+```
+
+逻辑：
+
+```text
+默认挂 25% 动态止盈
+浮盈达到 23.5% 后开始观察
+多单如果不再创新高，或空单如果不再创新低：
+    撤原止盈单
+    按当前实时价格挂 reduce-only 止盈单
+如果实时价止盈未成交，且浮盈回落到 22% 以下：
+    撤实时价止盈
+    恢复 25% 动态止盈
+```
+
+每次有新批次成交后，程序会退出动态锁盈状态，按新的交易所真实均价重新计算 25% 止盈，并重挂 reduce-only 止盈单。
+
+强平线作为最终风险边界，程序会挂条件止损单。
+
+```python
+LIQ_STOP_OFFSET_USD = 0.1
 LIQ_WARNING_DISTANCE_USD = 10.0
 LIQ_WARNING_REPEAT_SEC = 3600
 ```
@@ -218,197 +256,63 @@ TRADING_ACCOUNT_TARGET = 200.0
     将多出的利润从交易账户划转到资金账户
 
 交易账户可用余额 < 目标值：
-    从资金账户划转补足交易账户
+    尝试从资金账户补回交易账户
 ```
 
-OKX 账户编号：
+如果资金账户不足以补回目标值，程序会发送微信通知，并暂停新开仓和新补仓，但继续记录行情、同步持仓和管理已有订单。之后如果你补充资金并且交易账户余额恢复到目标值，程序会发送恢复通知并继续运行。若补充后交易账户余额超过目标值，超过部分会划转回资金账户。
 
-```text
-6  = 资金账户
-18 = 交易账户
-```
+## 本地看板
 
-如果资金账户不足以补足交易账户，程序会：
-
-- 发送微信通知。
-- 暂停新开仓和新补仓。
-- 继续记录行情、布林带和持仓信息。
-- 持续检查交易账户余额。
-- 当补充资金后交易账户恢复到目标值，会发送恢复通知。
-- 如果补充后超过目标值，多余部分会划转回资金账户。
-
-`TRADING_ACCOUNT_TARGET = 0` 时关闭固本资金管理。
-
-## 终端日志设计
-
-终端按重要性分层显示：
-
-```text
-MARKET  白色  每 3s 显示一次主逻辑行情
-CHECK   黄色  策略判断，例如宽度不足、间距不足、创新低暂不挂单
-ACTION  红色  真实操作，例如下单、撤单、止盈、止损、平仓、资金划转
-```
-
-同时，日志文件会每 `1s` 记录行情快照：
-
-```text
-price=1981.23  Boll[1975.78 | 1982.52 | 1989.25]  position=long  equity=167.17
-```
-
-每 `3s` 的主逻辑行情会显示在终端：
-
-```text
-MARKET | 价格=1981.12  布林[1975.78 | 1982.52 | 1989.25]  持仓=long  权益=167.17
-```
-
-这样可以兼顾：
-
-- 日志文件保留 1s 精度，方便后续评估采样频率对收益的影响。
-- 终端不被 1s 行情刷屏，只显示 3s 主逻辑和重要操作。
-
-## 微信推送
-
-程序使用 ServerChan 进行微信推送。当前会推送：
-
-```text
-程序挂出头仓单
-程序挂出补仓单
-头仓/补仓实际成交
-平仓完成
-资金不足
-资金恢复
-强平距离预警
-最大回撤触发
-```
-
-如果没有配置 `SERVERCHAN_KEY`，程序会静默跳过推送，不影响交易。
-
-## 安装方法
-
-建议使用 Python 虚拟环境：
-
-```powershell
-cd C:\okx
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-## 配置方法
-
-复制 `.env.example` 为 `.env`：
-
-```powershell
-Copy-Item .env.example .env
-```
-
-编辑 `.env`：
-
-```env
-OKX_API_KEY=your_api_key_here
-OKX_SECRET_KEY=your_secret_key_here
-OKX_PASSPHRASE=your_passphrase_here
-OKX_FLAG=1
-SERVERCHAN_KEY=your_serverchan_key_here
-```
-
-### 获取 SERVERCHAN_KEY
-
-`SERVERCHAN_KEY` 用于把开仓、加仓、平仓和风险事件推送到微信。当前程序使用的是 Server 酱新版接口：
-
-```text
-https://sctapi.ftqq.com/{SERVERCHAN_KEY}.send
-```
-
-获取方法：
-
-1. 打开 Server 酱官网：[https://sct.ftqq.com/](https://sct.ftqq.com/)
-2. 使用微信扫码登录。
-3. 按页面提示绑定消息通道。一般选择默认的微信/方糖服务号通道即可。
-4. 在官网后台找到 `SendKey` 页面。
-5. 复制你的 `SendKey`，填入 `.env`：
-
-```env
-SERVERCHAN_KEY=你的SendKey
-```
-
-注意：`SendKey` 等同于推送密钥，不要提交到 GitHub，也不要发给别人。如果不需要微信推送，可以留空：
-
-```env
-SERVERCHAN_KEY=
-```
-
-说明：
-
-```text
-OKX_FLAG=1  模拟盘
-OKX_FLAG=0  实盘
-```
-
-补充：如果你使用的是 Server 酱 3，它的入口通常是 [https://sc3.ft07.com](https://sc3.ft07.com)，但当前程序默认适配的是 `sct.ftqq.com` 这一版的 `SendKey`。
-
-## 启动方法
-
-方式一：直接运行 Python。
-
-```powershell
-cd C:\okx
-.\.venv\Scripts\python.exe main.py
-```
-
-方式二：双击运行：
-
-```text
-start.bat
-```
-
-启动后，本地看板地址：
+看板地址：
 
 ```text
 http://localhost:8080
 ```
 
-运行日志：
+看板只读取本地运行状态和日志，不负责下单。历史日志页支持读取 `logs/boll_pin_*.log`，显示价格、布林带、关键交易点、单日开单情况、实际固本收益、估算收益和累计收益。
+
+历史实际收益优先来自固本划转日志，例如：
 
 ```text
-logs/boll_pin_YYYY-MM-DD.log
+[Capital] Profit +13.1408 USDT
 ```
 
-本地策略状态：
+如果没有固本划转记录，才退回使用真实成交批次、最近一次止盈挂单价格和 `Position closed` 记录估算收益。
 
-```text
-logs/runtime_state.json
-```
+## 日志清理和参数优化
 
-## 本地看板
-
-看板包含：
-
-- 实时价格、布林带、权益、持仓、止盈、强平价。
-- 当前批次和最近成交。
-- 历史日志读取与价格/布林带展示。
-
-看板只读取本地运行状态和日志，不负责下单。
-
-## 日志参数优化报告
-
-手动运行：
+手动运行参数优化：
 
 ```powershell
-.\.venv\Scripts\python.exe backtest\log_parameter_optimizer.py
-```
-
-也可以直接运行：
-
-```text
 optimize_report.bat
 ```
 
-优化脚本会读取 `logs/boll_pin_*.log`，用历史运行日志回放多组参数，输出 CSV 和 Markdown 报告到：
+或直接运行：
+
+```powershell
+python backtest\log_parameter_optimizer.py
+```
+
+优化器默认读取：
 
 ```text
-backtest/results/log_parameter_optimizer/
+logs/boll_pin_*.log
 ```
+
+默认 `--sample-sec 0`，表示使用所有解析到的 tick，不做重采样。由于当前日志中混有 1s 和 3s 行情，建议需要更保守、接近 3s 主交易循环的评估时使用：
+
+```powershell
+python backtest\log_parameter_optimizer.py --sample-sec 3
+```
+
+如果想把中英文混合的行情行统一成英文格式，先生成清理副本：
+
+```powershell
+python backtest\clean_strategy_logs.py --log-dir logs --out-dir logs_cleaned
+python backtest\log_parameter_optimizer.py --log-dir logs_cleaned --sample-sec 3
+```
+
+`logs_cleaned/` 是生成的清理副本，默认不提交到 GitHub。
 
 当前优化重点包括：
 
@@ -423,16 +327,15 @@ DYNAMIC_BASE_ENTRY_RATIO
 DYNAMIC_MIN_ENTRY_RATIO
 DYNAMIC_MAX_ENTRY_RATIO
 MAX_TOTAL_ENTRY_RATIO
+BOLL_WIDTH_BASE_USD
+BOLL_WIDTH_GAP_MULT
+TP_TARGET_MARGIN_RETURN
+DYNAMIC_TP_ARM_RETURN
+DYNAMIC_TP_RESTORE_RETURN
+MIN_HEAD_LIQ_BUFFER_PCT
 ```
 
-报告跑完后，终端会出现参数同步菜单：
-
-```text
-输入 1-20：把对应排名的参数写入 src/config.py
-输入 0 或直接回车：保持当前策略参数不变
-```
-
-同步前需要再次输入 `y` 确认。脚本会先生成 `src/config.py.bak` 备份。
+报告跑完后，终端会出现参数同步菜单。同步前需要再次输入确认，脚本会先生成 `src/config.py.bak` 备份。
 
 ## 常用参数
 
@@ -446,24 +349,29 @@ PRICE_LOG_INTERVAL = 1
 POLL_INTERVAL = 3
 
 BOLL_PERIOD = 20
-BOLL_STD = 2
+BOLL_STD = 2.0
 BOLL_INCLUDE_CURRENT = True
+
 MIN_BOLL_WIDTH_USD = 15
 MIN_BOLL_WIDTH_PCT = 0.006
-NO_NEW_EXTREME_TICKS = 2
+BOLL_WIDTH_BASE_PRICE = 2000.0
+BOLL_WIDTH_BASE_USD = 15.0
+BOLL_WIDTH_GAP_MULT = 2.5
 
-MIN_ENTRY_GAP_USD = 3
+MIN_ENTRY_GAP_USD = 4
 REPRICE_GAP_USD = 0.5
 
 FIRST_BATCH_RATIO = 0.15
 SECOND_BATCH_RATIO = 0.15
-DYNAMIC_BASE_ENTRY_RATIO = 0.1
+DYNAMIC_BASE_ENTRY_RATIO = 0.10
 DYNAMIC_MIN_ENTRY_RATIO = 0.05
 DYNAMIC_MAX_ENTRY_RATIO = 0.15
-MAX_TOTAL_ENTRY_RATIO = 0.8
-MAX_ENTRY_BATCHES = 12
+MAX_TOTAL_ENTRY_RATIO = 0.80
 
-TP_PROFIT_USD = 10.0
+TP_TARGET_MARGIN_RETURN = 0.25
+DYNAMIC_TP_ARM_RETURN = 0.235
+DYNAMIC_TP_RESTORE_RETURN = 0.22
+
 TRADING_ACCOUNT_TARGET = 200.0
 ```
 
@@ -474,10 +382,12 @@ TRADING_ACCOUNT_TARGET = 200.0
 ```text
 .env
 logs/
+logs_cleaned/
 .idea/
 *.zip
 backtest/results/
-backtest/results_current_check/
+src/config.py.bak
+backtest/extreme_log_simulator.py
 ```
 
 提交前建议检查：
@@ -487,20 +397,4 @@ git status --short
 git diff --cached --check
 ```
 
-确认没有 API 密钥、日志、大型数据文件后再推送。
-
-## 当前策略特点
-
-```text
-1s 文件行情采样：用于积累更高精度日志
-3s 交易主逻辑：避免账户和订单接口过度请求
-低波动过滤：布林带宽度太窄不建仓/不补仓
-轨外均值回归：突破上下轨后等待不再创新极值再进场
-动态补仓：后续补仓按价差动态调整比例
-同 K 限制：每根 15m K 线最多新增一批
-固定止盈：按真实平均成本外 10U 止盈
-固本策略：平仓后保持交易账户目标可用资金，多余利润转资金账户
-资金不足保护：资金不足时暂停新入场，继续记录行情
-微信通知：挂单、成交、平仓和风险事件可通知
-彩色终端：MARKET/CHECK/ACTION 分层显示
-```
+确认没有 API 密钥、运行日志、清理日志副本、优化结果、极端行情模拟文件或大型数据文件后再推送。

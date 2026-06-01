@@ -14,7 +14,7 @@ import aiohttp
 from loguru import logger
 
 from src.config import API_KEY, SECRET_KEY, PASSPHRASE, FLAG
-from src.logging_utils import log_action
+from src.logging_utils import log_action, log_check
 
 BASE_URL = "https://www.okx.com"
 
@@ -31,6 +31,7 @@ def _is_benign_cancel_error(err: Exception) -> bool:
         "already filled",
         "already closed",
         "not found",
+        "-> 1",
         "51603",
         "51604",
     )
@@ -211,7 +212,7 @@ class OKXClient:
             log_action(f"撤单 ordId={ord_id}")
         except Exception as e:
             if _is_benign_cancel_error(e):
-                log_action(f"撤单跳过，订单可能已成交/已撤/不存在 ordId={ord_id}: {e}")
+                log_check(f"平仓后清理旧挂单：订单已成交/已撤/不存在 ordId={ord_id}")
                 return
             logger.warning(f"撤单失败(可能已成交/不存在): {e}")
 
@@ -236,7 +237,7 @@ class OKXClient:
             log_action(f"撤销条件单 algoId={algo_id}")
         except Exception as e:
             if _is_benign_cancel_error(e):
-                log_action(f"撤条件单跳过，订单可能已触发/已撤/不存在 algoId={algo_id}: {e}")
+                log_check(f"平仓后清理条件单：订单已触发/已撤/不存在 algoId={algo_id}")
                 return
             logger.warning(f"撤条件单失败: {e}")
 

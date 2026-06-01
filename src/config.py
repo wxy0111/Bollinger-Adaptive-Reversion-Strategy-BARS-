@@ -31,11 +31,15 @@ LEVER = 50
 
 # Bollinger-band settings.
 BOLL_PERIOD = 20
-BOLL_STD = 2
+BOLL_STD = 2.0
 BOLL_INCLUDE_CURRENT = True
 KLINE_LIMIT = 300
 MIN_BOLL_WIDTH_USD = 15
 MIN_BOLL_WIDTH_PCT = 0.006
+BOLL_WIDTH_BASE_PRICE = 2000.0
+BOLL_WIDTH_BASE_USD = 15.0
+MIN_BOLL_WIDTH_FLOOR_USD = 10.0
+BOLL_WIDTH_GAP_MULT = 2.5
 
 # Reserved: these breakout-quality filters are not wired into the current live
 # signal path. The live signal only checks whether mark price is outside the
@@ -82,10 +86,20 @@ BATCH_SPACING = [0.0, 0.2, 0.4, 0.6]
 
 # Exit settings.
 TP_PROFIT_USD = 10.0
+TP_TARGET_MARGIN_RETURN = 0.25
+DYNAMIC_TP_ENABLED = True
+DYNAMIC_TP_ARM_RETURN = 0.235
+DYNAMIC_TP_RESTORE_RETURN = 0.22
+DYNAMIC_TP_REPRICE_GAP_USD = 0.5
 LIQ_STOP_OFFSET_USD = 0.1
 LIQ_WARNING_DISTANCE_USD = 10.0
 LIQ_WARNING_REPEAT_SEC = 3600
-MIN_ENTRY_GAP_USD = 3
+MIN_ENTRY_GAP_USD = 4
+MIN_HEAD_LIQ_BUFFER_PCT = 0.03
+DYNAMIC_ENTRY_GAP_ENABLED = True
+DYNAMIC_ENTRY_GAP_MAX_USD = 40.0
+OKX_MAINTENANCE_MARGIN_RATE = 0.004
+OKX_LIQ_FEE_RATE = 0.0005
 
 # Reserved: these planned risk controls are not wired into
 # ``src.risk.build_batch_plan`` yet.
