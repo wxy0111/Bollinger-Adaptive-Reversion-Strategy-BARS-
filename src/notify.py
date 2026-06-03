@@ -36,6 +36,24 @@ async def notify_entry_order(direction: str, price: float, sz: float,
     await wx_push(title, content)
 
 
+async def notify_cross_copy_protect(
+    account_equity: float,
+    protected_equity: float,
+    direction: str,
+    total_sz: float,
+) -> None:
+    """Notify when cross-margin copy-protection closes the strategy."""
+    title = "ETH 全仓带单保护触发"
+    content = (
+        f"**账户总权益**: {account_equity:.2f} USDT\n\n"
+        f"**保护权益**: {protected_equity:.2f} USDT\n\n"
+        f"**当前方向**: {direction.upper()}\n\n"
+        f"**当前张数**: {total_sz}\n\n"
+        "账户权益已触及保护线，程序将撤单、平仓并停止运行。"
+    )
+    await wx_push(title, content)
+
+
 async def notify_capital_shortage(trading_balance: float, target: float, funding_balance: float, top_up: float):
     """Notify that the funding account cannot fully restore trading capital."""
     title = "ETH 资金不足提醒"
@@ -104,6 +122,34 @@ async def notify_liq_warning(
         f"**Mark price**: {mark_price:.2f}\n\n"
         f"**Liquidation price**: {liq_price:.2f}\n\n"
         f"**Distance**: {distance}{gap_pct:.2f}%"
+    )
+    await wx_push(title, content)
+
+
+async def notify_boll_trend_guard(
+    direction: str,
+    mark_price: float,
+    head_price: float,
+    adverse_pct: float,
+    width_expand: float,
+    width_pct: float,
+    z_mean: float,
+    slope_pct_per_hour: float,
+    control_enabled: bool,
+) -> None:
+    """Notify when the Bollinger trend-expansion guard is triggered."""
+    mode = "CONTROL" if control_enabled else "OBSERVE"
+    title = f"ETH BTG {mode} triggered"
+    content = (
+        f"**Direction**: {direction.upper()}\n\n"
+        f"**Mark price**: {mark_price:.2f}\n\n"
+        f"**Head entry**: {head_price:.2f}\n\n"
+        f"**Head adverse**: {adverse_pct:.2%}\n\n"
+        f"**Boll width expand**: {width_expand:.3f}x\n\n"
+        f"**Boll width pct**: {width_pct:.2%}\n\n"
+        f"**z_mean**: {z_mean:.3f}\n\n"
+        f"**Band slope**: {slope_pct_per_hour:.3f}%/h\n\n"
+        f"**Action**: {'close position' if control_enabled else 'notify only'}"
     )
     await wx_push(title, content)
 

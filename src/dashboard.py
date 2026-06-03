@@ -13,6 +13,7 @@ from src.config import WEB_HOST, WEB_PORT
 
 
 LOG_DIR = Path("logs")
+PNL_CORRECTIONS_PATH = LOG_DIR / "pnl_corrections.json"
 TICK_RE = re.compile(
     "^(?P<ts>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d+).*?"
     "(?:price|\\u4ef7\\u683c)=(?P<price>\\d+(?:\\.\\d+)?)\\s+"
@@ -41,6 +42,11 @@ CLOSE_SUMMARY_RE = re.compile(
     r"估算收益=(?P<pnl>[+-]?\d+(?:\.\d+)?)\s+USDT"
 )
 CT_VAL = 0.1
+POSITION_CLOSE_RE = re.compile(
+    r"Position closed\s+(?P<direction>long|short)\s+avg_entry=(?P<avg>\d+(?:\.\d+)?)\s+"
+    r"(?:close_avg|close_ref)=(?P<exit>\d+(?:\.\d+)?)\s+sz=(?P<sz>\d+(?:\.\d+)?)\s+"
+    r"(?P<label>actual_pnl|estimated_pnl)=(?P<pnl>[+-]?\d+(?:\.\d+)?)\s+USDT"
+)
 
 
 @dataclass
@@ -144,8 +150,27 @@ def _empty_daily_row(day: str) -> dict:
     }
 
 
+def _load_pnl_corrections() -> dict[str, float]:
+    """Load manual exchange-net PnL corrections keyed by close timestamp."""
+    if not PNL_CORRECTIONS_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(PNL_CORRECTIONS_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning(f"Load PnL corrections failed: {exc}")
+        return {}
+    corrections = {}
+    for key, value in raw.items():
+        try:
+            corrections[str(key)[:19]] = float(value)
+        except (TypeError, ValueError):
+            logger.warning(f"Ignore invalid PnL correction {key}={value}")
+    return corrections
+
+
 def _parse_trade_history(paths: list[Path]) -> dict:
     """Parse strategy-owned entries, closes, and realized PnL from logs."""
+    pnl_corrections = _load_pnl_corrections()
     events = []
     trades = []
     daily: dict[str, dict] = {}
@@ -172,6 +197,30 @@ def _parse_trade_history(paths: list[Path]) -> dict:
                     continue
                 ts = ts_match.group("ts")[:19]
 
+                position_close_match = POSITION_CLOSE_RE.search(line)
+                if position_close_match:
+                    pnl = float(position_close_match.group("pnl"))
+                    is_actual = position_close_match.group("label") == "actual_pnl"
+                    current["close_summary"] = {
+                        "time": ts,
+                        "direction": position_close_match.group("direction"),
+                        "avg_entry": float(position_close_match.group("avg")),
+                        "exit_price": float(position_close_match.group("exit")),
+                        "sz": float(position_close_match.group("sz")),
+                        "estimated_pnl": 0.0 if is_actual else pnl,
+                        "actual_pnl": pnl if is_actual else None,
+                    }
+                    events.append({
+                        "time": ts,
+                        "type": "close_summary",
+                        "direction": current["close_summary"]["direction"],
+                        "price": current["close_summary"]["exit_price"],
+                        "sz": current["close_summary"]["sz"],
+                        "pnl": pnl,
+                        "note": "close summary",
+                    })
+                    continue
+
                 close_summary_match = CLOSE_SUMMARY_RE.search(line)
                 if close_summary_match:
                     current["close_summary"] = {
@@ -181,6 +230,7 @@ def _parse_trade_history(paths: list[Path]) -> dict:
                         "exit_price": float(close_summary_match.group("exit")),
                         "sz": float(close_summary_match.group("sz")),
                         "estimated_pnl": float(close_summary_match.group("pnl")),
+                        "actual_pnl": None,
                     }
                     events.append({
                         "time": ts,
@@ -196,10 +246,13 @@ def _parse_trade_history(paths: list[Path]) -> dict:
                 capital_match = CAPITAL_PROFIT_RE.search(line) or CAPITAL_LOSS_RE.search(line)
                 if capital_match:
                     actual_pnl = float(capital_match.group("pnl"))
+                    correction = pnl_corrections.get(ts)
+                    if correction is not None:
+                        actual_pnl = correction
                     row = day_row(ts)
                     if last_closed_trade is None or _date_key(last_closed_trade.get("exit_time", "")) != _date_key(ts):
-                        row["closes"] += 1
                         last_closed_trade = {
+                            "record_type": "settlement",
                             "entry_time": "",
                             "exit_time": ts,
                             "direction": "",
@@ -211,6 +264,7 @@ def _parse_trade_history(paths: list[Path]) -> dict:
                             "actual_pnl": 0.0,
                             "pnl": 0.0,
                             "pnl_source": "capital",
+                            "note": "跨日固本划转",
                         }
                         trades.append(last_closed_trade)
                     row["actual_pnl"] += actual_pnl
@@ -219,6 +273,9 @@ def _parse_trade_history(paths: list[Path]) -> dict:
                         last_closed_trade["actual_pnl"] = round(actual_pnl, 4)
                         last_closed_trade["pnl"] = round(actual_pnl, 4)
                         last_closed_trade["pnl_source"] = "capital"
+                        if correction is not None:
+                            last_closed_trade["pnl_source"] = "exchange_correction"
+                            last_closed_trade["note"] = "交易所净收益修正"
                         last_closed_trade["actual_locked"] = True
                     events.append({
                         "time": ts,
@@ -227,7 +284,7 @@ def _parse_trade_history(paths: list[Path]) -> dict:
                         "price": 0.0,
                         "sz": 0.0,
                         "pnl": round(actual_pnl, 4),
-                        "note": "固本实际收益",
+                        "note": "交易所净收益修正" if correction is not None else "固本实际收益",
                     })
                     continue
 
@@ -323,10 +380,19 @@ def _parse_trade_history(paths: list[Path]) -> dict:
                             estimated_pnl = (avg_entry - exit_price) * total_sz * CT_VAL
                     if summary:
                         estimated_pnl = summary["estimated_pnl"]
+                    actual_pnl = summary.get("actual_pnl") if summary else None
+                    correction = pnl_corrections.get(ts)
+                    if correction is not None:
+                        actual_pnl = correction
+                    display_pnl = actual_pnl if actual_pnl is not None else estimated_pnl
+                    pnl_source = "fill" if actual_pnl is not None else "estimate"
+                    if correction is not None:
+                        pnl_source = "exchange_correction"
                     row = day_row(ts)
                     row["closes"] += 1
                     row["estimated_pnl"] += estimated_pnl
                     trade = {
+                        "record_type": "trade",
                         "entry_time": current["entry_time"],
                         "exit_time": ts,
                         "direction": current["direction"],
@@ -335,9 +401,10 @@ def _parse_trade_history(paths: list[Path]) -> dict:
                         "sz": round(total_sz, 8),
                         "batches": len(fills),
                         "estimated_pnl": round(estimated_pnl, 4),
-                        "actual_pnl": 0.0,
-                        "pnl": round(estimated_pnl, 4),
-                        "pnl_source": "estimate",
+                        "actual_pnl": round(actual_pnl, 4) if actual_pnl is not None else 0.0,
+                        "pnl": round(display_pnl, 4),
+                        "pnl_source": pnl_source,
+                        "note": "交易所净收益修正" if correction is not None else "",
                     }
                     trades.append(trade)
                     last_closed_trade = trade
@@ -347,7 +414,7 @@ def _parse_trade_history(paths: list[Path]) -> dict:
                         "direction": current["direction"],
                         "price": round(exit_price, 4),
                         "sz": round(total_sz, 8),
-                        "pnl": round(estimated_pnl, 4),
+                        "pnl": round(display_pnl, 4),
                         "note": "平仓",
                     })
                     current = {"direction": "none", "fills": [], "entry_time": "", "tp_price": 0.0, "close_summary": None}
@@ -358,7 +425,7 @@ def _parse_trade_history(paths: list[Path]) -> dict:
         row = daily[day]
         row["actual_pnl"] = round(row["actual_pnl"], 4)
         row["estimated_pnl"] = round(row["estimated_pnl"], 4)
-        row["pnl"] = row["actual_pnl"] if row["source"] == "capital" else row["estimated_pnl"]
+        row["pnl"] = row["actual_pnl"]
         row["pnl"] = round(row["pnl"], 4)
         cum += row["pnl"]
         row["cum_pnl"] = round(cum, 4)
@@ -366,8 +433,13 @@ def _parse_trade_history(paths: list[Path]) -> dict:
 
     for trade in trades:
         trade.pop("actual_locked", None)
-    wins = [trade for trade in trades if trade["pnl"] > 0]
-    total_pnl = round(sum(row["pnl"] for row in daily_rows), 4)
+    closed_trades = [trade for trade in trades if trade.get("record_type") != "settlement"]
+    actual_records = [
+        trade for trade in trades
+        if trade.get("pnl_source") in ("capital", "exchange_correction")
+    ]
+    wins = [trade for trade in actual_records if trade["pnl"] > 0]
+    total_pnl = round(sum(row["actual_pnl"] for row in daily_rows), 4)
     estimated_total = round(sum(row["estimated_pnl"] for row in daily_rows), 4)
     actual_total = round(sum(row["actual_pnl"] for row in daily_rows), 4)
     summary = {
@@ -375,12 +447,12 @@ def _parse_trade_history(paths: list[Path]) -> dict:
         "entry_fills": sum(row["entry_fills"] for row in daily_rows),
         "first_fills": sum(row["first_fills"] for row in daily_rows),
         "add_fills": sum(row["add_fills"] for row in daily_rows),
-        "closes": len(trades),
+        "closes": len(closed_trades),
         "total_pnl": total_pnl,
         "actual_pnl": actual_total,
         "estimated_pnl": estimated_total,
-        "win_rate": round(len(wins) / len(trades) * 100, 2) if trades else 0.0,
-        "avg_pnl": round(total_pnl / len(trades), 4) if trades else 0.0,
+        "win_rate": round(len(wins) / len(actual_records) * 100, 2) if actual_records else 0.0,
+        "avg_pnl": round(total_pnl / len(actual_records), 4) if actual_records else 0.0,
     }
     return {
         "summary": summary,
@@ -530,9 +602,18 @@ _HTML = """<!DOCTYPE html>
     transform: translateX(-50%);
   }
   table { width: 100%; border-collapse: collapse; }
-  th, td { padding: 9px 8px; border-bottom: 1px solid rgba(255,255,255,.06); text-align: left; }
+  th, td {
+    padding: 9px 8px;
+    border-bottom: 1px solid rgba(255,255,255,.06);
+    text-align: left;
+    vertical-align: middle;
+    white-space: nowrap;
+  }
   th { color: var(--muted); font-size: 12px; font-weight: 600; }
   td:last-child, th:last-child { text-align: right; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .time-cell { min-width: 150px; }
+  .note-cell { min-width: 150px; white-space: normal; }
   .badge { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 12px; background: #24303b; color: var(--muted); }
   .badge.fill { background: rgba(39,196,131,.14); color: var(--green); }
   .badge.wait { background: rgba(229,180,84,.14); color: var(--yellow); }
@@ -546,7 +627,7 @@ _HTML = """<!DOCTYPE html>
   }
   button { cursor: pointer; }
   button:hover { border-color: var(--blue); }
-  canvas { width: 100%; height: 360px; background: #0e1318; border: 1px solid var(--line); border-radius: 6px; display: block; }
+  canvas { width: 100%; height: 420px; background: #0e1318; border: 1px solid var(--line); border-radius: 6px; display: block; }
   .history-stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 10px; }
   .mini { background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; padding: 10px; }
   .mini .label { font-size: 12px; margin-bottom: 5px; }
@@ -631,14 +712,14 @@ _HTML = """<!DOCTYPE html>
           <button onclick="loadHistory()">加载</button>
         </div>
       </div>
-      <canvas id="history-chart" width="1200" height="360"></canvas>
+      <canvas id="history-chart" width="1200" height="420"></canvas>
       <div class="history-stats" id="history-stats"></div>
       <div class="history-grid">
         <div>
           <h2 style="margin:14px 0 8px">单日统计</h2>
           <div class="table-scroll">
             <table>
-              <thead><tr><th>日期</th><th>开单</th><th>头仓</th><th>补仓</th><th>平仓</th><th>实际收益</th><th>估算收益</th><th>累计</th><th>来源</th></tr></thead>
+              <thead><tr><th>日期</th><th>开单</th><th>头仓</th><th>补仓</th><th>平仓</th><th>实际收益</th><th>累计</th></tr></thead>
               <tbody id="daily-body"></tbody>
             </table>
           </div>
@@ -647,7 +728,7 @@ _HTML = """<!DOCTYPE html>
           <h2 style="margin:14px 0 8px">交易明细</h2>
           <div class="table-scroll">
             <table>
-              <thead><tr><th>开仓时间</th><th>平仓时间</th><th>方向</th><th>均价</th><th>平仓价</th><th>张数</th><th>批次</th><th>实际收益</th><th>估算收益</th><th>来源</th></tr></thead>
+              <thead><tr><th>开仓时间</th><th>平仓时间</th><th>类型</th><th>均价</th><th>平仓价</th><th>张数</th><th>批次</th><th>实际收益</th><th>备注</th></tr></thead>
               <tbody id="history-trade-body"></tbody>
             </table>
           </div>
@@ -753,8 +834,6 @@ function renderHistoryStats(s) {
   const items = [
     ['Tick', s.total_ticks || 0],
     ['价格区间', `${fmt(s.min_price)} - ${fmt(s.max_price)}`],
-    ['权益变化', `${fmt(s.first_equity)} -> ${fmt(s.last_equity)}`],
-    ['持仓占比', s.total_ticks ? `${fmt(s.position_ticks / s.total_ticks * 100)}%` : '--'],
     ['采样点', s.sampled_ticks || 0],
   ];
   document.getElementById('history-stats').innerHTML = items.map(([label, value]) => `
@@ -788,7 +867,6 @@ function renderHistoryTrades(data) {
   const currentStats = document.getElementById('history-stats').innerHTML;
   const tradeStats = [
     ['实际收益', pnlText(summary.total_pnl || 0)],
-    ['估算收益', pnlText(summary.estimated_pnl || 0)],
     ['平仓次数', summary.closes || 0],
     ['胜率', `${fmt(summary.win_rate || 0)}%`],
     ['头仓/补仓', `${summary.first_fills || 0} / ${summary.add_fills || 0}`],
@@ -806,28 +884,37 @@ function renderHistoryTrades(data) {
       <td>${row.first_fills}</td>
       <td>${row.add_fills}</td>
       <td>${row.closes}</td>
-      <td class="${pnlClass(row.pnl)}">${pnlText(row.pnl)}</td>
-      <td class="${pnlClass(row.estimated_pnl)}">${pnlText(row.estimated_pnl)}</td>
-      <td class="${pnlClass(row.cum_pnl)}">${pnlText(row.cum_pnl)}</td>
-      <td>${row.source === 'capital' ? '固本划转' : '估算'}</td>
+      <td class="num ${pnlClass(row.actual_pnl)}">${pnlText(row.actual_pnl)}</td>
+      <td class="num ${pnlClass(row.cum_pnl)}">${pnlText(row.cum_pnl)}</td>
     </tr>
-  `).join('') : '<tr><td colspan="9" class="muted">暂无可解析交易</td></tr>';
+  `).join('') : '<tr><td colspan="7" class="muted">暂无可解析交易</td></tr>';
 
   const trades = data.trades || [];
-  document.getElementById('history-trade-body').innerHTML = trades.length ? trades.map(t => `
-    <tr>
-      <td>${t.entry_time || '--'}</td>
-      <td>${t.exit_time || '--'}</td>
-      <td>${directionLabel(t.direction)}</td>
-      <td>${fmt(t.avg_entry)}</td>
-      <td>${fmt(t.exit_price)}</td>
-      <td>${t.sz || '--'}</td>
-      <td>${t.batches || 0}</td>
-      <td class="${pnlClass(t.pnl)}">${pnlText(t.pnl)}</td>
-      <td class="${pnlClass(t.estimated_pnl)}">${pnlText(t.estimated_pnl || 0)}</td>
-      <td>${t.pnl_source === 'capital' ? '固本划转' : '估算'}</td>
-    </tr>
-  `).join('') : '<tr><td colspan="10" class="muted">暂无平仓交易</td></tr>';
+  document.getElementById('history-trade-body').innerHTML = trades.length ? trades.map(t => {
+    if (t.record_type === 'settlement') {
+      return `
+        <tr>
+          <td class="time-cell">${t.exit_time || '--'}</td>
+          <td colspan="6" class="note-cell muted">跨日固本划转，当前日志缺少对应开仓/平仓明细</td>
+          <td class="num ${pnlClass(t.actual_pnl || t.pnl)}">${pnlText(t.actual_pnl || t.pnl)}</td>
+          <td class="note-cell">实际收益</td>
+        </tr>
+      `;
+    }
+    return `
+      <tr>
+        <td class="time-cell">${t.entry_time || '--'}</td>
+        <td class="time-cell">${t.exit_time || '--'}</td>
+        <td>${directionLabel(t.direction)}</td>
+        <td class="num">${fmt(t.avg_entry)}</td>
+        <td class="num">${fmt(t.exit_price)}</td>
+        <td class="num">${t.sz || '--'}</td>
+        <td class="num">${t.batches || 0}</td>
+        <td class="num ${pnlClass(t.actual_pnl || t.pnl)}">${pnlText(t.actual_pnl || t.pnl)}</td>
+        <td class="note-cell">${t.pnl_source === 'capital' ? '实际收益' : ''}</td>
+      </tr>
+    `;
+  }).join('') : '<tr><td colspan="9" class="muted">暂无平仓交易</td></tr>';
 
   const events = data.events || [];
   document.getElementById('event-body').innerHTML = events.length ? events.map(e => `
@@ -902,27 +989,45 @@ function drawHistory(points, events = []) {
     return best;
   }
   const markerStyle = {
-    first_fill: ['#27c483', 'H'],
-    add_fill: ['#e5b454', 'A'],
-    close: ['#ff5f66', 'C'],
-    capital_profit: ['#ff5f66', 'C'],
-    capital_loss: ['#ff5f66', 'C'],
+    first_fill: { color: '#27c483', label: '头', offset: -28 },
+    add_fill: { color: '#e5b454', label: '补', offset: 30 },
+    close: { color: '#ff5f66', label: '平', offset: -48 },
+    capital_profit: { color: '#ff5f66', label: '平', offset: -48 },
+    capital_loss: { color: '#ff5f66', label: '平', offset: -48 },
   };
   markers.forEach(e => {
     const idx = nearestIndex(e.time);
     if (idx < 0) return;
-    const [color, label] = markerStyle[e.type] || ['#ffffff', '?'];
+    const style = markerStyle[e.type] || { color: '#ffffff', label: '?', offset: -28 };
+    const color = style.color;
+    const label = style.label;
     const xx = x(idx);
     const yy = y(e.price || points[idx].price);
+    const labelY = Math.max(34, Math.min(h - 48, yy + style.offset));
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.setLineDash([4, 4]);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(xx, 24);
+    ctx.lineTo(xx, h - 34);
+    ctx.stroke();
+    ctx.setLineDash([]);
     ctx.fillStyle = color;
     ctx.beginPath();
-    ctx.arc(xx, yy, 5, 0, Math.PI * 2);
+    ctx.arc(xx, yy, 6, 0, Math.PI * 2);
     ctx.fill();
     ctx.fillStyle = '#0b0e11';
-    ctx.font = 'bold 8px Segoe UI';
+    ctx.fillRect(xx - 13, labelY - 10, 26, 20);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(xx - 13, labelY - 10, 26, 20);
+    ctx.font = 'bold 13px "Microsoft YaHei", Segoe UI';
     ctx.textAlign = 'center';
-    ctx.fillText(label, xx, yy + 3);
-    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = color;
+    ctx.fillText(label, xx, labelY + 1);
+    ctx.restore();
   });
 
   ctx.fillStyle = '#8a97a6';
@@ -935,9 +1040,9 @@ function drawHistory(points, events = []) {
   ctx.fillStyle = '#ff5f66'; ctx.fillText('Upper', w - 160, 22);
   ctx.fillStyle = '#e5b454'; ctx.fillText('Mid', w - 108, 22);
   ctx.fillStyle = '#27c483'; ctx.fillText('Lower', w - 70, 22);
-  ctx.fillStyle = '#27c483'; ctx.fillText('H 头仓', 56, 22);
-  ctx.fillStyle = '#e5b454'; ctx.fillText('A 补仓', 112, 22);
-  ctx.fillStyle = '#ff5f66'; ctx.fillText('C 平仓', 168, 22);
+  ctx.fillStyle = '#27c483'; ctx.fillText('头 头仓', 56, 22);
+  ctx.fillStyle = '#e5b454'; ctx.fillText('补 补仓', 116, 22);
+  ctx.fillStyle = '#ff5f66'; ctx.fillText('平 平仓/划转', 176, 22);
 }
 
 refreshLive();

@@ -11,8 +11,11 @@ import argparse
 import csv
 import itertools
 import math
+import os
+import random
 import re
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -25,7 +28,14 @@ if str(ROOT) not in sys.path:
 
 from src.config import (
     CONTRACT_STEP,
+    COPY_FIXED_LOSS_STOP_ENABLED,
+    COPY_FIXED_LOSS_STOP_RATIO,
+    COPY_FIXED_LOSS_STOP_USDT,
+    CROSS_COPY_DYNAMIC_SIZING_ENABLED,
+    CROSS_COPY_PROTECT_ENABLED,
+    CROSS_COPY_PROTECT_EQUITY_USDT,
     CT_VAL,
+    ADDON_EXTREME_GUARD_ENABLED,
     BOLL_WIDTH_BASE_PRICE,
     BOLL_WIDTH_BASE_USD,
     BOLL_WIDTH_GAP_MULT,
@@ -35,20 +45,58 @@ from src.config import (
     DYNAMIC_MAX_ENTRY_RATIO,
     DYNAMIC_MIN_ENTRY_RATIO,
     DYNAMIC_TP_ARM_RETURN,
+    BOLL_TP_COMPRESSION_ENABLED,
+    BOLL_TP_COMPRESSION_EXIT_OFFSET_USD,
+    BOLL_TP_COMPRESSION_MIN_RETURN,
+    BOLL_TREND_GUARD_ENABLED,
+    BOLL_TREND_GUARD_CONTROL_ENABLED,
+    BOLL_TREND_GUARD_HEAD_ADVERSE_PCT,
+    BOLL_TREND_GUARD_MIN_HOLD_MIN,
+    BOLL_TREND_GUARD_OBSERVE_ENABLED,
+    BOLL_TREND_GUARD_SLOPE_PCT_PER_HOUR,
+    BOLL_TREND_GUARD_SLOPE_WINDOW_MIN,
+    BOLL_TREND_GUARD_STOP_AFTER_CLOSE,
+    BOLL_TREND_GUARD_WIDTH_EXPAND,
+    BOLL_TREND_GUARD_WIDTH_PCT,
+    BOLL_TREND_GUARD_Z_MEAN,
+    DISASTER_HEAD_DROP_PCT,
+    DISASTER_LOSS_RATIO,
+    DISASTER_STOP_ENABLED,
     DYNAMIC_TP_ENABLED,
     DYNAMIC_TP_REPRICE_GAP_USD,
     DYNAMIC_TP_RESTORE_RETURN,
+    ADDON_DYNAMIC_GAP_ENABLED,
+    ADDON_DYNAMIC_GAP_MAX_USD,
+    ADDON_DYNAMIC_GAP_BOLL_START,
+    ADDON_DYNAMIC_GAP_BOLL_STRONG,
+    ADDON_DYNAMIC_GAP_BOLL_MAX_MULT,
+    ADDON_DYNAMIC_GAP_HEAD_START_PCT,
+    ADDON_DYNAMIC_GAP_HEAD_STRONG_PCT,
+    ADDON_DYNAMIC_GAP_HEAD_MAX_MULT,
+    ADDON_DYNAMIC_GAP_TREND_KLINES,
+    ADDON_DYNAMIC_GAP_TREND_MULT,
+    ENTRY_EXTREME_GAP_ADJUST_ENABLED,
+    ENTRY_EXTREME_GAP_BASE_PCT,
+    ENTRY_EXTREME_GAP_FULL_PCT,
+    ENTRY_EXTREME_GAP_MAX_MULT,
     FIRST_BATCH_RATIO,
     LEVER,
     MAX_ENTRY_BATCHES,
     MAX_TOTAL_ENTRY_RATIO,
+    MIN_BOLL_WIDTH_USD,
     MIN_BOLL_WIDTH_PCT,
+    ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED,
+    ENTRY_MAX_BOLL_WIDTH_PCT,
+    ENTRY_MAX_BOLL_WIDTH_USD,
+    MIN_ENTRY_GAP_USD,
     MIN_BOLL_WIDTH_FLOOR_USD,
     MIN_HEAD_LIQ_BUFFER_PCT,
     MIN_ORDER_CONTRACTS,
     NO_NEW_EXTREME_TICKS,
     OKX_LIQ_FEE_RATE,
     OKX_MAINTENANCE_MARGIN_RATE,
+    POLL_INTERVAL,
+    REPRICE_GAP_USD,
     SECOND_BATCH_RATIO,
     TP_TARGET_MARGIN_RETURN,
     TP_PROFIT_USD,
@@ -62,6 +110,8 @@ DEFAULT_OUT_DIR = ROOT / "backtest" / "results" / "log_parameter_optimizer"
 SOURCE_BOLL_STD = 2.0
 TAKER_FEE = 0.0005
 INITIAL_TOTAL_EQUITY = 1000.0
+DEFAULT_DYNAMIC_TP_ARM_GRID = ",".join(f"{value / 1000:g}" for value in range(150, 241, 5))
+_WORKER_TICKS: pd.DataFrame | None = None
 
 TICK_RE = re.compile(
     "^(?P<ts>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d+).*?"
@@ -78,8 +128,12 @@ class Params:
 
     boll_std: float
     min_width_usd: float
+    min_width_pct: float
     min_entry_gap_usd: float
     reprice_gap_usd: float
+    entry_max_width_enabled: int = int(ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED)
+    entry_max_width_pct: float = ENTRY_MAX_BOLL_WIDTH_PCT
+    entry_max_width_usd: float = ENTRY_MAX_BOLL_WIDTH_USD
     first_batch_ratio: float = FIRST_BATCH_RATIO
     second_batch_ratio: float = SECOND_BATCH_RATIO
     dynamic_base_ratio: float = DYNAMIC_BASE_ENTRY_RATIO
@@ -96,6 +150,40 @@ class Params:
     dynamic_tp_arm_return: float = DYNAMIC_TP_ARM_RETURN
     dynamic_tp_restore_return: float = DYNAMIC_TP_RESTORE_RETURN
     dynamic_tp_reprice_gap_usd: float = DYNAMIC_TP_REPRICE_GAP_USD
+    boll_tp_compression_enabled: int = int(BOLL_TP_COMPRESSION_ENABLED)
+    boll_tp_compression_min_return: float = BOLL_TP_COMPRESSION_MIN_RETURN
+    boll_tp_compression_exit_offset_usd: float = BOLL_TP_COMPRESSION_EXIT_OFFSET_USD
+    entry_extreme_gap_adjust_enabled: int = int(ENTRY_EXTREME_GAP_ADJUST_ENABLED)
+    entry_extreme_gap_base_pct: float = ENTRY_EXTREME_GAP_BASE_PCT
+    entry_extreme_gap_full_pct: float = ENTRY_EXTREME_GAP_FULL_PCT
+    entry_extreme_gap_max_mult: float = ENTRY_EXTREME_GAP_MAX_MULT
+    copy_fixed_loss_stop_enabled: int = int(COPY_FIXED_LOSS_STOP_ENABLED)
+    copy_fixed_loss_stop_usdt: float = COPY_FIXED_LOSS_STOP_USDT
+    copy_fixed_loss_stop_ratio: float = COPY_FIXED_LOSS_STOP_RATIO
+    disaster_stop_enabled: int = int(DISASTER_STOP_ENABLED)
+    disaster_head_drop_pct: float = DISASTER_HEAD_DROP_PCT
+    disaster_loss_ratio: float = DISASTER_LOSS_RATIO
+    boll_trend_guard_enabled: int = int(BOLL_TREND_GUARD_ENABLED)
+    boll_trend_guard_observe_enabled: int = int(BOLL_TREND_GUARD_OBSERVE_ENABLED)
+    boll_trend_guard_control_enabled: int = int(BOLL_TREND_GUARD_CONTROL_ENABLED)
+    boll_trend_guard_head_adverse_pct: float = BOLL_TREND_GUARD_HEAD_ADVERSE_PCT
+    boll_trend_guard_width_expand: float = BOLL_TREND_GUARD_WIDTH_EXPAND
+    boll_trend_guard_width_pct: float = BOLL_TREND_GUARD_WIDTH_PCT
+    boll_trend_guard_slope_window_min: float = BOLL_TREND_GUARD_SLOPE_WINDOW_MIN
+    boll_trend_guard_min_hold_min: float = BOLL_TREND_GUARD_MIN_HOLD_MIN
+    boll_trend_guard_z_mean: float = BOLL_TREND_GUARD_Z_MEAN
+    boll_trend_guard_slope_pct_per_hour: float = BOLL_TREND_GUARD_SLOPE_PCT_PER_HOUR
+    boll_trend_guard_stop_after_close: int = int(BOLL_TREND_GUARD_STOP_AFTER_CLOSE)
+    addon_dynamic_gap_enabled: int = int(ADDON_DYNAMIC_GAP_ENABLED)
+    addon_dynamic_gap_max_usd: float = ADDON_DYNAMIC_GAP_MAX_USD
+    addon_dynamic_gap_boll_start: float = ADDON_DYNAMIC_GAP_BOLL_START
+    addon_dynamic_gap_boll_strong: float = ADDON_DYNAMIC_GAP_BOLL_STRONG
+    addon_dynamic_gap_boll_max_mult: float = ADDON_DYNAMIC_GAP_BOLL_MAX_MULT
+    addon_dynamic_gap_head_start_pct: float = ADDON_DYNAMIC_GAP_HEAD_START_PCT
+    addon_dynamic_gap_head_strong_pct: float = ADDON_DYNAMIC_GAP_HEAD_STRONG_PCT
+    addon_dynamic_gap_head_max_mult: float = ADDON_DYNAMIC_GAP_HEAD_MAX_MULT
+    addon_dynamic_gap_trend_klines: int = ADDON_DYNAMIC_GAP_TREND_KLINES
+    addon_dynamic_gap_trend_mult: float = ADDON_DYNAMIC_GAP_TREND_MULT
 
 
 @dataclass
@@ -174,9 +262,16 @@ class LogReplay:
         self.ticks = ticks
         self.params = params
         self.initial_total = initial_total
-        self.trading_balance = TRADING_ACCOUNT_TARGET
-        self.funding_balance = max(initial_total - TRADING_ACCOUNT_TARGET, 0.0)
+        self.trading_balance = initial_total if CROSS_COPY_PROTECT_ENABLED else TRADING_ACCOUNT_TARGET
+        self.funding_balance = 0.0 if CROSS_COPY_PROTECT_ENABLED else max(initial_total - TRADING_ACCOUNT_TARGET, 0.0)
         self.pos = Position()
+        self.current_price = 0.0
+        self._current_row = None
+        self.kline_extremes = ticks.groupby("kline_ts").agg(low=("price", "min"), high=("price", "max"))
+        self.addon_extreme_guard_price = 0.0
+        self.addon_extreme_guard_kline = None
+        self.addon_extreme_guard_started = False
+        self.entry_gap_cache: dict[float, float] = {}
         self.recent_prices: list[float] = []
         self.last_plan_price = 0.0
         self.last_batch_kline = None
@@ -192,8 +287,17 @@ class LogReplay:
         self.skipped_entry_cap = 0
         self.skipped_funds = 0
         self.blocked_width = 0
+        self.blocked_entry_max_width = 0
         self.blocked_gap = 0
         self.blocked_extreme = 0
+        self.blocked_addon_guard = 0
+        self.cross_copy_stop = 0
+        self.fixed_loss_stop = 0
+        self.disaster_stop = 0
+        self.boll_trend_guard_signal = 0
+        self.boll_trend_guard_stop = 0
+        self.boll_trend_guard_active = False
+        self.stopped = False
         self.width_cancel = 0
         self.inside_cancel = 0
         self.reprice_count = 0
@@ -204,12 +308,31 @@ class LogReplay:
         self.dynamic_tp_active = False
         self.dynamic_tp_activated = 0
         self.dynamic_tp_restored = 0
+        self.boll_tp_compression_activated = 0
+        self.entry_extreme_gap_pct = 0.0
+        self.entry_extreme_gap_mult = 1.0
+        self.entry_extreme_entries = 0
+        self.entry_extreme_gap_total = 0.0
+        self.entry_extreme_gap_max = 0.0
+        self.entry_extreme_mult_total = 0.0
+        self.entry_extreme_mult_max = 1.0
+        self.min_liq_distance_pct = 999.0
+        self.wipeout_risk = False
+        self.boll_history: list[dict] = []
+        self.entry_boll_width = 0.0
+        self.entry_boll_width_pct = 0.0
+        self.dynamic_gap_events = 0
+        self.dynamic_gap_mult_total = 0.0
+        self.dynamic_gap_mult_max = 1.0
 
     def run(self) -> "LogReplay":
         """Run the replay and return self."""
         for row in self.ticks.itertuples(index=False):
+            self._current_row = row
             self._remember_price(float(row.price))
+            self._remember_boll(row)
             self._process_tick(row)
+            self._track_liq_distance(float(row.price))
             equity = self.total_equity() + self._unrealized(float(row.price))
             self.equity_curve.append(equity)
             self.equity_points.append({"ts": str(row.ts), "equity": round(float(equity), 4)})
@@ -218,6 +341,75 @@ class LogReplay:
     def total_equity(self) -> float:
         """Return simulated total account equity."""
         return self.trading_balance + self.funding_balance
+
+    def _account_equity(self, price: float | None = None) -> float:
+        """Return total account equity including open unrealized PnL."""
+        mark = self.current_price if price is None else price
+        return self.total_equity() + self._unrealized(mark)
+
+    def _previous_kline_ts(self, kline_ts):
+        """Return previous completed 15-minute candle timestamp."""
+        if pd.isna(kline_ts):
+            return None
+        return pd.Timestamp(kline_ts) - pd.Timedelta(minutes=15)
+
+    def _start_addon_guard(self, row) -> None:
+        """Start or continue completed-candle extreme tracking after a fill."""
+        if not ADDON_EXTREME_GUARD_ENABLED or self.pos.direction not in ("long", "short"):
+            return
+        self.addon_extreme_guard_started = True
+        prev = self._previous_kline_ts(row.kline_ts)
+        if prev not in self.kline_extremes.index:
+            return
+        if self.pos.direction == "long":
+            current = float(self.kline_extremes.loc[prev, "low"])
+            self.addon_extreme_guard_price = (
+                current if self.addon_extreme_guard_price <= 0 else min(self.addon_extreme_guard_price, current)
+            )
+        else:
+            current = float(self.kline_extremes.loc[prev, "high"])
+            self.addon_extreme_guard_price = (
+                current if self.addon_extreme_guard_price <= 0 else max(self.addon_extreme_guard_price, current)
+            )
+        self.addon_extreme_guard_kline = prev
+
+    def _update_addon_guard(self, row) -> None:
+        """Update add-on guard from the latest completed candle."""
+        if not ADDON_EXTREME_GUARD_ENABLED or not self.pos.is_active():
+            return
+        if not self.addon_extreme_guard_started and self.pos.filled:
+            self.addon_extreme_guard_started = True
+        if not self.addon_extreme_guard_started:
+            return
+        prev = self._previous_kline_ts(row.kline_ts)
+        if prev not in self.kline_extremes.index or prev == self.addon_extreme_guard_kline:
+            return
+        if self.pos.direction == "long":
+            current = float(self.kline_extremes.loc[prev, "low"])
+            self.addon_extreme_guard_price = (
+                current if self.addon_extreme_guard_price <= 0 else min(self.addon_extreme_guard_price, current)
+            )
+        else:
+            current = float(self.kline_extremes.loc[prev, "high"])
+            self.addon_extreme_guard_price = (
+                current if self.addon_extreme_guard_price <= 0 else max(self.addon_extreme_guard_price, current)
+            )
+        self.addon_extreme_guard_kline = prev
+
+    def _addon_guard_allows(self, price: float) -> bool:
+        """Return whether an add-on price breaks the tracked candle extreme."""
+        if not ADDON_EXTREME_GUARD_ENABLED:
+            return True
+        if self.addon_extreme_guard_price <= 0:
+            self.blocked_addon_guard += 1
+            return False
+        if self.pos.direction == "long":
+            allowed = price < self.addon_extreme_guard_price
+        else:
+            allowed = price > self.addon_extreme_guard_price
+        if not allowed:
+            self.blocked_addon_guard += 1
+        return allowed
 
     def _remember_price(self, price: float) -> None:
         self.recent_prices.append(price)
@@ -244,9 +436,43 @@ class LogReplay:
         width = upper - lower
         return lower, float(row.mid), upper, width
 
+    def _remember_boll(self, row) -> None:
+        """Keep recent Bollinger-shape data for trend-expansion checks."""
+        lower, mid, upper, width = self._bands(row)
+        price = float(row.price)
+        half_width = upper - mid
+        z = (price - mid) / half_width if half_width else 0.0
+        self.boll_history.append(
+            {
+                "ts": pd.Timestamp(row.ts),
+                "lower": lower,
+                "mid": mid,
+                "upper": upper,
+                "width": width,
+                "width_pct": width / price if price > 0 else 0.0,
+                "z": z,
+            }
+        )
+        keep_after = pd.Timestamp(row.ts) - pd.Timedelta(
+            minutes=max(self.params.boll_trend_guard_slope_window_min * 2, 180)
+        )
+        while self.boll_history and self.boll_history[0]["ts"] < keep_after:
+            self.boll_history.pop(0)
+
     def _width_ok(self, row) -> bool:
         _, _, _, width = self._bands(row)
         return width >= self._effective_min_boll_width(float(row.price))
+
+    def _entry_max_width_ok(self, row) -> bool:
+        """Return whether Bollinger width is not too wide for a first batch."""
+        if not self.params.entry_max_width_enabled:
+            return True
+        _, _, _, width = self._bands(row)
+        price = float(row.price)
+        width_pct = width / price if price > 0 else 0.0
+        pct_hit = self.params.entry_max_width_pct > 0 and width_pct >= self.params.entry_max_width_pct
+        usd_hit = self.params.entry_max_width_usd > 0 and width >= self.params.entry_max_width_usd
+        return not (pct_hit or usd_hit)
 
     def _effective_boll_width_pct(self) -> float:
         base_pct = (
@@ -254,7 +480,7 @@ class LogReplay:
             if self.params.boll_width_base_price > 0
             else 0.0
         )
-        return max(MIN_BOLL_WIDTH_PCT, base_pct)
+        return max(self.params.min_width_pct, base_pct)
 
     def _head_entry_price(self, fallback_price: float) -> float:
         filled = sorted(self.pos.filled, key=lambda batch: batch.idx)
@@ -280,9 +506,10 @@ class LogReplay:
         prices = [head_price - idx * gap for idx in range(len(ratios))]
         if not prices or prices[-1] <= 0:
             return None
+        sizing_equity = self._sizing_equity()
         sizes = []
         for ratio, price in zip(ratios, prices):
-            raw_sz = self._sizing_equity() * ratio * LEVER / (price * CT_VAL)
+            raw_sz = sizing_equity * ratio * LEVER / (price * CT_VAL)
             sz = math.floor(raw_sz / CONTRACT_STEP) * CONTRACT_STEP
             if sz <= 0:
                 return None
@@ -290,15 +517,51 @@ class LogReplay:
         qty = sum(sizes) * CT_VAL
         avg = sum(sz * CT_VAL * price for sz, price in zip(sizes, prices)) / qty
         entry_fee = sum(sz * CT_VAL * price * OKX_LIQ_FEE_RATE for sz, price in zip(sizes, prices))
-        margin_balance = max(TRADING_ACCOUNT_TARGET - entry_fee, 0.0)
+        margin_balance = max(sizing_equity - entry_fee, 0.0)
         denominator = qty * (OKX_MAINTENANCE_MARGIN_RATE + OKX_LIQ_FEE_RATE - 1)
         if denominator == 0:
             return None
         return (margin_balance - qty * avg) / denominator
 
+    def _liq_price_for_batches(self, batches: list[Batch]) -> float | None:
+        """Estimate liquidation price for currently filled batches."""
+        if not batches:
+            return None
+        qty = sum(batch.sz for batch in batches) * CT_VAL
+        if qty <= 0:
+            return None
+        avg = sum(batch.sz * CT_VAL * batch.price for batch in batches) / qty
+        entry_fee = sum(batch.sz * CT_VAL * batch.price * OKX_LIQ_FEE_RATE for batch in batches)
+        margin_balance = max(self._sizing_equity() - entry_fee, 0.0)
+        if self.pos.direction == "short":
+            denominator = qty * (1 + OKX_MAINTENANCE_MARGIN_RATE + OKX_LIQ_FEE_RATE)
+            return (margin_balance + qty * avg) / denominator if denominator else None
+        denominator = qty * (1 - OKX_MAINTENANCE_MARGIN_RATE - OKX_LIQ_FEE_RATE)
+        return (qty * avg - margin_balance) / denominator if denominator else None
+
+    def _liq_distance_pct(self, liq_price: float | None, mark_price: float) -> float:
+        """Return distance from estimated liquidation as a price percentage."""
+        if liq_price is None or liq_price <= 0 or mark_price <= 0:
+            return 999.0
+        if self.pos.direction == "short":
+            return (liq_price - mark_price) / mark_price * 100
+        return (mark_price - liq_price) / mark_price * 100
+
+    def _track_liq_distance(self, mark_price: float) -> None:
+        """Track the tightest estimated liquidation distance seen in replay."""
+        if not self.pos.is_active():
+            return
+        distance = self._liq_distance_pct(self._liq_price_for_batches(self.pos.filled), mark_price)
+        self.min_liq_distance_pct = min(self.min_liq_distance_pct, distance)
+        if distance <= 0:
+            self.wipeout_risk = True
+
     def _required_entry_gap_for_head_buffer(self, head_price: float) -> float:
         if not DYNAMIC_ENTRY_GAP_ENABLED or head_price <= 0:
             return self.params.min_entry_gap_usd
+        cache_key = round(head_price, 1)
+        if cache_key in self.entry_gap_cache:
+            return self.entry_gap_cache[cache_key]
 
         def buffer_pct(gap: float) -> float:
             liq = self._liq_price_for_ladder(head_price, gap)
@@ -307,6 +570,7 @@ class LogReplay:
             return (head_price - liq) / head_price
 
         if buffer_pct(self.params.min_entry_gap_usd) >= self.params.min_head_liq_buffer_pct:
+            self.entry_gap_cache[cache_key] = self.params.min_entry_gap_usd
             return self.params.min_entry_gap_usd
         lo = self.params.min_entry_gap_usd
         hi = DYNAMIC_ENTRY_GAP_MAX_USD
@@ -316,16 +580,114 @@ class LogReplay:
                 hi = mid
             else:
                 lo = mid
-        return round(hi, 2)
+        result = round(hi, 2)
+        self.entry_gap_cache[cache_key] = result
+        return result
 
     def _effective_entry_gap(self, price: float) -> float:
         head_price = self._head_entry_price(price)
-        return max(self.params.min_entry_gap_usd, self._required_entry_gap_for_head_buffer(head_price))
+        base_gap = max(self.params.min_entry_gap_usd, self._required_entry_gap_for_head_buffer(head_price))
+        mult = self.entry_extreme_gap_mult if self.params.entry_extreme_gap_adjust_enabled else 1.0
+        mult *= self._addon_dynamic_gap_mult(price)
+        return round(base_gap * max(1.0, mult), 2)
+
+    def _addon_dynamic_gap_mult(self, price: float) -> float:
+        """Return dynamic add-on spacing multiplier for the current replay tick."""
+        if not self.params.addon_dynamic_gap_enabled or not self.pos.is_active():
+            return 1.0
+        mult = 1.0
+        row = self._current_row
+        if row is not None and self.entry_boll_width > 0:
+            _, _, _, width = self._bands(row)
+            expand = width / self.entry_boll_width
+            if expand >= self.params.addon_dynamic_gap_boll_strong:
+                mult *= self.params.addon_dynamic_gap_boll_max_mult
+            elif expand >= self.params.addon_dynamic_gap_boll_start:
+                mid_mult = 1.0 + (self.params.addon_dynamic_gap_boll_max_mult - 1.0) * 0.5
+                mult *= max(1.0, mid_mult)
+
+        adverse_pct = self._head_adverse_move_pct(price)
+        if adverse_pct >= self.params.addon_dynamic_gap_head_strong_pct:
+            mult *= self.params.addon_dynamic_gap_head_max_mult
+        elif adverse_pct >= self.params.addon_dynamic_gap_head_start_pct:
+            mid_mult = 1.0 + (self.params.addon_dynamic_gap_head_max_mult - 1.0) * 0.5
+            mult *= max(1.0, mid_mult)
+
+        mult *= self._addon_dynamic_gap_trend_mult()
+        if self.params.addon_dynamic_gap_max_usd > 0 and self.params.min_entry_gap_usd > 0:
+            mult = min(mult, self.params.addon_dynamic_gap_max_usd / self.params.min_entry_gap_usd)
+        mult = max(1.0, mult)
+        if mult > 1.0001:
+            self.dynamic_gap_events += 1
+            self.dynamic_gap_mult_total += mult
+            self.dynamic_gap_mult_max = max(self.dynamic_gap_mult_max, mult)
+        return mult
+
+    def _addon_dynamic_gap_trend_mult(self) -> float:
+        """Return extra multiplier for consecutive completed-candle extremes."""
+        if self.params.addon_dynamic_gap_trend_mult <= 1.0:
+            return 1.0
+        if self.pos.direction not in ("long", "short"):
+            return 1.0
+        row = self._current_row
+        if row is None:
+            return 1.0
+        count = int(self.params.addon_dynamic_gap_trend_klines)
+        if count < 2:
+            return 1.0
+        prev = self._previous_kline_ts(row.kline_ts)
+        if prev is None:
+            return 1.0
+        idx = [value for value in self.kline_extremes.index if value <= prev]
+        if len(idx) < count:
+            return 1.0
+        recent = self.kline_extremes.loc[idx[-count:]]
+        if self.pos.direction == "long":
+            lows = [float(value) for value in recent["low"]]
+            if all(lows[i] > lows[i + 1] for i in range(len(lows) - 1)):
+                return self.params.addon_dynamic_gap_trend_mult
+            return 1.0
+        highs = [float(value) for value in recent["high"]]
+        if all(highs[i] < highs[i + 1] for i in range(len(highs) - 1)):
+            return self.params.addon_dynamic_gap_trend_mult
+        return 1.0
 
     def _effective_min_boll_width(self, price: float) -> float:
         pct_rule = price * self._effective_boll_width_pct() if price > 0 else 0.0
         gap_rule = self._effective_entry_gap(price) * self.params.boll_width_gap_mult
         return max(self.params.min_width_usd, self.params.boll_width_floor_usd, pct_rule, gap_rule)
+
+    def _entry_extreme_multiplier(self, gap_pct: float) -> float:
+        if not self.params.entry_extreme_gap_adjust_enabled:
+            return 1.0
+        if gap_pct <= self.params.entry_extreme_gap_base_pct:
+            return 1.0
+        full = self.params.entry_extreme_gap_full_pct if self.params.entry_extreme_gap_full_pct > 0 else 1e-9
+        progress = (gap_pct - self.params.entry_extreme_gap_base_pct) / full
+        mult = 1.0 + progress * (self.params.entry_extreme_gap_max_mult - 1.0)
+        return round(max(1.0, min(self.params.entry_extreme_gap_max_mult, mult)), 4)
+
+    def _record_entry_extreme_adjustment(self, direction: str, price: float, row) -> None:
+        self.entry_extreme_gap_pct = 0.0
+        self.entry_extreme_gap_mult = 1.0
+        if not self.params.entry_extreme_gap_adjust_enabled or price <= 0:
+            return
+        low24 = float(getattr(row, "low24", price) or price)
+        high24 = float(getattr(row, "high24", price) or price)
+        if direction == "long":
+            gap_pct = max(0.0, (price - low24) / price)
+        elif direction == "short":
+            gap_pct = max(0.0, (high24 - price) / price)
+        else:
+            return
+        mult = self._entry_extreme_multiplier(gap_pct)
+        self.entry_extreme_gap_pct = gap_pct
+        self.entry_extreme_gap_mult = mult
+        self.entry_extreme_entries += 1
+        self.entry_extreme_gap_total += gap_pct
+        self.entry_extreme_gap_max = max(self.entry_extreme_gap_max, gap_pct)
+        self.entry_extreme_mult_total += mult
+        self.entry_extreme_mult_max = max(self.entry_extreme_mult_max, mult)
 
     def _dynamic_tp_distance(self, avg_entry: float) -> float:
         if avg_entry <= 0:
@@ -386,6 +748,39 @@ class LogReplay:
         self.dynamic_tp_active = True
         self.dynamic_tp_activated += 1
 
+    def _maybe_update_boll_tp_compression(self, row) -> bool:
+        if not self.params.boll_tp_compression_enabled:
+            return False
+        if not self.pos.is_active() or self.pos.avg_entry <= 0 or self.pos.tp_price <= 0:
+            return False
+        price = float(row.price)
+        ret = self._position_margin_return(price)
+        if ret < self.params.boll_tp_compression_min_return:
+            return False
+
+        lower, _, upper, _ = self._bands(row)
+        if self.pos.direction == "long":
+            if upper > self.pos.tp_price or self._still_making_new_high():
+                return False
+            lock_price = round(price - self.params.boll_tp_compression_exit_offset_usd, 2)
+            if lock_price <= self.pos.avg_entry:
+                return False
+        elif self.pos.direction == "short":
+            if lower < self.pos.tp_price or self._still_making_new_low():
+                return False
+            lock_price = round(price + self.params.boll_tp_compression_exit_offset_usd, 2)
+            if lock_price >= self.pos.avg_entry:
+                return False
+        else:
+            return False
+
+        if abs(lock_price - self.pos.tp_price) < self.params.dynamic_tp_reprice_gap_usd:
+            return False
+        self.pos.tp_price = lock_price
+        self.dynamic_tp_active = True
+        self.boll_tp_compression_activated += 1
+        return True
+
     def _outside_direction(self, row) -> str:
         lower, _, upper, _ = self._bands(row)
         price = float(row.price)
@@ -402,6 +797,9 @@ class LogReplay:
         direction = self._outside_direction(row)
         if direction == "none":
             return "none"
+        if not self.pos.has_plan() and not self._entry_max_width_ok(row):
+            self.blocked_entry_max_width += 1
+            return "none"
         self.signal_count += 1
         if direction == "long" and self._still_making_new_low():
             self.blocked_extreme += 1
@@ -411,13 +809,209 @@ class LogReplay:
             return "none"
         return direction
 
+    def _head_adverse_move_pct(self, mark_price: float) -> float:
+        """Return mark-price adverse move from the first filled batch."""
+        filled = sorted(self.pos.filled, key=lambda batch: batch.idx)
+        if not filled:
+            return 0.0
+        head_price = filled[0].price
+        if head_price <= 0 or mark_price <= 0:
+            return 0.0
+        if self.pos.direction == "long":
+            return max((head_price - mark_price) / head_price, 0.0)
+        return max((mark_price - head_price) / head_price, 0.0)
+
+    def _disaster_stop_triggered(self, mark_price: float) -> bool:
+        """Return whether the strategy-cycle disaster stop should close now."""
+        if not self.params.disaster_stop_enabled:
+            return False
+        if not self.pos.is_active() or TRADING_ACCOUNT_TARGET <= 0:
+            return False
+        if self.params.disaster_head_drop_pct <= 0 or self.params.disaster_loss_ratio <= 0:
+            return False
+        head_move = self._head_adverse_move_pct(mark_price)
+        unrealized = self._unrealized(mark_price)
+        loss_threshold = TRADING_ACCOUNT_TARGET * self.params.disaster_loss_ratio
+        return head_move >= self.params.disaster_head_drop_pct and unrealized <= -loss_threshold
+
+    def _fixed_loss_stop_price(self) -> float:
+        """Return the live-style fixed-loss stop trigger price."""
+        if not self.params.copy_fixed_loss_stop_enabled:
+            return 0.0
+        if not self.pos.is_active() or self.pos.avg_entry <= 0 or self.pos.total_sz <= 0:
+            return 0.0
+        target_loss = self.params.copy_fixed_loss_stop_usdt
+        if target_loss <= 0:
+            target_loss = TRADING_ACCOUNT_TARGET * self.params.copy_fixed_loss_stop_ratio
+        if target_loss <= 0:
+            return 0.0
+        price_delta = target_loss / (self.pos.total_sz * CT_VAL)
+        if self.pos.direction == "long":
+            return self.pos.avg_entry - price_delta
+        if self.pos.direction == "short":
+            return self.pos.avg_entry + price_delta
+        return 0.0
+
+    def _fixed_loss_stop_triggered(self, mark_price: float) -> bool:
+        """Return whether the fixed-loss protection order would trigger."""
+        stop_price = self._fixed_loss_stop_price()
+        if stop_price <= 0:
+            return False
+        if self.pos.direction == "long":
+            return mark_price <= stop_price
+        if self.pos.direction == "short":
+            return mark_price >= stop_price
+        return False
+
+    def _head_adverse_move_pct(self, mark_price: float) -> float:
+        """Return adverse move from the first filled batch as a ratio."""
+        head = self.pos.filled[0].price if self.pos.filled else 0.0
+        if head <= 0 or mark_price <= 0:
+            return 0.0
+        if self.pos.direction == "long":
+            return max((head - mark_price) / head, 0.0)
+        if self.pos.direction == "short":
+            return max((mark_price - head) / head, 0.0)
+        return 0.0
+
+    def _series_slope_pct_per_hour(self, values: list[float], start_ts, end_ts) -> float:
+        """Return percent-per-hour slope across a window."""
+        if len(values) < 2 or not values[0]:
+            return 0.0
+        hours = (pd.Timestamp(end_ts) - pd.Timestamp(start_ts)).total_seconds() / 3600
+        if hours <= 0:
+            return 0.0
+        return (values[-1] - values[0]) / values[0] * 100 / hours
+
+    def _boll_trend_guard_triggered(self, row) -> bool:
+        """Detect one-way trend expansion after entry."""
+        if not (
+            self.params.boll_trend_guard_enabled
+            or self.params.boll_trend_guard_observe_enabled
+            or self.params.boll_trend_guard_control_enabled
+        ):
+            return False
+        if not self.pos.is_active():
+            return False
+        if not self.entry_time or self.entry_boll_width <= 0:
+            return False
+
+        now = pd.Timestamp(row.ts)
+        entry_ts = pd.Timestamp(self.entry_time)
+        hold_min = (now - entry_ts).total_seconds() / 60
+        if hold_min < self.params.boll_trend_guard_min_hold_min:
+            return False
+
+        mark_price = float(row.price)
+        if self._head_adverse_move_pct(mark_price) < self.params.boll_trend_guard_head_adverse_pct:
+            return False
+
+        _, _, _, width = self._bands(row)
+        width_pct = width / mark_price if mark_price > 0 else 0.0
+        if width / self.entry_boll_width < self.params.boll_trend_guard_width_expand:
+            return False
+        if width_pct < self.params.boll_trend_guard_width_pct:
+            return False
+
+        window_start = now - pd.Timedelta(minutes=self.params.boll_trend_guard_slope_window_min)
+        window = [item for item in self.boll_history if item["ts"] >= window_start]
+        if len(window) < 2:
+            return False
+
+        z_mean = float(np.mean([item["z"] for item in window]))
+        slope_limit = self.params.boll_trend_guard_slope_pct_per_hour
+        if self.pos.direction == "long":
+            if z_mean > -self.params.boll_trend_guard_z_mean:
+                return False
+            slope = self._series_slope_pct_per_hour(
+                [item["lower"] for item in window],
+                window[0]["ts"],
+                window[-1]["ts"],
+            )
+            return slope <= -slope_limit
+
+        if self.pos.direction == "short":
+            if z_mean < self.params.boll_trend_guard_z_mean:
+                return False
+            slope = self._series_slope_pct_per_hour(
+                [item["upper"] for item in window],
+                window[0]["ts"],
+                window[-1]["ts"],
+            )
+            return slope >= slope_limit
+
+        return False
+
     def _process_tick(self, row) -> None:
+        if self.stopped:
+            return
+        self.current_price = float(row.price)
+        if CROSS_COPY_PROTECT_ENABLED and self._account_equity(float(row.price)) <= CROSS_COPY_PROTECT_EQUITY_USDT:
+            if self.pos.is_active():
+                self._close(
+                    float(row.price),
+                    str(row.ts),
+                    float(row.price),
+                    row.kline_ts,
+                    rebalance=False,
+                    reason="鍏ㄤ粨淇濇姢姝㈡崯骞充粨",
+                )
+            self.pos.reset()
+            self.pos.pending = None
+            self.cross_copy_stop += 1
+            self.stopped = True
+            return
         if self.pos.pending is not None:
             self._try_fill_pending(row)
         if self.pos.is_active():
             self._try_take_profit(row)
+        if self.pos.is_active() and self._fixed_loss_stop_triggered(float(row.price)):
+            self._close(
+                float(row.price),
+                str(row.ts),
+                float(row.price),
+                row.kline_ts,
+                rebalance=True,
+                reason="鍥哄畾浜忔崯淇濇姢骞充粨",
+            )
+            self.fixed_loss_stop += 1
+        if self.pos.is_active() and self._boll_trend_guard_triggered(row):
+            if not self.boll_trend_guard_active:
+                self.boll_trend_guard_signal += 1
+                self.boll_trend_guard_active = True
+            control_enabled = bool(
+                self.params.boll_trend_guard_enabled
+                or self.params.boll_trend_guard_control_enabled
+            )
+            if control_enabled:
+                self._close(
+                    float(row.price),
+                    str(row.ts),
+                    float(row.price),
+                    row.kline_ts,
+                    rebalance=True,
+                    reason="BTG control close",
+                )
+                self.boll_trend_guard_stop += 1
+                if self.params.boll_trend_guard_stop_after_close:
+                    self.stopped = True
+                    return
+        if self.pos.is_active() and self._disaster_stop_triggered(float(row.price)):
+            self._close(
+                float(row.price),
+                str(row.ts),
+                float(row.price),
+                row.kline_ts,
+                rebalance=False,
+                reason="鐏鹃毦姝㈡崯骞充粨",
+            )
+            self.disaster_stop += 1
+            self.stopped = True
+            return
         if self.pos.is_active():
-            self._maybe_update_dynamic_tp(row)
+            compressed = self._maybe_update_boll_tp_compression(row)
+            if not compressed:
+                self._maybe_update_dynamic_tp(row)
         if self.capital_shortage_active and self.trading_balance + 0.01 >= TRADING_ACCOUNT_TARGET:
             self.capital_shortage_active = False
         if self.pos.has_plan():
@@ -446,6 +1040,7 @@ class LogReplay:
         order = self._order_at(0, price)
         if order is None:
             return
+        self._record_entry_extreme_adjustment(direction, price, row)
         self.pos.direction = direction
         self.pos.pending = order
         self.events.append(
@@ -457,7 +1052,7 @@ class LogReplay:
                 "price": order.price,
                 "sz": order.sz,
                 "pnl": 0.0,
-                "note": "头仓挂单",
+                "note": "澶翠粨鎸傚崟",
             }
         )
         self.last_plan_price = price
@@ -473,6 +1068,11 @@ class LogReplay:
                 self.pos.pending = None
                 if not self.pos.is_active():
                     self.pos.reset()
+                return
+            if self.pos.pending.idx == 0 and not self.pos.is_active() and not self._entry_max_width_ok(row):
+                self.blocked_entry_max_width += 1
+                self.pos.pending = None
+                self.pos.reset()
                 return
             if self._outside_direction(row) != self.pos.direction:
                 if row.kline_ts != self.last_entry_check_kline:
@@ -514,6 +1114,9 @@ class LogReplay:
         if abs(price - last.price) < self._effective_entry_gap(price):
             self.blocked_gap += 1
             return
+        self._update_addon_guard(row)
+        if not self._addon_guard_allows(price):
+            return
         order = self._order_at(self.pos.next_idx(), price)
         if order is None:
             return
@@ -527,7 +1130,7 @@ class LogReplay:
                 "price": order.price,
                 "sz": order.sz,
                 "pnl": 0.0,
-                "note": "补仓挂单",
+                "note": "琛ヤ粨鎸傚崟",
             }
         )
         self.last_batch_kline = row.kline_ts
@@ -549,6 +1152,12 @@ class LogReplay:
             return
         if abs(replacement.price - self.pos.pending.price) < self.params.reprice_gap_usd:
             return
+        if self.pos.pending.idx > 0:
+            self._update_addon_guard(row)
+            if not self._addon_guard_allows(replacement.price):
+                return
+        if self.pos.pending.idx == 0:
+            self._record_entry_extreme_adjustment(self.pos.direction, float(row.price), row)
         self.pos.pending = replacement
         self.events.append(
             {
@@ -559,12 +1168,16 @@ class LogReplay:
                 "price": replacement.price,
                 "sz": replacement.sz,
                 "pnl": 0.0,
-                "note": "挂单重挂",
+                "note": "鎸傚崟閲嶆寕",
             }
         )
         self.reprice_count += 1
 
     def _sizing_equity(self) -> float:
+        if CROSS_COPY_DYNAMIC_SIZING_ENABLED:
+            protected = CROSS_COPY_PROTECT_EQUITY_USDT if CROSS_COPY_PROTECT_ENABLED else 0.0
+            available = max(self._account_equity() - protected, 0.0)
+            return min(TRADING_ACCOUNT_TARGET, available) if TRADING_ACCOUNT_TARGET > 0 else available
         return TRADING_ACCOUNT_TARGET if TRADING_ACCOUNT_TARGET > 0 else max(self.trading_balance, 0.0)
 
     def _used_entry_ratio(self, exclude_idx: int | None = None) -> float:
@@ -641,7 +1254,12 @@ class LogReplay:
         self.pos.recalc()
         self._refresh_tp()
         self.last_batch_kline = row.kline_ts
+        self._start_addon_guard(row)
         event_type = "first_fill" if pending.idx == 0 else "add_fill"
+        if pending.idx == 0:
+            _, _, _, width = self._bands(row)
+            self.entry_boll_width = width
+            self.entry_boll_width_pct = width / float(row.price) if float(row.price) > 0 else 0.0
         self.events.append(
             {
                 "ts": str(row.ts),
@@ -651,7 +1269,7 @@ class LogReplay:
                 "price": pending.price,
                 "sz": pending.sz,
                 "pnl": 0.0,
-                "note": "头仓成交" if pending.idx == 0 else "补仓成交",
+                "note": "澶翠粨鎴愪氦" if pending.idx == 0 else "琛ヤ粨鎴愪氦",
             }
         )
 
@@ -663,7 +1281,15 @@ class LogReplay:
             return
         self._close(self.pos.tp_price, str(row.ts), price, row.kline_ts)
 
-    def _close(self, exit_price: float, ts: str, mark_price: float, kline_ts) -> None:
+    def _close(
+        self,
+        exit_price: float,
+        ts: str,
+        mark_price: float,
+        kline_ts,
+        rebalance: bool = True,
+        reason: str = "姝㈢泩骞充粨",
+    ) -> None:
         avg = self.pos.avg_entry
         sz = self.pos.total_sz
         if self.pos.direction == "long":
@@ -673,7 +1299,8 @@ class LogReplay:
         fee = sz * CT_VAL * exit_price * TAKER_FEE
         pnl = raw_pnl - fee
         self.trading_balance += pnl
-        self._rebalance()
+        if rebalance:
+            self._rebalance(pnl)
         self.events.append(
             {
                 "ts": ts,
@@ -683,7 +1310,7 @@ class LogReplay:
                 "price": round(exit_price, 4),
                 "sz": round(sz, 8),
                 "pnl": round(pnl, 4),
-                "note": "止盈平仓",
+                "note": reason,
             }
         )
         self.trades.append(
@@ -700,12 +1327,34 @@ class LogReplay:
         )
         self.pos.reset()
         self.dynamic_tp_active = False
+        self.entry_extreme_gap_pct = 0.0
+        self.entry_extreme_gap_mult = 1.0
+        self.addon_extreme_guard_price = 0.0
+        self.addon_extreme_guard_kline = None
+        self.addon_extreme_guard_started = False
+        self.entry_boll_width = 0.0
+        self.entry_boll_width_pct = 0.0
+        self.boll_trend_guard_active = False
         self.entry_time = ""
         self.last_batch_kline = None
         self.last_entry_check_kline = None
         self.last_close_kline = kline_ts
 
-    def _rebalance(self) -> None:
+    def _rebalance(self, actual_pnl: float | None = None) -> None:
+        if CROSS_COPY_PROTECT_ENABLED:
+            if actual_pnl is None:
+                return
+            if actual_pnl > 0.01:
+                amount = min(actual_pnl, self.trading_balance)
+                self.trading_balance -= amount
+                self.funding_balance += amount
+                self.profit_transferred += amount
+            elif actual_pnl < -0.01:
+                topup = min(abs(actual_pnl), max(self.funding_balance, 0.0))
+                self.trading_balance += topup
+                self.funding_balance -= topup
+                self.loss_topup += topup
+            return
         diff = self.trading_balance - TRADING_ACCOUNT_TARGET
         if diff > 0.01:
             self.trading_balance -= diff
@@ -726,6 +1375,16 @@ class LogReplay:
             return (price - self.pos.avg_entry) * self.pos.total_sz * CT_VAL
         return (self.pos.avg_entry - price) * self.pos.total_sz * CT_VAL
 
+    def _risk_adjusted_score(self, total_pnl: float, max_dd_pct: float, end_unrealized: float) -> float:
+        """Return a balanced score for risk-aware parameter ranking."""
+        min_liq = self.min_liq_distance_pct if self.min_liq_distance_pct != 999.0 else 99.0
+        liq_penalty = max(0.0, 2.0 - min_liq) * 60.0
+        wipeout_penalty = 1000.0 if self.wipeout_risk else 0.0
+        drawdown_penalty = max_dd_pct * 5.0
+        open_loss_penalty = abs(min(0.0, end_unrealized)) * 1.2
+        skip_penalty = (self.skipped_entry_cap + self.skipped_funds) * 0.05
+        return round(total_pnl - drawdown_penalty - liq_penalty - wipeout_penalty - open_loss_penalty - skip_penalty, 4)
+
     def report(self) -> dict:
         """Return one summary row."""
         pnls = [trade.pnl for trade in self.trades]
@@ -735,6 +1394,12 @@ class LogReplay:
         for equity in self.equity_curve:
             peak = max(peak, equity)
             max_dd = max(max_dd, (peak - equity) / peak if peak else 0.0)
+        end_price = float(self.ticks["price"].iloc[-1]) if len(self.ticks) else 0.0
+        end_unrealized = round(self._unrealized(end_price), 4)
+        total_pnl = round(self.total_equity() - self.initial_total, 4)
+        max_drawdown_pct = round(max_dd * 100, 4)
+        min_liq = round(self.min_liq_distance_pct if self.min_liq_distance_pct != 999.0 else 0.0, 4)
+        balanced_score = self._risk_adjusted_score(total_pnl, max_drawdown_pct, end_unrealized)
         durations = [
             (pd.Timestamp(trade.exit_time) - pd.Timestamp(trade.entry_time)).total_seconds() / 60
             for trade in self.trades
@@ -742,6 +1407,10 @@ class LogReplay:
         return {
             "boll_std": self.params.boll_std,
             "min_width_usd": self.params.min_width_usd,
+            "min_width_pct": self.params.min_width_pct,
+            "entry_max_width_enabled": self.params.entry_max_width_enabled,
+            "entry_max_width_pct": self.params.entry_max_width_pct,
+            "entry_max_width_usd": self.params.entry_max_width_usd,
             "min_entry_gap_usd": self.params.min_entry_gap_usd,
             "reprice_gap_usd": self.params.reprice_gap_usd,
             "first_batch_ratio": self.params.first_batch_ratio,
@@ -760,10 +1429,57 @@ class LogReplay:
             "dynamic_tp_arm_return": self.params.dynamic_tp_arm_return,
             "dynamic_tp_restore_return": self.params.dynamic_tp_restore_return,
             "dynamic_tp_reprice_gap_usd": self.params.dynamic_tp_reprice_gap_usd,
+            "boll_tp_compression_enabled": self.params.boll_tp_compression_enabled,
+            "boll_tp_compression_min_return": self.params.boll_tp_compression_min_return,
+            "boll_tp_compression_exit_offset_usd": self.params.boll_tp_compression_exit_offset_usd,
+            "entry_extreme_gap_adjust_enabled": self.params.entry_extreme_gap_adjust_enabled,
+            "entry_extreme_gap_base_pct": self.params.entry_extreme_gap_base_pct,
+            "entry_extreme_gap_full_pct": self.params.entry_extreme_gap_full_pct,
+            "entry_extreme_gap_max_mult": self.params.entry_extreme_gap_max_mult,
+            "copy_fixed_loss_stop_enabled": self.params.copy_fixed_loss_stop_enabled,
+            "copy_fixed_loss_stop_usdt": self.params.copy_fixed_loss_stop_usdt,
+            "copy_fixed_loss_stop_ratio": self.params.copy_fixed_loss_stop_ratio,
+            "disaster_stop_enabled": self.params.disaster_stop_enabled,
+            "disaster_head_drop_pct": self.params.disaster_head_drop_pct,
+            "disaster_loss_ratio": self.params.disaster_loss_ratio,
+            "boll_trend_guard_enabled": self.params.boll_trend_guard_enabled,
+            "boll_trend_guard_observe_enabled": self.params.boll_trend_guard_observe_enabled,
+            "boll_trend_guard_control_enabled": self.params.boll_trend_guard_control_enabled,
+            "boll_trend_guard_head_adverse_pct": self.params.boll_trend_guard_head_adverse_pct,
+            "boll_trend_guard_width_expand": self.params.boll_trend_guard_width_expand,
+            "boll_trend_guard_width_pct": self.params.boll_trend_guard_width_pct,
+            "boll_trend_guard_slope_window_min": self.params.boll_trend_guard_slope_window_min,
+            "boll_trend_guard_min_hold_min": self.params.boll_trend_guard_min_hold_min,
+            "boll_trend_guard_z_mean": self.params.boll_trend_guard_z_mean,
+            "boll_trend_guard_slope_pct_per_hour": self.params.boll_trend_guard_slope_pct_per_hour,
+            "boll_trend_guard_stop_after_close": self.params.boll_trend_guard_stop_after_close,
+            "addon_dynamic_gap_enabled": self.params.addon_dynamic_gap_enabled,
+            "addon_dynamic_gap_max_usd": self.params.addon_dynamic_gap_max_usd,
+            "addon_dynamic_gap_boll_start": self.params.addon_dynamic_gap_boll_start,
+            "addon_dynamic_gap_boll_strong": self.params.addon_dynamic_gap_boll_strong,
+            "addon_dynamic_gap_boll_max_mult": self.params.addon_dynamic_gap_boll_max_mult,
+            "addon_dynamic_gap_head_start_pct": self.params.addon_dynamic_gap_head_start_pct,
+            "addon_dynamic_gap_head_strong_pct": self.params.addon_dynamic_gap_head_strong_pct,
+            "addon_dynamic_gap_head_max_mult": self.params.addon_dynamic_gap_head_max_mult,
+            "addon_dynamic_gap_trend_klines": self.params.addon_dynamic_gap_trend_klines,
+            "addon_dynamic_gap_trend_mult": self.params.addon_dynamic_gap_trend_mult,
+            "entry_extreme_entries": self.entry_extreme_entries,
+            "entry_extreme_avg_gap_pct": round(
+                self.entry_extreme_gap_total / self.entry_extreme_entries * 100, 4
+            ) if self.entry_extreme_entries else 0.0,
+            "entry_extreme_max_gap_pct": round(self.entry_extreme_gap_max * 100, 4),
+            "entry_extreme_avg_mult": round(
+                self.entry_extreme_mult_total / self.entry_extreme_entries, 4
+            ) if self.entry_extreme_entries else 1.0,
+            "entry_extreme_max_mult_seen": round(self.entry_extreme_mult_max, 4),
             "final_total_equity": round(self.total_equity(), 4),
-            "total_pnl": round(self.total_equity() - self.initial_total, 4),
+            "total_pnl": total_pnl,
             "return_pct": round((self.total_equity() / self.initial_total - 1) * 100, 4),
-            "max_drawdown_pct": round(max_dd * 100, 4),
+            "balanced_score": balanced_score,
+            "max_drawdown_pct": max_drawdown_pct,
+            "min_liq_distance_pct": min_liq,
+            "wipeout_risk": self.wipeout_risk,
+            "end_unrealized": end_unrealized,
             "trades": len(self.trades),
             "entry_signals": self.signal_count,
             "win_rate_pct": round(len(wins) / len(pnls) * 100, 4) if pnls else 0.0,
@@ -777,9 +1493,22 @@ class LogReplay:
             "close_kline_block": self.close_kline_block,
             "dynamic_tp_activated": self.dynamic_tp_activated,
             "dynamic_tp_restored": self.dynamic_tp_restored,
+            "boll_tp_compression_activated": self.boll_tp_compression_activated,
             "blocked_width": self.blocked_width,
+            "blocked_entry_max_width": self.blocked_entry_max_width,
             "blocked_gap": self.blocked_gap,
             "blocked_extreme": self.blocked_extreme,
+            "blocked_addon_guard": self.blocked_addon_guard,
+            "cross_copy_stop": self.cross_copy_stop,
+            "fixed_loss_stop": self.fixed_loss_stop,
+            "disaster_stop": self.disaster_stop,
+            "boll_trend_guard_signal": self.boll_trend_guard_signal,
+            "boll_trend_guard_stop": self.boll_trend_guard_stop,
+            "dynamic_gap_events": self.dynamic_gap_events,
+            "dynamic_gap_avg_mult": round(
+                self.dynamic_gap_mult_total / self.dynamic_gap_events, 4
+            ) if self.dynamic_gap_events else 1.0,
+            "dynamic_gap_max_mult": round(self.dynamic_gap_mult_max, 4),
             "skipped_entry_cap": self.skipped_entry_cap,
             "skipped_funds": self.skipped_funds,
             "profit_transferred": round(self.profit_transferred, 4),
@@ -806,7 +1535,7 @@ def parse_logs(log_dir: Path, sample_sec: int = 0) -> pd.DataFrame:
                     }
                 )
     if not rows:
-        raise RuntimeError(f"没有从 {log_dir} 解析到策略 tick 日志")
+        raise RuntimeError(f"娌℃湁浠?{log_dir} 瑙ｆ瀽鍒扮瓥鐣?tick 鏃ュ織")
     df = pd.DataFrame(rows).sort_values("ts").drop_duplicates("ts")
     if sample_sec and sample_sec > 0:
         df = (
@@ -816,12 +1545,26 @@ def parse_logs(log_dir: Path, sample_sec: int = 0) -> pd.DataFrame:
             .dropna(subset=["price"])
             .reset_index()
         )
+    indexed = df.set_index("ts")
+    df["low24"] = indexed["price"].rolling("24h", min_periods=1).min().to_numpy()
+    df["high24"] = indexed["price"].rolling("24h", min_periods=1).max().to_numpy()
     df["kline_ts"] = df["ts"].dt.floor("15min")
     return df.reset_index(drop=True)
 
 
 def parse_float_list(text: str) -> list[float]:
-    """Parse comma-separated floats."""
+    """Parse comma-separated floats or start:end:step ranges."""
+    text = text.strip()
+    if ":" in text and "," not in text:
+        start, end, step = (float(item.strip()) for item in text.split(":"))
+        if step <= 0:
+            raise ValueError("Range step must be positive")
+        values = []
+        current = start
+        while current <= end + step / 2:
+            values.append(round(current, 10))
+            current += step
+        return values
     return [float(item.strip()) for item in text.split(",") if item.strip()]
 
 
@@ -832,88 +1575,349 @@ def parse_int_list(text: str) -> list[int]:
 
 def build_grid(args) -> list[Params]:
     """Build parameter combinations from CLI arguments."""
+    value_lists = _param_value_lists(args)
+    return [Params(*values) for values in itertools.product(*value_lists)]
+
+
+def _param_value_lists(args) -> list[list[float] | list[int]]:
+    """Return parsed parameter value lists in Params field order."""
     return [
-        Params(*values)
-        for values in itertools.product(
-            parse_float_list(args.boll_std),
-            parse_float_list(args.min_width_usd),
-            parse_float_list(args.min_entry_gap_usd),
-            parse_float_list(args.reprice_gap_usd),
-            parse_float_list(args.first_batch_ratio),
-            parse_float_list(args.second_batch_ratio),
-            parse_float_list(args.dynamic_base_ratio),
-            parse_float_list(args.dynamic_min_ratio),
-            parse_float_list(args.dynamic_max_ratio),
-            parse_float_list(args.max_total_entry_ratio),
-            parse_float_list(args.boll_width_base_price),
-            parse_float_list(args.boll_width_base_usd),
-            parse_float_list(args.boll_width_floor_usd),
-            parse_float_list(args.boll_width_gap_mult),
-            parse_float_list(args.tp_target_margin_return),
-            parse_float_list(args.min_head_liq_buffer_pct),
-            parse_int_list(args.dynamic_tp_enabled),
-            parse_float_list(args.dynamic_tp_arm_return),
-            parse_float_list(args.dynamic_tp_restore_return),
-            parse_float_list(args.dynamic_tp_reprice_gap_usd),
-        )
+        parse_float_list(args.boll_std),
+        parse_float_list(args.min_width_usd),
+        parse_float_list(args.min_boll_width_pct),
+        parse_float_list(args.min_entry_gap_usd),
+        parse_float_list(args.reprice_gap_usd),
+        parse_int_list(args.entry_max_width_enabled),
+        parse_float_list(args.entry_max_width_pct),
+        parse_float_list(args.entry_max_width_usd),
+        parse_float_list(args.first_batch_ratio),
+        parse_float_list(args.second_batch_ratio),
+        parse_float_list(args.dynamic_base_ratio),
+        parse_float_list(args.dynamic_min_ratio),
+        parse_float_list(args.dynamic_max_ratio),
+        parse_float_list(args.max_total_entry_ratio),
+        parse_float_list(args.boll_width_base_price),
+        parse_float_list(args.boll_width_base_usd),
+        parse_float_list(args.boll_width_floor_usd),
+        parse_float_list(args.boll_width_gap_mult),
+        parse_float_list(args.tp_target_margin_return),
+        parse_float_list(args.min_head_liq_buffer_pct),
+        parse_int_list(args.dynamic_tp_enabled),
+        parse_float_list(args.dynamic_tp_arm_return),
+        parse_float_list(args.dynamic_tp_restore_return),
+        parse_float_list(args.dynamic_tp_reprice_gap_usd),
+        parse_int_list(args.boll_tp_compression_enabled),
+        parse_float_list(args.boll_tp_compression_min_return),
+        parse_float_list(args.boll_tp_compression_exit_offset_usd),
+        parse_int_list(args.entry_extreme_gap_adjust_enabled),
+        parse_float_list(args.entry_extreme_gap_base_pct),
+        parse_float_list(args.entry_extreme_gap_full_pct),
+        parse_float_list(args.entry_extreme_gap_max_mult),
+        parse_int_list(args.copy_fixed_loss_stop_enabled),
+        parse_float_list(args.copy_fixed_loss_stop_usdt),
+        parse_float_list(args.copy_fixed_loss_stop_ratio),
+        parse_int_list(args.disaster_stop_enabled),
+        parse_float_list(args.disaster_head_drop_pct),
+        parse_float_list(args.disaster_loss_ratio),
+        parse_int_list(args.boll_trend_guard_enabled),
+        parse_int_list(args.boll_trend_guard_observe_enabled),
+        parse_int_list(args.boll_trend_guard_control_enabled),
+        parse_float_list(args.boll_trend_guard_head_adverse_pct),
+        parse_float_list(args.boll_trend_guard_width_expand),
+        parse_float_list(args.boll_trend_guard_width_pct),
+        parse_float_list(args.boll_trend_guard_slope_window_min),
+        parse_float_list(args.boll_trend_guard_min_hold_min),
+        parse_float_list(args.boll_trend_guard_z_mean),
+        parse_float_list(args.boll_trend_guard_slope_pct_per_hour),
+        parse_int_list(args.boll_trend_guard_stop_after_close),
+        parse_int_list(args.addon_dynamic_gap_enabled),
+        parse_float_list(args.addon_dynamic_gap_max_usd),
+        parse_float_list(args.addon_dynamic_gap_boll_start),
+        parse_float_list(args.addon_dynamic_gap_boll_strong),
+        parse_float_list(args.addon_dynamic_gap_boll_max_mult),
+        parse_float_list(args.addon_dynamic_gap_head_start_pct),
+        parse_float_list(args.addon_dynamic_gap_head_strong_pct),
+        parse_float_list(args.addon_dynamic_gap_head_max_mult),
+        parse_int_list(args.addon_dynamic_gap_trend_klines),
+        parse_float_list(args.addon_dynamic_gap_trend_mult),
     ]
 
 
-FOCUSED_GROUPS = [
-    ("BOLL/Width", ("boll_std", "min_width_usd")),
-    ("Width", ("min_width_usd",)),
-    ("Entry Gap", ("min_entry_gap_usd",)),
-    ("First/Second", ("first_batch_ratio", "second_batch_ratio")),
-    ("Dyn Base/Min/Max", ("dynamic_base_ratio", "dynamic_min_ratio", "dynamic_max_ratio")),
-    ("Max Total", ("max_total_entry_ratio",)),
-    ("Boll Dynamic", ("boll_width_base_usd", "boll_width_gap_mult")),
-    ("TP Return", ("tp_target_margin_return",)),
-    ("Head Buffer", ("min_head_liq_buffer_pct",)),
-]
+def build_random_grid(args) -> list[Params]:
+    """Build a deduplicated random sample from the configured parameter ranges."""
+    value_lists = _param_value_lists(args)
+    max_combinations = math.prod(len(values) for values in value_lists)
+    target = min(max(1, int(args.random_trials)), max_combinations)
+    rng = random.Random(args.random_seed)
+    seen: set[tuple] = set()
+    params: list[Params] = []
+    attempts = 0
+    while len(params) < target and attempts < target * 20:
+        attempts += 1
+        values = tuple(rng.choice(values) for values in value_lists)
+        if values in seen:
+            continue
+        seen.add(values)
+        params.append(Params(*values))
+    if len(params) < target:
+        for values in itertools.product(*value_lists):
+            if values in seen:
+                continue
+            params.append(Params(*values))
+            if len(params) >= target:
+                break
+    return params
 
 
-def _format_group_value(row: dict, fields: tuple[str, ...]) -> str:
-    """Format grouped parameter values for reports."""
-    return "/".join(f"{float(row[field]):g}" for field in fields)
-
-
-def summarize_parameter_group(rows: list[dict], fields: tuple[str, ...]) -> list[dict]:
-    """Summarize ranked results by one parameter group."""
-    grouped: dict[str, dict] = {}
-    for rank, row in enumerate(rows, start=1):
-        label = _format_group_value(row, fields)
-        group = grouped.setdefault(label, {"rows": [], "best_rank": rank})
-        group["rows"].append(row)
-        group["best_rank"] = min(group["best_rank"], rank)
-
-    summaries = []
-    for label, group in grouped.items():
-        group_rows = group["rows"]
-        best = max(
-            group_rows,
-            key=lambda item: (item["total_pnl"], item["trades"], -item["max_drawdown_pct"]),
-        )
-        summaries.append(
-            {
-                "value": label,
-                "runs": len(group_rows),
-                "best_rank": group["best_rank"],
-                "best_pnl": round(best["total_pnl"], 4),
-                "avg_pnl": round(float(np.mean([row["total_pnl"] for row in group_rows])), 4),
-                "avg_trades": round(float(np.mean([row["trades"] for row in group_rows])), 2),
-                "avg_drawdown": round(float(np.mean([row["max_drawdown_pct"] for row in group_rows])), 4),
-                "cap_skip": int(sum(row.get("skipped_entry_cap", 0) for row in group_rows)),
-                "fund_skip": int(sum(row.get("skipped_funds", 0) for row in group_rows)),
-            }
-        )
-    return sorted(
-        summaries,
-        key=lambda item: (item["best_pnl"], item["avg_pnl"], -item["avg_drawdown"]),
-        reverse=True,
+def current_config_params(args) -> Params:
+    """Return a baseline Params object from the current live config values."""
+    return Params(
+        boll_std=parse_float_list(args.boll_std)[0],
+        min_width_usd=MIN_BOLL_WIDTH_USD,
+        min_width_pct=MIN_BOLL_WIDTH_PCT,
+        min_entry_gap_usd=MIN_ENTRY_GAP_USD,
+        reprice_gap_usd=REPRICE_GAP_USD,
+        entry_max_width_enabled=int(ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED),
+        entry_max_width_pct=ENTRY_MAX_BOLL_WIDTH_PCT,
+        entry_max_width_usd=ENTRY_MAX_BOLL_WIDTH_USD,
+        first_batch_ratio=FIRST_BATCH_RATIO,
+        second_batch_ratio=SECOND_BATCH_RATIO,
+        dynamic_base_ratio=DYNAMIC_BASE_ENTRY_RATIO,
+        dynamic_min_ratio=DYNAMIC_MIN_ENTRY_RATIO,
+        dynamic_max_ratio=DYNAMIC_MAX_ENTRY_RATIO,
+        max_total_entry_ratio=MAX_TOTAL_ENTRY_RATIO,
+        boll_width_base_price=BOLL_WIDTH_BASE_PRICE,
+        boll_width_base_usd=BOLL_WIDTH_BASE_USD,
+        boll_width_floor_usd=MIN_BOLL_WIDTH_FLOOR_USD,
+        boll_width_gap_mult=BOLL_WIDTH_GAP_MULT,
+        tp_target_margin_return=TP_TARGET_MARGIN_RETURN,
+        min_head_liq_buffer_pct=MIN_HEAD_LIQ_BUFFER_PCT,
+        dynamic_tp_enabled=int(DYNAMIC_TP_ENABLED),
+        dynamic_tp_arm_return=DYNAMIC_TP_ARM_RETURN,
+        dynamic_tp_restore_return=DYNAMIC_TP_RESTORE_RETURN,
+        dynamic_tp_reprice_gap_usd=DYNAMIC_TP_REPRICE_GAP_USD,
+        boll_tp_compression_enabled=int(BOLL_TP_COMPRESSION_ENABLED),
+        boll_tp_compression_min_return=BOLL_TP_COMPRESSION_MIN_RETURN,
+        boll_tp_compression_exit_offset_usd=BOLL_TP_COMPRESSION_EXIT_OFFSET_USD,
+        entry_extreme_gap_adjust_enabled=int(ENTRY_EXTREME_GAP_ADJUST_ENABLED),
+        entry_extreme_gap_base_pct=ENTRY_EXTREME_GAP_BASE_PCT,
+        entry_extreme_gap_full_pct=ENTRY_EXTREME_GAP_FULL_PCT,
+        entry_extreme_gap_max_mult=ENTRY_EXTREME_GAP_MAX_MULT,
+        copy_fixed_loss_stop_enabled=int(COPY_FIXED_LOSS_STOP_ENABLED),
+        copy_fixed_loss_stop_usdt=COPY_FIXED_LOSS_STOP_USDT,
+        copy_fixed_loss_stop_ratio=COPY_FIXED_LOSS_STOP_RATIO,
+        disaster_stop_enabled=int(DISASTER_STOP_ENABLED),
+        disaster_head_drop_pct=DISASTER_HEAD_DROP_PCT,
+        disaster_loss_ratio=DISASTER_LOSS_RATIO,
+        boll_trend_guard_enabled=int(BOLL_TREND_GUARD_ENABLED),
+        boll_trend_guard_observe_enabled=int(BOLL_TREND_GUARD_OBSERVE_ENABLED),
+        boll_trend_guard_control_enabled=int(BOLL_TREND_GUARD_CONTROL_ENABLED),
+        boll_trend_guard_head_adverse_pct=BOLL_TREND_GUARD_HEAD_ADVERSE_PCT,
+        boll_trend_guard_width_expand=BOLL_TREND_GUARD_WIDTH_EXPAND,
+        boll_trend_guard_width_pct=BOLL_TREND_GUARD_WIDTH_PCT,
+        boll_trend_guard_slope_window_min=BOLL_TREND_GUARD_SLOPE_WINDOW_MIN,
+        boll_trend_guard_min_hold_min=BOLL_TREND_GUARD_MIN_HOLD_MIN,
+        boll_trend_guard_z_mean=BOLL_TREND_GUARD_Z_MEAN,
+        boll_trend_guard_slope_pct_per_hour=BOLL_TREND_GUARD_SLOPE_PCT_PER_HOUR,
+        boll_trend_guard_stop_after_close=int(BOLL_TREND_GUARD_STOP_AFTER_CLOSE),
+        addon_dynamic_gap_enabled=int(ADDON_DYNAMIC_GAP_ENABLED),
+        addon_dynamic_gap_max_usd=ADDON_DYNAMIC_GAP_MAX_USD,
+        addon_dynamic_gap_boll_start=ADDON_DYNAMIC_GAP_BOLL_START,
+        addon_dynamic_gap_boll_strong=ADDON_DYNAMIC_GAP_BOLL_STRONG,
+        addon_dynamic_gap_boll_max_mult=ADDON_DYNAMIC_GAP_BOLL_MAX_MULT,
+        addon_dynamic_gap_head_start_pct=ADDON_DYNAMIC_GAP_HEAD_START_PCT,
+        addon_dynamic_gap_head_strong_pct=ADDON_DYNAMIC_GAP_HEAD_STRONG_PCT,
+        addon_dynamic_gap_head_max_mult=ADDON_DYNAMIC_GAP_HEAD_MAX_MULT,
+        addon_dynamic_gap_trend_klines=ADDON_DYNAMIC_GAP_TREND_KLINES,
+        addon_dynamic_gap_trend_mult=ADDON_DYNAMIC_GAP_TREND_MULT,
     )
 
 
-def write_markdown_report(path: Path, rows: list[dict], ticks: pd.DataFrame) -> None:
+def ensure_baseline_in_grid(grid: list[Params], baseline: Params) -> list[Params]:
+    """Return grid with the current-config baseline included exactly once."""
+    if baseline in grid:
+        return grid
+    return [baseline, *grid]
+
+
+def _init_worker(ticks: pd.DataFrame) -> None:
+    """Store parsed ticks once per worker process."""
+    global _WORKER_TICKS
+    _WORKER_TICKS = ticks
+
+
+def _run_replay_worker(payload: tuple[Params, float]) -> dict:
+    """Run one replay inside a worker process."""
+    params, initial_total = payload
+    if _WORKER_TICKS is None:
+        raise RuntimeError("Worker ticks are not initialized")
+    return LogReplay(_WORKER_TICKS, params, initial_total).run().report()
+
+
+def _resolve_worker_count(requested: int, total: int) -> int:
+    """Return an efficient worker count for the parameter grid size."""
+    if total <= 1:
+        return 1
+    if requested > 0:
+        return max(1, min(requested, total))
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(total, max(cpu_count - 1, 1)))
+
+
+def run_replays(ticks: pd.DataFrame, grid: list[Params], initial_total: float, workers: int, quiet: bool) -> list[dict]:
+    """Run all parameter replays, using multiple processes when requested."""
+    total = len(grid)
+    worker_count = _resolve_worker_count(workers, total)
+    progress_step = max(1, total // 20)
+    rows: list[dict] = []
+    if not quiet:
+        mode = "single process" if worker_count == 1 else f"{worker_count} worker processes"
+        print(f"Starting replay for {total} parameter sets using {mode}...", flush=True)
+    if worker_count == 1:
+        for idx, params in enumerate(grid, start=1):
+            rows.append(LogReplay(ticks, params, initial_total).run().report())
+            if not quiet and (idx == 1 or idx == total or idx % progress_step == 0):
+                pct = idx / total * 100
+                print(f"Progress {idx}/{total} ({pct:.1f}%)", flush=True)
+        return rows
+
+    payloads = [(params, initial_total) for params in grid]
+    with ProcessPoolExecutor(max_workers=worker_count, initializer=_init_worker, initargs=(ticks,)) as executor:
+        futures = [executor.submit(_run_replay_worker, payload) for payload in payloads]
+        for idx, future in enumerate(as_completed(futures), start=1):
+            rows.append(future.result())
+            if not quiet and (idx == 1 or idx == total or idx % progress_step == 0):
+                pct = idx / total * 100
+                print(f"Progress {idx}/{total} ({pct:.1f}%)", flush=True)
+    return rows
+
+
+def params_from_report_row(row: dict) -> Params:
+    """Rebuild Params from a report row."""
+    return Params(
+        boll_std=row["boll_std"],
+        min_width_usd=row["min_width_usd"],
+        min_width_pct=row["min_width_pct"],
+        min_entry_gap_usd=row["min_entry_gap_usd"],
+        reprice_gap_usd=row["reprice_gap_usd"],
+        entry_max_width_enabled=row["entry_max_width_enabled"],
+        entry_max_width_pct=row["entry_max_width_pct"],
+        entry_max_width_usd=row["entry_max_width_usd"],
+        first_batch_ratio=row["first_batch_ratio"],
+        second_batch_ratio=row["second_batch_ratio"],
+        dynamic_base_ratio=row["dynamic_base_ratio"],
+        dynamic_min_ratio=row["dynamic_min_ratio"],
+        dynamic_max_ratio=row["dynamic_max_ratio"],
+        max_total_entry_ratio=row["max_total_entry_ratio"],
+        boll_width_base_price=row["boll_width_base_price"],
+        boll_width_base_usd=row["boll_width_base_usd"],
+        boll_width_floor_usd=row["boll_width_floor_usd"],
+        boll_width_gap_mult=row["boll_width_gap_mult"],
+        tp_target_margin_return=row["tp_target_margin_return"],
+        min_head_liq_buffer_pct=row["min_head_liq_buffer_pct"],
+        dynamic_tp_enabled=row["dynamic_tp_enabled"],
+        dynamic_tp_arm_return=row["dynamic_tp_arm_return"],
+        dynamic_tp_restore_return=row["dynamic_tp_restore_return"],
+        dynamic_tp_reprice_gap_usd=row["dynamic_tp_reprice_gap_usd"],
+        boll_tp_compression_enabled=row["boll_tp_compression_enabled"],
+        boll_tp_compression_min_return=row["boll_tp_compression_min_return"],
+        boll_tp_compression_exit_offset_usd=row["boll_tp_compression_exit_offset_usd"],
+        entry_extreme_gap_adjust_enabled=row["entry_extreme_gap_adjust_enabled"],
+        entry_extreme_gap_base_pct=row["entry_extreme_gap_base_pct"],
+        entry_extreme_gap_full_pct=row["entry_extreme_gap_full_pct"],
+        entry_extreme_gap_max_mult=row["entry_extreme_gap_max_mult"],
+        copy_fixed_loss_stop_enabled=row["copy_fixed_loss_stop_enabled"],
+        copy_fixed_loss_stop_usdt=row["copy_fixed_loss_stop_usdt"],
+        copy_fixed_loss_stop_ratio=row["copy_fixed_loss_stop_ratio"],
+        disaster_stop_enabled=row["disaster_stop_enabled"],
+        disaster_head_drop_pct=row["disaster_head_drop_pct"],
+        disaster_loss_ratio=row["disaster_loss_ratio"],
+        boll_trend_guard_enabled=row["boll_trend_guard_enabled"],
+        boll_trend_guard_observe_enabled=row["boll_trend_guard_observe_enabled"],
+        boll_trend_guard_control_enabled=row["boll_trend_guard_control_enabled"],
+        boll_trend_guard_head_adverse_pct=row["boll_trend_guard_head_adverse_pct"],
+        boll_trend_guard_width_expand=row["boll_trend_guard_width_expand"],
+        boll_trend_guard_width_pct=row["boll_trend_guard_width_pct"],
+        boll_trend_guard_slope_window_min=row["boll_trend_guard_slope_window_min"],
+        boll_trend_guard_min_hold_min=row["boll_trend_guard_min_hold_min"],
+        boll_trend_guard_z_mean=row["boll_trend_guard_z_mean"],
+        boll_trend_guard_slope_pct_per_hour=row["boll_trend_guard_slope_pct_per_hour"],
+        boll_trend_guard_stop_after_close=row["boll_trend_guard_stop_after_close"],
+        addon_dynamic_gap_enabled=row["addon_dynamic_gap_enabled"],
+        addon_dynamic_gap_max_usd=row["addon_dynamic_gap_max_usd"],
+        addon_dynamic_gap_boll_start=row["addon_dynamic_gap_boll_start"],
+        addon_dynamic_gap_boll_strong=row["addon_dynamic_gap_boll_strong"],
+        addon_dynamic_gap_boll_max_mult=row["addon_dynamic_gap_boll_max_mult"],
+        addon_dynamic_gap_head_start_pct=row["addon_dynamic_gap_head_start_pct"],
+        addon_dynamic_gap_head_strong_pct=row["addon_dynamic_gap_head_strong_pct"],
+        addon_dynamic_gap_head_max_mult=row["addon_dynamic_gap_head_max_mult"],
+        addon_dynamic_gap_trend_klines=row["addon_dynamic_gap_trend_klines"],
+        addon_dynamic_gap_trend_mult=row["addon_dynamic_gap_trend_mult"],
+    )
+
+
+def run_walk_forward(
+    ticks: pd.DataFrame,
+    rows: list[dict],
+    initial_total: float,
+    ratio: float,
+    top_n: int,
+) -> list[dict]:
+    """Validate top-ranked rows on earlier and later log segments."""
+    if ratio <= 0 or ratio >= 1 or len(ticks) < 100:
+        return []
+    split_idx = int(len(ticks) * ratio)
+    train = ticks.iloc[:split_idx].reset_index(drop=True)
+    validate = ticks.iloc[split_idx:].reset_index(drop=True)
+    if train.empty or validate.empty:
+        return []
+
+    summaries = []
+    for rank, row in enumerate(rows[: max(1, top_n)], start=1):
+        params = params_from_report_row(row)
+        train_row = LogReplay(train, params, initial_total).run().report()
+        val_row = LogReplay(validate, params, initial_total).run().report()
+        robustness_score = round(
+            min(train_row["balanced_score"], val_row["balanced_score"])
+            - abs(train_row["total_pnl"] - val_row["total_pnl"]) * 0.1,
+            4,
+        )
+        summaries.append(
+            {
+                "rank": rank,
+                "robustness_score": robustness_score,
+                "min_width_pct": row["min_width_pct"],
+                "min_entry_gap_usd": row["min_entry_gap_usd"],
+                "boll_width_gap_mult": row["boll_width_gap_mult"],
+                "first_second": f"{row['first_batch_ratio']}/{row['second_batch_ratio']}",
+                "dynamic_ratios": f"{row['dynamic_base_ratio']}/{row['dynamic_min_ratio']}/{row['dynamic_max_ratio']}",
+                "train_score": train_row["balanced_score"],
+                "train_pnl": train_row["total_pnl"],
+                "train_trades": train_row["trades"],
+                "train_dd": train_row["max_drawdown_pct"],
+                "val_score": val_row["balanced_score"],
+                "val_pnl": val_row["total_pnl"],
+                "val_trades": val_row["trades"],
+                "val_dd": val_row["max_drawdown_pct"],
+                "val_dstop": val_row["disaster_stop"],
+                "val_wipeout": val_row["wipeout_risk"],
+            }
+        )
+    return sorted(summaries, key=lambda item: item["robustness_score"], reverse=True)
+
+
+def _metric_delta(best: dict, baseline: dict, key: str) -> float:
+    """Return best minus baseline for a numeric report metric."""
+    return round(float(best.get(key, 0.0)) - float(baseline.get(key, 0.0)), 4)
+
+
+def write_markdown_report(
+    path: Path,
+    rows: list[dict],
+    ticks: pd.DataFrame,
+    baseline_row: dict,
+    walk_forward_rows: list[dict] | None = None,
+) -> None:
     """Write a concise Markdown report."""
     best = rows[0]
     lines = [
@@ -923,59 +1927,125 @@ def write_markdown_report(path: Path, rows: list[dict], ticks: pd.DataFrame) -> 
         f"- Ticks: {len(ticks)}",
         "- Mode: manual offline replay",
         f"- Trading account target: {TRADING_ACCOUNT_TARGET:.2f} USDT",
-        "- Sizing model: dynamic live strategy, with max total entry ratio cap",
+        (
+            f"- Cross copy protection: enabled={CROSS_COPY_PROTECT_ENABLED}, "
+            f"protected={CROSS_COPY_PROTECT_EQUITY_USDT:.2f} USDT"
+        ),
+        "- Sizing model: live cross-copy sizing, max total entry ratio cap, and completed-candle add-on guard",
         "",
-        "## Best Parameters",
+        "## Best Balanced Parameters",
         "",
         (
-            f"`BOLL_STD={best['boll_std']}`, `MIN_BOLL_WIDTH_USD={best['min_width_usd']}`, "
-            f"`MIN_ENTRY_GAP_USD={best['min_entry_gap_usd']}`, `REPRICE_GAP_USD={best['reprice_gap_usd']}`, "
+            f"`MIN_BOLL_WIDTH_PCT={best['min_width_pct']}`, "
+            f"`ENTRY_MAX_BOLL_WIDTH={bool(best['entry_max_width_enabled'])}/"
+            f"{best['entry_max_width_pct']}/{best['entry_max_width_usd']}`, "
+            f"`MIN_ENTRY_GAP_USD={best['min_entry_gap_usd']}`, "
+            f"`BOLL_WIDTH_GAP_MULT={best['boll_width_gap_mult']}`, "
             f"`FIRST_BATCH_RATIO={best['first_batch_ratio']}`, `SECOND_BATCH_RATIO={best['second_batch_ratio']}`, "
             f"`DYNAMIC_BASE_ENTRY_RATIO={best['dynamic_base_ratio']}`, "
             f"`DYNAMIC_MIN_ENTRY_RATIO={best['dynamic_min_ratio']}`, "
             f"`DYNAMIC_MAX_ENTRY_RATIO={best['dynamic_max_ratio']}`, "
-            f"`MAX_TOTAL_ENTRY_RATIO={best['max_total_entry_ratio']}`, "
-            f"`BOLL_WIDTH_BASE_USD={best['boll_width_base_usd']}`, "
-            f"`BOLL_WIDTH_GAP_MULT={best['boll_width_gap_mult']}`, "
-            f"`TP_TARGET_MARGIN_RETURN={best['tp_target_margin_return']}`, "
-            f"`MIN_HEAD_LIQ_BUFFER_PCT={best['min_head_liq_buffer_pct']}`"
+            f"`MIN_HEAD_LIQ_BUFFER_PCT={best['min_head_liq_buffer_pct']}`, "
+            f"`COPY_FIXED_LOSS_STOP={bool(best['copy_fixed_loss_stop_enabled'])}/"
+            f"{best['copy_fixed_loss_stop_usdt']}/{best['copy_fixed_loss_stop_ratio']}`, "
+            f"`DISASTER_STOP_ENABLED={bool(best['disaster_stop_enabled'])}`, "
+            f"`DISASTER_HEAD_DROP_PCT={best['disaster_head_drop_pct']}`, "
+            f"`DISASTER_LOSS_RATIO={best['disaster_loss_ratio']}`, "
+            f"`BOLL_TREND_GUARD=observe:{bool(best['boll_trend_guard_observe_enabled'])}/"
+            f"control:{bool(best['boll_trend_guard_control_enabled'] or best['boll_trend_guard_enabled'])}/"
+            f"{best['boll_trend_guard_head_adverse_pct']}/"
+            f"{best['boll_trend_guard_width_expand']}/"
+            f"{best['boll_trend_guard_width_pct']}/"
+            f"{best['boll_trend_guard_slope_pct_per_hour']}`"
         ),
         "",
         (
-            f"PnL `{best['total_pnl']}` USDT, trades `{best['trades']}`, "
+            f"Score `{best['balanced_score']}`, PnL `{best['total_pnl']}` USDT, trades `{best['trades']}`, "
             f"win rate `{best['win_rate_pct']}%`, max drawdown `{best['max_drawdown_pct']}%`, "
-            f"avg hold `{best['avg_hold_minutes']}` minutes."
+            f"min liquidation distance `{best['min_liq_distance_pct']}%`, "
+            f"wipeout risk `{best['wipeout_risk']}`, avg hold `{best['avg_hold_minutes']}` minutes."
         ),
+        "",
+        "## Current Config Baseline",
+        "",
+        (
+            f"`MIN_BOLL_WIDTH_PCT={baseline_row['min_width_pct']}`, "
+            f"`ENTRY_MAX={bool(baseline_row['entry_max_width_enabled'])}/"
+            f"{baseline_row['entry_max_width_pct']}/{baseline_row['entry_max_width_usd']}`, "
+            f"`MIN_ENTRY_GAP_USD={baseline_row['min_entry_gap_usd']}`, "
+            f"`BOLL_WIDTH_GAP_MULT={baseline_row['boll_width_gap_mult']}`, "
+            f"`FIRST/SECOND={baseline_row['first_batch_ratio']}/{baseline_row['second_batch_ratio']}`, "
+            f"`DYNAMIC={baseline_row['dynamic_base_ratio']}/{baseline_row['dynamic_min_ratio']}/{baseline_row['dynamic_max_ratio']}`"
+        ),
+        "",
+        (
+            f"Baseline score `{baseline_row['balanced_score']}`, PnL `{baseline_row['total_pnl']}` USDT, "
+            f"trades `{baseline_row['trades']}`, win rate `{baseline_row['win_rate_pct']}%`, "
+            f"drawdown `{baseline_row['max_drawdown_pct']}%`, "
+            f"min liquidation distance `{baseline_row['min_liq_distance_pct']}%`, "
+            f"DStop `{baseline_row['disaster_stop']}`, BTG signal `{baseline_row['boll_trend_guard_signal']}`, "
+            f"BTG stop `{baseline_row['boll_trend_guard_stop']}`, "
+            f"FStop `{baseline_row['fixed_loss_stop']}`."
+        ),
+        "",
+        "## Best Versus Current",
+        "",
+        "|Metric|Current|Best|Delta|",
+        "|-|-:|-:|-:|",
+        f"|Score|{baseline_row['balanced_score']}|{best['balanced_score']}|{_metric_delta(best, baseline_row, 'balanced_score')}|",
+        f"|PnL USDT|{baseline_row['total_pnl']}|{best['total_pnl']}|{_metric_delta(best, baseline_row, 'total_pnl')}|",
+        f"|Trades|{baseline_row['trades']}|{best['trades']}|{_metric_delta(best, baseline_row, 'trades')}|",
+        f"|Win Rate %|{baseline_row['win_rate_pct']}|{best['win_rate_pct']}|{_metric_delta(best, baseline_row, 'win_rate_pct')}|",
+        f"|Drawdown %|{baseline_row['max_drawdown_pct']}|{best['max_drawdown_pct']}|{_metric_delta(best, baseline_row, 'max_drawdown_pct')}|",
+        f"|Min Liq %|{baseline_row['min_liq_distance_pct']}|{best['min_liq_distance_pct']}|{_metric_delta(best, baseline_row, 'min_liq_distance_pct')}|",
+        f"|DStop|{baseline_row['disaster_stop']}|{best['disaster_stop']}|{_metric_delta(best, baseline_row, 'disaster_stop')}|",
+        f"|BTG Signal|{baseline_row['boll_trend_guard_signal']}|{best['boll_trend_guard_signal']}|{_metric_delta(best, baseline_row, 'boll_trend_guard_signal')}|",
+        f"|BTG Stop|{baseline_row['boll_trend_guard_stop']}|{best['boll_trend_guard_stop']}|{_metric_delta(best, baseline_row, 'boll_trend_guard_stop')}|",
+        f"|FStop|{baseline_row['fixed_loss_stop']}|{best['fixed_loss_stop']}|{_metric_delta(best, baseline_row, 'fixed_loss_stop')}|",
         "",
         "## Top 20",
         "",
-        "|#|BOLL_STD|Width|Entry Gap|Reprice|First/Second|Dyn Base/Min/Max|Max Total|PnL|Trades|Win|Drawdown|Cap/Funds Skip|",
-        "|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|",
+        "|#|Score|PnL|DD|MinLiq|Wipeout|WidthPct|Entry Gap|Width Gap Mult|First/Second|Dyn Base/Min/Max|Head Buffer|Fixed Stop|Disaster|BTG|Trades|Signals|Guard Block|Cross Stop|FStop|DStop|BTG Signal|BTG Stop|",
+        "|-:|-:|-:|-:|-:|-|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|",
     ]
     for idx, row in enumerate(rows[:20], start=1):
         lines.append(
-            f"|{idx}|{row['boll_std']}|{row['min_width_usd']}|{row['min_entry_gap_usd']}|"
-            f"{row['reprice_gap_usd']}|{row['first_batch_ratio']}/{row['second_batch_ratio']}|"
+            f"|{idx}|{row['balanced_score']}|{row['total_pnl']}|{row['max_drawdown_pct']}|"
+            f"{row['min_liq_distance_pct']}|{row['wipeout_risk']}|"
+            f"{row['min_width_pct']}|"
+            f"{row['min_entry_gap_usd']}|"
+            f"{row['boll_width_gap_mult']}|"
+            f"{row['first_batch_ratio']}/{row['second_batch_ratio']}|"
             f"{row['dynamic_base_ratio']}/{row['dynamic_min_ratio']}/{row['dynamic_max_ratio']}|"
-            f"{row['max_total_entry_ratio']}|{row['total_pnl']}|{row['trades']}|"
-            f"{row['win_rate_pct']}|{row['max_drawdown_pct']}|"
-            f"{row['skipped_entry_cap']}/{row['skipped_funds']}|"
+            f"{row['min_head_liq_buffer_pct']}|"
+            f"{row['copy_fixed_loss_stop_enabled']}/{row['copy_fixed_loss_stop_usdt']}/{row['copy_fixed_loss_stop_ratio']}|"
+            f"{row['disaster_stop_enabled']}/{row['disaster_head_drop_pct']}/{row['disaster_loss_ratio']}|"
+            f"O{row['boll_trend_guard_observe_enabled']}/C{row['boll_trend_guard_control_enabled'] or row['boll_trend_guard_enabled']}/"
+            f"{row['boll_trend_guard_head_adverse_pct']}/{row['boll_trend_guard_width_expand']}/"
+            f"{row['boll_trend_guard_width_pct']}/{row['boll_trend_guard_slope_pct_per_hour']}|"
+            f"{row['trades']}|{row['entry_signals']}|{row['blocked_addon_guard']}|"
+            f"{row['cross_copy_stop']}|{row['fixed_loss_stop']}|{row['disaster_stop']}|"
+            f"{row['boll_trend_guard_signal']}|{row['boll_trend_guard_stop']}|"
         )
-    lines.extend(["", "## Focused Parameter Impact", ""])
-    for title, fields in FOCUSED_GROUPS:
+    if walk_forward_rows:
         lines.extend(
             [
-                f"### {title}",
+                "## Walk-Forward Validation",
                 "",
-                "|Value|Runs|Best Rank|Best PnL|Avg PnL|Avg Trades|Avg Drawdown|Cap/Funds Skip|",
-                "|-:|-:|-:|-:|-:|-:|-:|-:|",
+                "Top-ranked full-sample parameters are replayed on the earlier training segment and later validation segment.",
+                "",
+                "|Rank|Robust|WidthPct|Entry Gap|Width Gap Mult|First/Second|Dyn Base/Min/Max|Train PnL|Train DD|Train Trades|Val PnL|Val DD|Val Trades|Val DStop|Val Wipeout|",
+                "|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-|",
             ]
         )
-        for summary in summarize_parameter_group(rows, fields):
+        for row in walk_forward_rows:
             lines.append(
-                f"|{summary['value']}|{summary['runs']}|{summary['best_rank']}|"
-                f"{summary['best_pnl']}|{summary['avg_pnl']}|{summary['avg_trades']}|"
-                f"{summary['avg_drawdown']}|{summary['cap_skip']}/{summary['fund_skip']}|"
+                f"|{row['rank']}|{row['robustness_score']}|{row['min_width_pct']}|"
+                f"{row['min_entry_gap_usd']}|{row['boll_width_gap_mult']}|"
+                f"{row['first_second']}|{row['dynamic_ratios']}|"
+                f"{row['train_pnl']}|{row['train_dd']}|{row['train_trades']}|"
+                f"{row['val_pnl']}|{row['val_dd']}|{row['val_trades']}|"
+                f"{row['val_dstop']}|{row['val_wipeout']}|"
             )
         lines.append("")
     lines.extend(
@@ -983,15 +2053,20 @@ def write_markdown_report(path: Path, rows: list[dict], ticks: pd.DataFrame) -> 
             "## Notes",
             "",
             "- This replay uses logged mark price and Bollinger snapshots, not order-book level fills.",
-            "- It follows the current dynamic entry sizing: first/second fixed ratios, later gap-based ratios, and no shrinking when the 80% cap would be exceeded.",
+            "- It follows the current live cross-copy sizing: sizing equity = min(TRADING_ACCOUNT_TARGET, account equity - protected equity).",
+            "- It includes the completed-candle add-on guard: long add-ons must break the tracked low; short add-ons must break the tracked high.",
+            "- It includes the optional disaster stop: head-entry adverse move plus strategy-cycle unrealized loss against TRADING_ACCOUNT_TARGET.",
+            "- It can optionally test BTG/Boll Trend Guard: adverse head-entry move plus Bollinger expansion and band-slope confirmation.",
             "- Config is changed only after manual confirmation in the selection prompt.",
         ]
     )
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def _format_config_value(value: float) -> str:
-    """Format a numeric config value with stable Python syntax."""
+def _format_config_value(value: float, as_bool: bool = False) -> str:
+    """Format a config value with stable Python syntax."""
+    if as_bool:
+        return "True" if int(float(value)) else "False"
     if float(value).is_integer():
         return str(int(value))
     return str(float(value))
@@ -1000,30 +2075,48 @@ def _format_config_value(value: float) -> str:
 def apply_params_to_config(row: dict, config_path: Path = CONFIG_PATH) -> Path:
     """Write selected optimizer parameters into ``src/config.py``."""
     replacements = {
-        "BOLL_STD": row["boll_std"],
-        "MIN_BOLL_WIDTH_USD": row["min_width_usd"],
+        "MIN_BOLL_WIDTH_PCT": row["min_width_pct"],
+        "ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED": row["entry_max_width_enabled"],
+        "ENTRY_MAX_BOLL_WIDTH_PCT": row["entry_max_width_pct"],
+        "ENTRY_MAX_BOLL_WIDTH_USD": row["entry_max_width_usd"],
         "MIN_ENTRY_GAP_USD": row["min_entry_gap_usd"],
-        "REPRICE_GAP_USD": row["reprice_gap_usd"],
+        "BOLL_WIDTH_GAP_MULT": row["boll_width_gap_mult"],
         "FIRST_BATCH_RATIO": row["first_batch_ratio"],
         "SECOND_BATCH_RATIO": row["second_batch_ratio"],
         "DYNAMIC_BASE_ENTRY_RATIO": row["dynamic_base_ratio"],
         "DYNAMIC_MIN_ENTRY_RATIO": row["dynamic_min_ratio"],
         "DYNAMIC_MAX_ENTRY_RATIO": row["dynamic_max_ratio"],
-        "MAX_TOTAL_ENTRY_RATIO": row["max_total_entry_ratio"],
-        "BOLL_WIDTH_BASE_PRICE": row["boll_width_base_price"],
-        "BOLL_WIDTH_BASE_USD": row["boll_width_base_usd"],
-        "MIN_BOLL_WIDTH_FLOOR_USD": row["boll_width_floor_usd"],
-        "BOLL_WIDTH_GAP_MULT": row["boll_width_gap_mult"],
-        "TP_TARGET_MARGIN_RETURN": row["tp_target_margin_return"],
         "MIN_HEAD_LIQ_BUFFER_PCT": row["min_head_liq_buffer_pct"],
+        "DISASTER_STOP_ENABLED": row["disaster_stop_enabled"],
+        "DISASTER_HEAD_DROP_PCT": row["disaster_head_drop_pct"],
+        "DISASTER_LOSS_RATIO": row["disaster_loss_ratio"],
+        "ADDON_DYNAMIC_GAP_ENABLED": row["addon_dynamic_gap_enabled"],
+        "ADDON_DYNAMIC_GAP_MAX_USD": row["addon_dynamic_gap_max_usd"],
+        "ADDON_DYNAMIC_GAP_BOLL_START": row["addon_dynamic_gap_boll_start"],
+        "ADDON_DYNAMIC_GAP_BOLL_STRONG": row["addon_dynamic_gap_boll_strong"],
+        "ADDON_DYNAMIC_GAP_BOLL_MAX_MULT": row["addon_dynamic_gap_boll_max_mult"],
+        "ADDON_DYNAMIC_GAP_HEAD_START_PCT": row["addon_dynamic_gap_head_start_pct"],
+        "ADDON_DYNAMIC_GAP_HEAD_STRONG_PCT": row["addon_dynamic_gap_head_strong_pct"],
+        "ADDON_DYNAMIC_GAP_HEAD_MAX_MULT": row["addon_dynamic_gap_head_max_mult"],
+        "ADDON_DYNAMIC_GAP_TREND_KLINES": row["addon_dynamic_gap_trend_klines"],
+        "ADDON_DYNAMIC_GAP_TREND_MULT": row["addon_dynamic_gap_trend_mult"],
+    }
+    bool_keys = {
+        "DISASTER_STOP_ENABLED",
+        "ADDON_DYNAMIC_GAP_ENABLED",
+        "ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED",
     }
     text = config_path.read_text(encoding="utf-8")
     backup_path = config_path.with_suffix(".py.bak")
     backup_path.write_text(text, encoding="utf-8")
 
     for key, value in replacements.items():
-        pattern = re.compile(rf"^({key}\s*=\s*)([-+]?\d+(?:\.\d+)?)(.*)$", re.MULTILINE)
-        text, count = pattern.subn(rf"\g<1>{_format_config_value(value)}\3", text, count=1)
+        pattern = re.compile(rf"^({key}\s*=\s*)(True|False|[-+]?\d+(?:\.\d+)?)(.*)$", re.MULTILINE)
+        text, count = pattern.subn(
+            rf"\g<1>{_format_config_value(value, key in bool_keys)}\3",
+            text,
+            count=1,
+        )
         if count != 1:
             raise RuntimeError(f"Missing config key {key} in {config_path}")
 
@@ -1048,16 +2141,34 @@ def prompt_apply_params(rows: list[dict], top_n: int = 20) -> None:
     selected = rows[int(choice) - 1]
     print(
         "Will apply: "
-        f"BOLL_STD={selected['boll_std']}, "
-        f"MIN_BOLL_WIDTH_USD={selected['min_width_usd']}, "
+        f"SCORE={selected['balanced_score']}, "
+        f"PNL={selected['total_pnl']}, "
+        f"DD={selected['max_drawdown_pct']}%, "
+        f"MIN_LIQ={selected['min_liq_distance_pct']}%, "
+        f"MIN_BOLL_WIDTH_PCT={selected['min_width_pct']}, "
+        f"ENTRY_MAX_WIDTH={bool(selected['entry_max_width_enabled'])}/"
+        f"{selected['entry_max_width_pct']}/{selected['entry_max_width_usd']}, "
         f"MIN_ENTRY_GAP_USD={selected['min_entry_gap_usd']}, "
-        f"REPRICE_GAP_USD={selected['reprice_gap_usd']}, "
+        f"BOLL_WIDTH_GAP_MULT={selected['boll_width_gap_mult']}, "
         f"FIRST_BATCH_RATIO={selected['first_batch_ratio']}, "
         f"SECOND_BATCH_RATIO={selected['second_batch_ratio']}, "
         f"DYNAMIC_BASE_ENTRY_RATIO={selected['dynamic_base_ratio']}, "
         f"DYNAMIC_MIN_ENTRY_RATIO={selected['dynamic_min_ratio']}, "
         f"DYNAMIC_MAX_ENTRY_RATIO={selected['dynamic_max_ratio']}, "
-        f"MAX_TOTAL_ENTRY_RATIO={selected['max_total_entry_ratio']}"
+        f"MIN_HEAD_LIQ_BUFFER_PCT={selected['min_head_liq_buffer_pct']}, "
+        f"DISASTER_STOP_ENABLED={bool(selected['disaster_stop_enabled'])}, "
+        f"DISASTER_HEAD_DROP_PCT={selected['disaster_head_drop_pct']}, "
+        f"DISASTER_LOSS_RATIO={selected['disaster_loss_ratio']}, "
+        f"ADDON_DYNAMIC_GAP_ENABLED={bool(selected['addon_dynamic_gap_enabled'])}, "
+        f"ADDON_DYNAMIC_GAP_MAX_USD={selected['addon_dynamic_gap_max_usd']}, "
+        f"ADDON_DYNAMIC_GAP_BOLL={selected['addon_dynamic_gap_boll_start']}/"
+        f"{selected['addon_dynamic_gap_boll_strong']}/"
+        f"{selected['addon_dynamic_gap_boll_max_mult']}, "
+        f"ADDON_DYNAMIC_GAP_HEAD={selected['addon_dynamic_gap_head_start_pct']}/"
+        f"{selected['addon_dynamic_gap_head_strong_pct']}/"
+        f"{selected['addon_dynamic_gap_head_max_mult']}, "
+        f"ADDON_DYNAMIC_GAP_TREND={selected['addon_dynamic_gap_trend_klines']}/"
+        f"{selected['addon_dynamic_gap_trend_mult']}"
     )
     confirm = input("Type y to confirm: ").strip().lower()
     if confirm != "y":
@@ -1068,68 +2179,143 @@ def prompt_apply_params(rows: list[dict], top_n: int = 20) -> None:
     print(f"Updated src/config.py; backup saved to {backup_path}")
 
 
-def print_rankings(rows: list[dict], top_n: int = 10) -> None:
+def print_rankings(rows: list[dict], baseline_row: dict, top_n: int = 10) -> None:
     """Print a compact, readable optimizer ranking."""
     best = rows[0]
     print()
     print("=" * 108)
-    print("Best Parameters")
+    print("Best Balanced Parameters")
     print("=" * 108)
     print(
-        f"BOLL_STD={best['boll_std']}  "
-        f"MIN_BOLL_WIDTH_USD={best['min_width_usd']}  "
+        f"MIN_BOLL_WIDTH_PCT={best['min_width_pct']}  "
+        f"ENTRY_MAX_WIDTH={bool(best['entry_max_width_enabled'])}/"
+        f"{best['entry_max_width_pct']}/{best['entry_max_width_usd']}  "
         f"MIN_ENTRY_GAP_USD={best['min_entry_gap_usd']}  "
-        f"REPRICE_GAP_USD={best['reprice_gap_usd']}"
+        f"BOLL_WIDTH_GAP_MULT={best['boll_width_gap_mult']}  "
+        f"MIN_HEAD_LIQ_BUFFER_PCT={best['min_head_liq_buffer_pct']}"
     )
     print(
         f"FIRST/SECOND={best['first_batch_ratio']}/{best['second_batch_ratio']}  "
-        f"DYNAMIC={best['dynamic_base_ratio']}/{best['dynamic_min_ratio']}/{best['dynamic_max_ratio']}  "
-        f"MAX_TOTAL={best['max_total_entry_ratio']}"
+        f"DYNAMIC={best['dynamic_base_ratio']}/{best['dynamic_min_ratio']}/{best['dynamic_max_ratio']}"
     )
     print(
+        f"DISASTER_STOP={bool(best['disaster_stop_enabled'])}  "
+        f"HEAD_DROP={best['disaster_head_drop_pct']}  "
+        f"LOSS_RATIO={best['disaster_loss_ratio']}"
+    )
+    print(
+        f"FIXED_LOSS_STOP={bool(best['copy_fixed_loss_stop_enabled'])}  "
+        f"LOSS_USDT={best['copy_fixed_loss_stop_usdt']}  "
+        f"LOSS_RATIO={best['copy_fixed_loss_stop_ratio']}"
+    )
+    print(
+        f"BTG_OBSERVE={bool(best['boll_trend_guard_observe_enabled'])}  "
+        f"BTG_CONTROL={bool(best['boll_trend_guard_control_enabled'] or best['boll_trend_guard_enabled'])}  "
+        f"BTG_HEAD={best['boll_trend_guard_head_adverse_pct']}  "
+        f"BTG_EXPAND={best['boll_trend_guard_width_expand']}  "
+        f"BTG_WIDTH={best['boll_trend_guard_width_pct']}"
+    )
+    print(
+        f"Score={best['balanced_score']:+.2f}  "
         f"PnL={best['total_pnl']:+.2f} USDT  "
         f"trades={best['trades']}  "
         f"win={best['win_rate_pct']:.1f}%  "
         f"drawdown={best['max_drawdown_pct']:.2f}%  "
+        f"min_liq={best['min_liq_distance_pct']:.2f}%  "
+        f"wipeout={best['wipeout_risk']}  "
         f"avg_hold={best['avg_hold_minutes']:.0f}m"
     )
     print()
-    print("Top parameter comparison")
+    print("Current config baseline")
     print("-" * 108)
-    print("Rank  BOLL/W/G/R        First/Second  DynBase/Min/Max  Cap   PnL USDT  Trades  Win    DD     SkipCap/Funds")
-    print("-" * 108)
+    print(
+        f"WIDTH_PCT={baseline_row['min_width_pct']}  "
+        f"ENTRY_MAX={bool(baseline_row['entry_max_width_enabled'])}/"
+        f"{baseline_row['entry_max_width_pct']}/{baseline_row['entry_max_width_usd']}  "
+        f"ENTRY_GAP={baseline_row['min_entry_gap_usd']}  "
+        f"GAP_MULT={baseline_row['boll_width_gap_mult']}  "
+        f"FIRST/SECOND={baseline_row['first_batch_ratio']}/{baseline_row['second_batch_ratio']}  "
+        f"DYNAMIC={baseline_row['dynamic_base_ratio']}/{baseline_row['dynamic_min_ratio']}/{baseline_row['dynamic_max_ratio']}"
+    )
+    print(
+        f"Score={baseline_row['balanced_score']:+.2f}  "
+        f"PnL={baseline_row['total_pnl']:+.2f} USDT  "
+        f"trades={baseline_row['trades']}  "
+        f"win={baseline_row['win_rate_pct']:.1f}%  "
+        f"drawdown={baseline_row['max_drawdown_pct']:.2f}%  "
+        f"min_liq={baseline_row['min_liq_distance_pct']:.2f}%  "
+        f"DStop={baseline_row['disaster_stop']}  "
+        f"BTGSignal={baseline_row['boll_trend_guard_signal']}  "
+        f"BTGStop={baseline_row['boll_trend_guard_stop']}  "
+        f"FStop={baseline_row['fixed_loss_stop']}"
+    )
+    print(
+        f"Best delta: Score={_metric_delta(best, baseline_row, 'balanced_score'):+.2f}  "
+        f"PnL={_metric_delta(best, baseline_row, 'total_pnl'):+.2f} USDT  "
+        f"DD={_metric_delta(best, baseline_row, 'max_drawdown_pct'):+.2f}%  "
+        f"MinLiq={_metric_delta(best, baseline_row, 'min_liq_distance_pct'):+.2f}%"
+    )
+    print()
+    print("Top balanced parameter comparison")
+    print("-" * 152)
+    print("Rank  Score     PnL USDT  DD     MinLiq  Wipeout  WidthPct  EntryMax  EntryGap  GapMult  First/Second  DynBase/Min/Max  HeadBuf  Guard  MaxW  Cross  FStop  DStop  BTGsig BTGst Trades  Signals")
+    print("-" * 152)
     for idx, row in enumerate(rows[:top_n], start=1):
-        params = f"{row['boll_std']:g}/{row['min_width_usd']:g}/{row['min_entry_gap_usd']:g}/{row['reprice_gap_usd']:g}"
         dyn = f"{row['dynamic_base_ratio']:g}/{row['dynamic_min_ratio']:g}/{row['dynamic_max_ratio']:g}"
         print(
-            f"{idx:>2}    {params:<17}"
+            f"{idx:>2}  "
+            f"{row['balanced_score']:>8.2f}  "
+            f"{row['total_pnl']:>9.2f}  "
+            f"{row['max_drawdown_pct']:>5.2f}%  "
+            f"{row['min_liq_distance_pct']:>6.2f}%  "
+            f"{str(row['wipeout_risk']):<7}  "
+            f"{row['min_width_pct']:<9.4f}"
+            f"{row['entry_max_width_pct']:<9.4f}"
+            f"{row['min_entry_gap_usd']:<9g}"
+            f"{row['boll_width_gap_mult']:<8g}"
             f"{row['first_batch_ratio']:>5.2f}/{row['second_batch_ratio']:<5.2f}  "
             f"{dyn:<16}"
-            f"{row['max_total_entry_ratio']:<5.2f}"
-            f"{row['total_pnl']:>9.2f}  "
+            f"{row['min_head_liq_buffer_pct']:<8.3f}"
+            f"{row['blocked_addon_guard']:<7}"
+            f"{row['blocked_entry_max_width']:<6}"
+            f"{row['cross_copy_stop']:<6}"
+            f"{row['fixed_loss_stop']:<7}"
+            f"{row['disaster_stop']:<7}"
+            f"{row['boll_trend_guard_signal']:<7}"
+            f"{row['boll_trend_guard_stop']:<6}"
             f"{row['trades']:>3}  "
-            f"{row['win_rate_pct']:>5.1f}%  "
-            f"{row['max_drawdown_pct']:>5.2f}%  "
-            f"{row['skipped_entry_cap']:>5}/{row['skipped_funds']:<5}"
+            f"{row['entry_signals']:>7}"
         )
-    print("-" * 108)
+    print("-" * 152)
     print()
-    print("Focused parameter impact")
-    print("-" * 108)
-    for title, fields in FOCUSED_GROUPS:
-        print(f"{title}:")
-        for summary in summarize_parameter_group(rows, fields)[:8]:
-            print(
-                f"  {summary['value']:<14} "
-                f"best_rank={summary['best_rank']:<3} "
-                f"best_pnl={summary['best_pnl']:>8.2f} "
-                f"avg_pnl={summary['avg_pnl']:>8.2f} "
-                f"avg_trades={summary['avg_trades']:>5.2f} "
-                f"avg_dd={summary['avg_drawdown']:>5.2f}% "
-                f"skip={summary['cap_skip']}/{summary['fund_skip']}"
-            )
-    print("-" * 108)
-    print("Full fields and grouped tables are saved to CSV/Markdown.")
+    print("Full fields, current baseline, and walk-forward validation are saved to CSV/Markdown.")
+
+
+def print_walk_forward(rows: list[dict], top_n: int = 10) -> None:
+    """Print compact walk-forward validation rows."""
+    if not rows:
+        return
+    print()
+    print("Walk-forward validation")
+    print("-" * 120)
+    print("Rank  Robust    WidthPct  EntryGap  GapMult  TrainPnL  TrainDD  ValPnL    ValDD   ValTrades  ValDStop  Wipeout")
+    print("-" * 120)
+    for row in rows[:top_n]:
+        print(
+            f"{row['rank']:>2}  "
+            f"{row['robustness_score']:>8.2f}  "
+            f"{row['min_width_pct']:<8.4f}  "
+            f"{row['min_entry_gap_usd']:<8g}  "
+            f"{row['boll_width_gap_mult']:<7g}  "
+            f"{row['train_pnl']:>8.2f}  "
+            f"{row['train_dd']:>7.2f}%  "
+            f"{row['val_pnl']:>8.2f}  "
+            f"{row['val_dd']:>6.2f}%  "
+            f"{row['val_trades']:>9}  "
+            f"{row['val_dstop']:>8}  "
+            f"{row['val_wipeout']}"
+        )
+    print("-" * 120)
 
 
 def main() -> None:
@@ -1138,27 +2324,79 @@ def main() -> None:
     parser.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
     parser.add_argument("--initial-total-equity", type=float, default=INITIAL_TOTAL_EQUITY)
-    parser.add_argument("--sample-sec", type=int, default=0, help="Optional replay resample interval in seconds; 0 uses every parsed tick.")
-    parser.add_argument("--boll-std", default="1.8,2.0,2.2")
-    parser.add_argument("--min-width-usd", default="10,12,13.5,15,16.5,18,20,25")
-    parser.add_argument("--min-entry-gap-usd", default="3,4,5,6,8")
-    parser.add_argument("--reprice-gap-usd", default="0.5,1,2")
+    parser.add_argument("--sample-sec", type=int, default=POLL_INTERVAL, help="Replay resample interval in seconds; 0 uses every parsed tick.")
+    parser.add_argument("--boll-std", default="2.0")
+    parser.add_argument("--min-width-usd", default=str(MIN_BOLL_WIDTH_USD))
+    parser.add_argument("--min-boll-width-pct", default="0.0055:0.01:0.0005")
+    parser.add_argument("--min-entry-gap-usd", default="3,4,5,6")
+    parser.add_argument("--reprice-gap-usd", default=str(REPRICE_GAP_USD))
+    parser.add_argument("--entry-max-width-enabled", default=str(int(ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED)))
+    parser.add_argument("--entry-max-width-pct", default="0.02,0.023,0.025,0.03,0.035")
+    parser.add_argument("--entry-max-width-usd", default="0,60,80,100")
     parser.add_argument("--first-batch-ratio", default=str(FIRST_BATCH_RATIO))
     parser.add_argument("--second-batch-ratio", default=str(SECOND_BATCH_RATIO))
-    parser.add_argument("--dynamic-base-ratio", default=str(DYNAMIC_BASE_ENTRY_RATIO))
+    parser.add_argument("--dynamic-base-ratio", default="0.08,0.10")
     parser.add_argument("--dynamic-min-ratio", default=str(DYNAMIC_MIN_ENTRY_RATIO))
-    parser.add_argument("--dynamic-max-ratio", default=str(DYNAMIC_MAX_ENTRY_RATIO))
+    parser.add_argument("--dynamic-max-ratio", default="0.15,0.18")
     parser.add_argument("--max-total-entry-ratio", default=str(MAX_TOTAL_ENTRY_RATIO))
     parser.add_argument("--boll-width-base-price", default=str(BOLL_WIDTH_BASE_PRICE))
     parser.add_argument("--boll-width-base-usd", default=str(BOLL_WIDTH_BASE_USD))
     parser.add_argument("--boll-width-floor-usd", default=str(MIN_BOLL_WIDTH_FLOOR_USD))
-    parser.add_argument("--boll-width-gap-mult", default=str(BOLL_WIDTH_GAP_MULT))
+    parser.add_argument("--boll-width-gap-mult", default="2.5,3,3.5,4")
     parser.add_argument("--tp-target-margin-return", default=str(TP_TARGET_MARGIN_RETURN))
-    parser.add_argument("--min-head-liq-buffer-pct", default=str(MIN_HEAD_LIQ_BUFFER_PCT))
-    parser.add_argument("--dynamic-tp-enabled", default=str(int(DYNAMIC_TP_ENABLED)))
-    parser.add_argument("--dynamic-tp-arm-return", default=str(DYNAMIC_TP_ARM_RETURN))
+    parser.add_argument("--min-head-liq-buffer-pct", default="0.03,0.035")
+    parser.add_argument(
+        "--dynamic-tp-enabled",
+        default="0",
+        help="Dynamic take-profit replay switch. Default is 0 for baseline optimization; pass 1 to test dynamic TP.",
+    )
+    parser.add_argument(
+        "--dynamic-tp-arm-return",
+        default=str(DYNAMIC_TP_ARM_RETURN),
+        help=f"Comma list or range. Example sweep: {DEFAULT_DYNAMIC_TP_ARM_GRID} or 0.15:0.24:0.005.",
+    )
     parser.add_argument("--dynamic-tp-restore-return", default=str(DYNAMIC_TP_RESTORE_RETURN))
     parser.add_argument("--dynamic-tp-reprice-gap-usd", default=str(DYNAMIC_TP_REPRICE_GAP_USD))
+    parser.add_argument("--boll-tp-compression-enabled", default="0")
+    parser.add_argument("--boll-tp-compression-min-return", default=str(BOLL_TP_COMPRESSION_MIN_RETURN))
+    parser.add_argument("--boll-tp-compression-exit-offset-usd", default=str(BOLL_TP_COMPRESSION_EXIT_OFFSET_USD))
+    parser.add_argument("--entry-extreme-gap-adjust-enabled", default=str(int(ENTRY_EXTREME_GAP_ADJUST_ENABLED)))
+    parser.add_argument("--entry-extreme-gap-base-pct", default=str(ENTRY_EXTREME_GAP_BASE_PCT))
+    parser.add_argument("--entry-extreme-gap-full-pct", default=str(ENTRY_EXTREME_GAP_FULL_PCT))
+    parser.add_argument("--entry-extreme-gap-max-mult", default=str(ENTRY_EXTREME_GAP_MAX_MULT))
+    parser.add_argument("--copy-fixed-loss-stop-enabled", default=str(int(COPY_FIXED_LOSS_STOP_ENABLED)))
+    parser.add_argument("--copy-fixed-loss-stop-usdt", default=str(COPY_FIXED_LOSS_STOP_USDT))
+    parser.add_argument("--copy-fixed-loss-stop-ratio", default=str(COPY_FIXED_LOSS_STOP_RATIO))
+    parser.add_argument("--disaster-stop-enabled", default=str(int(DISASTER_STOP_ENABLED)))
+    parser.add_argument("--disaster-head-drop-pct", default=str(DISASTER_HEAD_DROP_PCT))
+    parser.add_argument("--disaster-loss-ratio", default=str(DISASTER_LOSS_RATIO))
+    parser.add_argument("--boll-trend-guard-enabled", default=str(int(BOLL_TREND_GUARD_ENABLED)))
+    parser.add_argument("--boll-trend-guard-observe-enabled", default=str(int(BOLL_TREND_GUARD_OBSERVE_ENABLED)))
+    parser.add_argument("--boll-trend-guard-control-enabled", default=str(int(BOLL_TREND_GUARD_CONTROL_ENABLED)))
+    parser.add_argument("--boll-trend-guard-head-adverse-pct", default=str(BOLL_TREND_GUARD_HEAD_ADVERSE_PCT))
+    parser.add_argument("--boll-trend-guard-width-expand", default=str(BOLL_TREND_GUARD_WIDTH_EXPAND))
+    parser.add_argument("--boll-trend-guard-width-pct", default=str(BOLL_TREND_GUARD_WIDTH_PCT))
+    parser.add_argument("--boll-trend-guard-slope-window-min", default=str(BOLL_TREND_GUARD_SLOPE_WINDOW_MIN))
+    parser.add_argument("--boll-trend-guard-min-hold-min", default=str(BOLL_TREND_GUARD_MIN_HOLD_MIN))
+    parser.add_argument("--boll-trend-guard-z-mean", default=str(BOLL_TREND_GUARD_Z_MEAN))
+    parser.add_argument("--boll-trend-guard-slope-pct-per-hour", default=str(BOLL_TREND_GUARD_SLOPE_PCT_PER_HOUR))
+    parser.add_argument("--boll-trend-guard-stop-after-close", default=str(int(BOLL_TREND_GUARD_STOP_AFTER_CLOSE)))
+    parser.add_argument("--addon-dynamic-gap-enabled", default=str(int(ADDON_DYNAMIC_GAP_ENABLED)))
+    parser.add_argument("--addon-dynamic-gap-max-usd", default=str(ADDON_DYNAMIC_GAP_MAX_USD))
+    parser.add_argument("--addon-dynamic-gap-boll-start", default=str(ADDON_DYNAMIC_GAP_BOLL_START))
+    parser.add_argument("--addon-dynamic-gap-boll-strong", default=str(ADDON_DYNAMIC_GAP_BOLL_STRONG))
+    parser.add_argument("--addon-dynamic-gap-boll-max-mult", default=str(ADDON_DYNAMIC_GAP_BOLL_MAX_MULT))
+    parser.add_argument("--addon-dynamic-gap-head-start-pct", default=str(ADDON_DYNAMIC_GAP_HEAD_START_PCT))
+    parser.add_argument("--addon-dynamic-gap-head-strong-pct", default=str(ADDON_DYNAMIC_GAP_HEAD_STRONG_PCT))
+    parser.add_argument("--addon-dynamic-gap-head-max-mult", default=str(ADDON_DYNAMIC_GAP_HEAD_MAX_MULT))
+    parser.add_argument("--addon-dynamic-gap-trend-klines", default=str(ADDON_DYNAMIC_GAP_TREND_KLINES))
+    parser.add_argument("--addon-dynamic-gap-trend-mult", default=str(ADDON_DYNAMIC_GAP_TREND_MULT))
+    parser.add_argument("--search-mode", choices=("grid", "random"), default="grid")
+    parser.add_argument("--random-trials", type=int, default=300)
+    parser.add_argument("--random-seed", type=int, default=42)
+    parser.add_argument("--walk-forward-ratio", type=float, default=0.7)
+    parser.add_argument("--walk-forward-top-n", type=int, default=10)
+    parser.add_argument("--workers", type=int, default=0, help="Replay worker processes; 0 auto-detects, 1 disables multiprocessing.")
     parser.add_argument("--no-prompt", action="store_true", help="Generate report only; do not show config sync prompt.")
     parser.add_argument("--quiet", action="store_true", help="Hide progress output and print only final results.")
     args = parser.parse_args()
@@ -1175,34 +2413,53 @@ def main() -> None:
             flush=True,
         )
 
-    grid = build_grid(args)
-    total = len(grid)
-    progress_step = max(1, total // 20)
-    if not args.quiet:
-        print(f"Starting replay for {total} parameter sets...", flush=True)
-    rows = []
-    for idx, params in enumerate(grid, start=1):
-        rows.append(LogReplay(ticks, params, args.initial_total_equity).run().report())
-        if not args.quiet and (idx == 1 or idx == total or idx % progress_step == 0):
-            pct = idx / total * 100
-            print(f"Progress {idx}/{total} ({pct:.1f}%)", flush=True)
+    baseline_params = current_config_params(args)
+    grid = build_random_grid(args) if args.search_mode == "random" else build_grid(args)
+    grid = ensure_baseline_in_grid(grid, baseline_params)
+    rows = run_replays(ticks, grid, args.initial_total_equity, args.workers, args.quiet)
 
     if not args.quiet:
         print("Sorting and writing report...", flush=True)
-    rows.sort(key=lambda row: (row["total_pnl"], row["trades"], -row["max_drawdown_pct"]), reverse=True)
+    rows.sort(
+        key=lambda row: (
+            row["balanced_score"],
+            row["total_pnl"],
+            -row["max_drawdown_pct"],
+            row["min_liq_distance_pct"],
+        ),
+        reverse=True,
+    )
+    baseline_row = LogReplay(ticks, baseline_params, args.initial_total_equity).run().report()
+
+    walk_forward_rows = run_walk_forward(
+        ticks,
+        rows,
+        args.initial_total_equity,
+        args.walk_forward_ratio,
+        args.walk_forward_top_n,
+    )
 
     stamp = ticks["ts"].max().strftime("%Y%m%d_%H%M%S")
     csv_path = out_dir / f"log_param_report_{stamp}.csv"
     md_path = out_dir / f"log_param_report_{stamp}.md"
+    wf_csv_path = out_dir / f"log_param_walk_forward_{stamp}.csv"
     out_dir.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
-    write_markdown_report(md_path, rows, ticks)
+    if walk_forward_rows:
+        with wf_csv_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=list(walk_forward_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(walk_forward_rows)
+    write_markdown_report(md_path, rows, ticks, baseline_row, walk_forward_rows)
 
-    print_rankings(rows)
+    print_rankings(rows, baseline_row)
+    print_walk_forward(walk_forward_rows)
     print(f"csv={csv_path}")
+    if walk_forward_rows:
+        print(f"walk_forward_csv={wf_csv_path}")
     print(f"report={md_path}")
     if not args.no_prompt:
         prompt_apply_params(rows)

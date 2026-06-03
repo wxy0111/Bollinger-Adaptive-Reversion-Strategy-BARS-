@@ -203,7 +203,7 @@ def build_batch_plan(
 
 def check_drawdown(current_equity: float, peak_equity: float, max_dd: float) -> bool:
     """Return whether the account drawdown has reached the configured limit."""
-    if peak_equity <= 0:
+    if max_dd <= 0 or max_dd >= 1.0 or peak_equity <= 0:
         return False
     dd = (peak_equity - current_equity) / peak_equity
     if dd >= max_dd:

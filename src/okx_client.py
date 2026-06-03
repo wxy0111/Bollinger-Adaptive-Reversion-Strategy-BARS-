@@ -102,6 +102,16 @@ class OKXClient:
                                {"instId": inst_id, "instType": "SWAP"})
         return float(data["data"][0]["markPx"])
 
+    async def get_ticker_24h(self, inst_id: str) -> dict:
+        """Return 24h ticker high/low values for an instrument."""
+        data = await self._get("/api/v5/market/ticker", {"instId": inst_id})
+        ticker = data["data"][0]
+        return {
+            "high24h": float(ticker.get("high24h") or 0),
+            "low24h": float(ticker.get("low24h") or 0),
+            "last": float(ticker.get("last") or 0),
+        }
+
     async def get_balance(self, ccy: str = "USDT") -> float:
         """Return available trading-account balance for a currency."""
         data = await self._get("/api/v5/account/balance", {"ccy": ccy})
@@ -197,6 +207,22 @@ class OKXClient:
     async def get_open_orders(self, inst_id: str) -> list:
         """Return open normal orders for an instrument."""
         data = await self._get("/api/v5/trade/orders-pending", {"instId": inst_id})
+        return data["data"]
+
+    async def get_fills_history(self, inst_id: str, inst_type: str = "SWAP",
+                                limit: int = 100, begin: int | None = None,
+                                end: int | None = None) -> list:
+        """Return recent fill records for an instrument."""
+        params = {
+            "instType": inst_type,
+            "instId": inst_id,
+            "limit": str(limit),
+        }
+        if begin is not None:
+            params["begin"] = str(begin)
+        if end is not None:
+            params["end"] = str(end)
+        data = await self._get("/api/v5/trade/fills-history", params)
         return data["data"]
 
     async def get_open_algo_orders(self, inst_id: str) -> list:
