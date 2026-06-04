@@ -46,6 +46,14 @@ def _sign(timestamp: str, method: str, path: str, body: str = "") -> str:
     ).decode()
 
 
+def _float_or_zero(value) -> float:
+    """Convert OKX numeric fields to float, treating empty fields as zero."""
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _headers(method: str, path: str, body: str = "") -> dict:
     """Build authenticated OKX request headers."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -117,16 +125,21 @@ class OKXClient:
         data = await self._get("/api/v5/account/balance", {"ccy": ccy})
         for d in data["data"][0]["details"]:
             if d["ccy"] == ccy:
-                return float(d["availBal"])
+                return _float_or_zero(d.get("availBal"))
         return 0.0
 
     async def get_equity(self, ccy: str = "USDT") -> float:
         """Return account equity for a currency when available."""
         data = await self._get("/api/v5/account/balance", {"ccy": ccy})
+        total_eq = _float_or_zero(data["data"][0].get("totalEq"))
         for d in data["data"][0]["details"]:
             if d["ccy"] == ccy:
-                return float(d.get("eq") or d.get("cashBal") or 0)
-        return float(data["data"][0].get("totalEq") or 0)
+                for field in ("eq", "cashBal", "availBal"):
+                    value = _float_or_zero(d.get(field))
+                    if value > 0:
+                        return value
+                return total_eq
+        return total_eq
 
     async def get_position(self, inst_id: str) -> Optional[dict]:
         """Return the first non-zero position for an instrument."""
@@ -145,7 +158,7 @@ class OKXClient:
         data = await self._get("/api/v5/asset/balances", {"ccy": ccy})
         for d in data["data"]:
             if d["ccy"] == ccy:
-                return float(d.get("availBal") or 0)
+                return _float_or_zero(d.get("availBal"))
         return 0.0
 
     async def transfer(self, amt: float, from_acct: str, to_acct: str, ccy: str = "USDT") -> None:

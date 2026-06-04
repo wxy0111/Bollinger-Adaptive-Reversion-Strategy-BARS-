@@ -16,7 +16,7 @@ import random
 import re
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +39,8 @@ from src.config import (
     BOLL_WIDTH_BASE_PRICE,
     BOLL_WIDTH_BASE_USD,
     BOLL_WIDTH_GAP_MULT,
+    BOLL_WIDTH_TP_SPACE_ENABLED,
+    BOLL_WIDTH_TP_SPACE_MULT,
     DYNAMIC_BASE_ENTRY_RATIO,
     DYNAMIC_ENTRY_GAP_ENABLED,
     DYNAMIC_ENTRY_GAP_MAX_USD,
@@ -91,13 +93,18 @@ from src.config import (
     MIN_ENTRY_GAP_USD,
     MIN_BOLL_WIDTH_FLOOR_USD,
     MIN_HEAD_LIQ_BUFFER_PCT,
+    FIXED_LOSS_HEAD_BUFFER_ENABLED,
+    FIXED_LOSS_HEAD_BUFFER_PCT,
     MIN_ORDER_CONTRACTS,
     NO_NEW_EXTREME_TICKS,
     OKX_LIQ_FEE_RATE,
     OKX_MAINTENANCE_MARGIN_RATE,
     POLL_INTERVAL,
     REPRICE_GAP_USD,
-    SECOND_BATCH_RATIO,
+    SECOND_BATCH_DYNAMIC_BASE_RATIO,
+    SECOND_BATCH_DYNAMIC_MIN_RATIO,
+    SECOND_BATCH_DYNAMIC_MAX_RATIO,
+    SECOND_BATCH_DYNAMIC_FULL_GAP_USD,
     TP_TARGET_MARGIN_RETURN,
     TP_PROFIT_USD,
     TRADING_ACCOUNT_TARGET,
@@ -107,11 +114,35 @@ from src.config import (
 CONFIG_PATH = ROOT / "src" / "config.py"
 DEFAULT_LOG_DIR = ROOT / "logs"
 DEFAULT_OUT_DIR = ROOT / "backtest" / "results" / "log_parameter_optimizer"
+DEFAULT_CACHE_DIR = ROOT / "backtest" / "cache"
 SOURCE_BOLL_STD = 2.0
 TAKER_FEE = 0.0005
 INITIAL_TOTAL_EQUITY = 1000.0
 DEFAULT_DYNAMIC_TP_ARM_GRID = ",".join(f"{value / 1000:g}" for value in range(150, 241, 5))
 _WORKER_TICKS: pd.DataFrame | None = None
+
+# Only these fields are varied by the optimizer. The remaining Params fields
+# are still replayed, but they are fixed to the live config so the report stays
+# aligned with the real strategy instead of drifting into stale knobs.
+CORE_OPTIMIZED_FIELDS = (
+    "entry_max_width_pct",
+    "min_entry_gap_usd",
+    "boll_width_tp_space_mult",
+    "first_batch_ratio",
+    "second_batch_dynamic_base_ratio",
+    "second_batch_dynamic_min_ratio",
+    "second_batch_dynamic_max_ratio",
+    "second_batch_dynamic_full_gap_usd",
+    "dynamic_base_ratio",
+    "dynamic_min_ratio",
+    "dynamic_max_ratio",
+    "max_total_entry_ratio",
+    "copy_fixed_loss_stop_ratio",
+    "fixed_loss_head_buffer_pct",
+    "disaster_head_drop_pct",
+    "disaster_loss_ratio",
+    "addon_dynamic_gap_max_usd",
+)
 
 TICK_RE = re.compile(
     "^(?P<ts>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d+).*?"
@@ -135,7 +166,10 @@ class Params:
     entry_max_width_pct: float = ENTRY_MAX_BOLL_WIDTH_PCT
     entry_max_width_usd: float = ENTRY_MAX_BOLL_WIDTH_USD
     first_batch_ratio: float = FIRST_BATCH_RATIO
-    second_batch_ratio: float = SECOND_BATCH_RATIO
+    second_batch_dynamic_base_ratio: float = SECOND_BATCH_DYNAMIC_BASE_RATIO
+    second_batch_dynamic_min_ratio: float = SECOND_BATCH_DYNAMIC_MIN_RATIO
+    second_batch_dynamic_max_ratio: float = SECOND_BATCH_DYNAMIC_MAX_RATIO
+    second_batch_dynamic_full_gap_usd: float = SECOND_BATCH_DYNAMIC_FULL_GAP_USD
     dynamic_base_ratio: float = DYNAMIC_BASE_ENTRY_RATIO
     dynamic_min_ratio: float = DYNAMIC_MIN_ENTRY_RATIO
     dynamic_max_ratio: float = DYNAMIC_MAX_ENTRY_RATIO
@@ -144,6 +178,8 @@ class Params:
     boll_width_base_usd: float = BOLL_WIDTH_BASE_USD
     boll_width_floor_usd: float = MIN_BOLL_WIDTH_FLOOR_USD
     boll_width_gap_mult: float = BOLL_WIDTH_GAP_MULT
+    boll_width_tp_space_enabled: int = int(BOLL_WIDTH_TP_SPACE_ENABLED)
+    boll_width_tp_space_mult: float = BOLL_WIDTH_TP_SPACE_MULT
     tp_target_margin_return: float = TP_TARGET_MARGIN_RETURN
     min_head_liq_buffer_pct: float = MIN_HEAD_LIQ_BUFFER_PCT
     dynamic_tp_enabled: int = int(DYNAMIC_TP_ENABLED)
@@ -160,6 +196,8 @@ class Params:
     copy_fixed_loss_stop_enabled: int = int(COPY_FIXED_LOSS_STOP_ENABLED)
     copy_fixed_loss_stop_usdt: float = COPY_FIXED_LOSS_STOP_USDT
     copy_fixed_loss_stop_ratio: float = COPY_FIXED_LOSS_STOP_RATIO
+    fixed_loss_head_buffer_enabled: int = int(FIXED_LOSS_HEAD_BUFFER_ENABLED)
+    fixed_loss_head_buffer_pct: float = FIXED_LOSS_HEAD_BUFFER_PCT
     disaster_stop_enabled: int = int(DISASTER_STOP_ENABLED)
     disaster_head_drop_pct: float = DISASTER_HEAD_DROP_PCT
     disaster_loss_ratio: float = DISASTER_LOSS_RATIO
@@ -324,6 +362,7 @@ class LogReplay:
         self.dynamic_gap_events = 0
         self.dynamic_gap_mult_total = 0.0
         self.dynamic_gap_mult_max = 1.0
+        self.fixed_loss_head_buffer_block = 0
 
     def run(self) -> "LogReplay":
         """Run the replay and return self."""
@@ -491,7 +530,7 @@ class LogReplay:
         return fallback_price
 
     def _min_ratio_ladder(self) -> list[float]:
-        ratios = [self.params.first_batch_ratio, self.params.second_batch_ratio]
+        ratios = [self.params.first_batch_ratio, self.params.second_batch_dynamic_min_ratio]
         while (
             sum(ratios) + self.params.dynamic_min_ratio <= self.params.max_total_entry_ratio + 1e-12
             and len(ratios) < MAX_ENTRY_BATCHES
@@ -653,9 +692,20 @@ class LogReplay:
         return 1.0
 
     def _effective_min_boll_width(self, price: float) -> float:
-        pct_rule = price * self._effective_boll_width_pct() if price > 0 else 0.0
-        gap_rule = self._effective_entry_gap(price) * self.params.boll_width_gap_mult
-        return max(self.params.min_width_usd, self.params.boll_width_floor_usd, pct_rule, gap_rule)
+        tp_space_rule = self._tp_space_width_rule(price)
+        if self.params.boll_width_tp_space_enabled:
+            return max(self.params.boll_width_floor_usd, tp_space_rule)
+        return self.params.min_width_usd
+
+    def _tp_space_width_rule(self, price: float) -> float:
+        """Return the Bollinger width required by the configured TP target."""
+        if not self.params.boll_width_tp_space_enabled:
+            return 0.0
+        if price <= 0 or LEVER <= 0 or self.params.tp_target_margin_return <= 0:
+            return 0.0
+        if self.params.boll_width_tp_space_mult <= 0:
+            return 0.0
+        return price * self.params.tp_target_margin_return / LEVER * self.params.boll_width_tp_space_mult
 
     def _entry_extreme_multiplier(self, gap_pct: float) -> float:
         if not self.params.entry_extreme_gap_adjust_enabled:
@@ -862,6 +912,57 @@ class LogReplay:
         if self.pos.direction == "short":
             return mark_price >= stop_price
         return False
+
+    def _fixed_loss_stop_price_for(self, direction: str, avg_entry: float, total_sz: float) -> float:
+        """Return fixed-loss trigger price for a simulated candidate position."""
+        if not self.params.copy_fixed_loss_stop_enabled:
+            return 0.0
+        if avg_entry <= 0 or total_sz <= 0:
+            return 0.0
+        target_loss = self.params.copy_fixed_loss_stop_usdt
+        if target_loss <= 0:
+            target_loss = TRADING_ACCOUNT_TARGET * self.params.copy_fixed_loss_stop_ratio
+        if target_loss <= 0:
+            return 0.0
+        price_delta = target_loss / (total_sz * CT_VAL)
+        if direction == "long":
+            return avg_entry - price_delta
+        if direction == "short":
+            return avg_entry + price_delta
+        return 0.0
+
+    def _candidate_entry_totals(self, idx: int, price: float, sz: float) -> tuple[float, float]:
+        """Return average entry and size after adding/replacing a candidate batch."""
+        entries = [batch for batch in self.pos.filled if batch.idx != idx]
+        if self.pos.pending is not None and self.pos.pending.idx != idx:
+            entries.append(self.pos.pending)
+        entries.append(Batch(idx=idx, price=price, sz=sz))
+        total_sz = sum(batch.sz for batch in entries)
+        if total_sz <= 0:
+            return 0.0, 0.0
+        avg_entry = sum(batch.price * batch.sz for batch in entries) / total_sz
+        return avg_entry, total_sz
+
+    def _fixed_loss_head_buffer_allows(self, idx: int, price: float, sz: float) -> bool:
+        """Return whether a candidate add-on keeps fixed-loss stop beyond the head buffer."""
+        if not self.params.fixed_loss_head_buffer_enabled or idx <= 0:
+            return True
+        if self.pos.direction not in ("long", "short") or not self.pos.filled:
+            return True
+        head_price = sorted(self.pos.filled, key=lambda batch: batch.idx)[0].price
+        if head_price <= 0 or price <= 0 or sz <= 0:
+            return True
+        avg_entry, total_sz = self._candidate_entry_totals(idx, price, sz)
+        stop_price = self._fixed_loss_stop_price_for(self.pos.direction, avg_entry, total_sz)
+        if stop_price <= 0:
+            return True
+        if self.pos.direction == "long":
+            allowed = stop_price <= head_price * (1 - self.params.fixed_loss_head_buffer_pct)
+        else:
+            allowed = stop_price >= head_price * (1 + self.params.fixed_loss_head_buffer_pct)
+        if not allowed:
+            self.fixed_loss_head_buffer_block += 1
+        return allowed
 
     def _head_adverse_move_pct(self, mark_price: float) -> float:
         """Return adverse move from the first filled batch as a ratio."""
@@ -1146,6 +1247,8 @@ class LogReplay:
             return
         replacement = self._order_at(self.pos.pending.idx, float(row.price))
         if replacement is None:
+            if self.pos.pending is not None and self.pos.pending.idx > 0:
+                self.pos.pending = None
             return
         last = self.pos.last_filled()
         if last is not None and abs(replacement.price - last.price) < self._effective_entry_gap(float(row.price)):
@@ -1201,7 +1304,19 @@ class LogReplay:
         if idx == 0:
             return self.params.first_batch_ratio
         if idx == 1:
-            return self.params.second_batch_ratio
+            head = next((batch for batch in self.pos.filled if batch.idx == 0), None)
+            if head is None or head.price <= 0 or self.params.second_batch_dynamic_full_gap_usd <= 0:
+                return 0.0
+            gap = abs(price - head.price)
+            ratio = (
+                self.params.second_batch_dynamic_base_ratio
+                * gap
+                / self.params.second_batch_dynamic_full_gap_usd
+            )
+            return min(
+                self.params.second_batch_dynamic_max_ratio,
+                max(self.params.second_batch_dynamic_min_ratio, ratio),
+            )
         filled = sorted(self.pos.filled, key=lambda batch: batch.idx)
         if len(filled) < 2:
             ratio = self.params.dynamic_base_ratio
@@ -1234,6 +1349,8 @@ class LogReplay:
         candidate_ratio = candidate_margin / equity
         if self._used_entry_ratio(exclude_idx=idx) + candidate_ratio > self.params.max_total_entry_ratio:
             self.skipped_entry_cap += 1
+            return None
+        if not self._fixed_loss_head_buffer_allows(idx, round(price, 2), sz):
             return None
         return Batch(idx=idx, price=round(price, 2), sz=sz)
 
@@ -1378,12 +1495,45 @@ class LogReplay:
     def _risk_adjusted_score(self, total_pnl: float, max_dd_pct: float, end_unrealized: float) -> float:
         """Return a balanced score for risk-aware parameter ranking."""
         min_liq = self.min_liq_distance_pct if self.min_liq_distance_pct != 999.0 else 99.0
-        liq_penalty = max(0.0, 2.0 - min_liq) * 60.0
         wipeout_penalty = 1000.0 if self.wipeout_risk else 0.0
-        drawdown_penalty = max_dd_pct * 5.0
+        if min_liq <= 0:
+            liq_penalty = 1000.0
+        elif min_liq < 0.5:
+            liq_penalty = 240.0 + (0.5 - min_liq) * 300.0
+        elif min_liq < 1.0:
+            liq_penalty = 80.0 + (1.0 - min_liq) * 320.0
+        elif min_liq < 1.5:
+            liq_penalty = (1.5 - min_liq) * 120.0
+        else:
+            liq_penalty = 0.0
+        drawdown_penalty = max_dd_pct * 4.0
         open_loss_penalty = abs(min(0.0, end_unrealized)) * 1.2
         skip_penalty = (self.skipped_entry_cap + self.skipped_funds) * 0.05
-        return round(total_pnl - drawdown_penalty - liq_penalty - wipeout_penalty - open_loss_penalty - skip_penalty, 4)
+        stop_penalty = self.disaster_stop * 30.0 + self.fixed_loss_stop * 50.0
+        low_trade_penalty = max(0, 8 - len(self.trades)) * 10.0
+        return round(
+            total_pnl
+            - drawdown_penalty
+            - liq_penalty
+            - wipeout_penalty
+            - open_loss_penalty
+            - skip_penalty
+            - stop_penalty
+            - low_trade_penalty,
+            4,
+        )
+
+    def _risk_quality_score(self, max_dd_pct: float) -> float:
+        """Return a risk-only score where higher means safer."""
+        min_liq = self.min_liq_distance_pct if self.min_liq_distance_pct != 999.0 else 99.0
+        return round(
+            min_liq * 100.0
+            - max_dd_pct * 5.0
+            - self.disaster_stop * 80.0
+            - self.fixed_loss_stop * 100.0
+            - (1000.0 if self.wipeout_risk else 0.0),
+            4,
+        )
 
     def report(self) -> dict:
         """Return one summary row."""
@@ -1400,6 +1550,7 @@ class LogReplay:
         max_drawdown_pct = round(max_dd * 100, 4)
         min_liq = round(self.min_liq_distance_pct if self.min_liq_distance_pct != 999.0 else 0.0, 4)
         balanced_score = self._risk_adjusted_score(total_pnl, max_drawdown_pct, end_unrealized)
+        risk_score = self._risk_quality_score(max_drawdown_pct)
         durations = [
             (pd.Timestamp(trade.exit_time) - pd.Timestamp(trade.entry_time)).total_seconds() / 60
             for trade in self.trades
@@ -1414,7 +1565,10 @@ class LogReplay:
             "min_entry_gap_usd": self.params.min_entry_gap_usd,
             "reprice_gap_usd": self.params.reprice_gap_usd,
             "first_batch_ratio": self.params.first_batch_ratio,
-            "second_batch_ratio": self.params.second_batch_ratio,
+            "second_batch_dynamic_base_ratio": self.params.second_batch_dynamic_base_ratio,
+            "second_batch_dynamic_min_ratio": self.params.second_batch_dynamic_min_ratio,
+            "second_batch_dynamic_max_ratio": self.params.second_batch_dynamic_max_ratio,
+            "second_batch_dynamic_full_gap_usd": self.params.second_batch_dynamic_full_gap_usd,
             "dynamic_base_ratio": self.params.dynamic_base_ratio,
             "dynamic_min_ratio": self.params.dynamic_min_ratio,
             "dynamic_max_ratio": self.params.dynamic_max_ratio,
@@ -1423,6 +1577,8 @@ class LogReplay:
             "boll_width_base_usd": self.params.boll_width_base_usd,
             "boll_width_floor_usd": self.params.boll_width_floor_usd,
             "boll_width_gap_mult": self.params.boll_width_gap_mult,
+            "boll_width_tp_space_enabled": self.params.boll_width_tp_space_enabled,
+            "boll_width_tp_space_mult": self.params.boll_width_tp_space_mult,
             "tp_target_margin_return": self.params.tp_target_margin_return,
             "min_head_liq_buffer_pct": self.params.min_head_liq_buffer_pct,
             "dynamic_tp_enabled": self.params.dynamic_tp_enabled,
@@ -1439,6 +1595,8 @@ class LogReplay:
             "copy_fixed_loss_stop_enabled": self.params.copy_fixed_loss_stop_enabled,
             "copy_fixed_loss_stop_usdt": self.params.copy_fixed_loss_stop_usdt,
             "copy_fixed_loss_stop_ratio": self.params.copy_fixed_loss_stop_ratio,
+            "fixed_loss_head_buffer_enabled": self.params.fixed_loss_head_buffer_enabled,
+            "fixed_loss_head_buffer_pct": self.params.fixed_loss_head_buffer_pct,
             "disaster_stop_enabled": self.params.disaster_stop_enabled,
             "disaster_head_drop_pct": self.params.disaster_head_drop_pct,
             "disaster_loss_ratio": self.params.disaster_loss_ratio,
@@ -1476,6 +1634,7 @@ class LogReplay:
             "total_pnl": total_pnl,
             "return_pct": round((self.total_equity() / self.initial_total - 1) * 100, 4),
             "balanced_score": balanced_score,
+            "risk_score": risk_score,
             "max_drawdown_pct": max_drawdown_pct,
             "min_liq_distance_pct": min_liq,
             "wipeout_risk": self.wipeout_risk,
@@ -1499,6 +1658,7 @@ class LogReplay:
             "blocked_gap": self.blocked_gap,
             "blocked_extreme": self.blocked_extreme,
             "blocked_addon_guard": self.blocked_addon_guard,
+            "fixed_loss_head_buffer_block": self.fixed_loss_head_buffer_block,
             "cross_copy_stop": self.cross_copy_stop,
             "fixed_loss_stop": self.fixed_loss_stop,
             "disaster_stop": self.disaster_stop,
@@ -1552,6 +1712,38 @@ def parse_logs(log_dir: Path, sample_sec: int = 0) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def _log_cache_key(log_dir: Path, sample_sec: int) -> str:
+    """Return a stable cache key for log files and sampling settings."""
+    import hashlib
+
+    digest = hashlib.sha1()
+    digest.update(str(log_dir.resolve()).encode("utf-8", errors="ignore"))
+    digest.update(f"|sample={sample_sec}|".encode())
+    for path in sorted(log_dir.glob("boll_pin_*.log")):
+        stat = path.stat()
+        digest.update(path.name.encode("utf-8", errors="ignore"))
+        digest.update(str(stat.st_size).encode())
+        digest.update(str(int(stat.st_mtime_ns)).encode())
+    return digest.hexdigest()[:16]
+
+
+def load_or_parse_logs(log_dir: Path, sample_sec: int, cache_dir: Path | None, quiet: bool) -> pd.DataFrame:
+    """Load parsed ticks from cache when possible, otherwise parse and cache."""
+    if cache_dir is None:
+        return parse_logs(log_dir, sample_sec=sample_sec)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"ticks_{_log_cache_key(log_dir, sample_sec)}.pkl"
+    if cache_path.exists():
+        if not quiet:
+            print(f"Loading parsed tick cache: {cache_path}", flush=True)
+        return pd.read_pickle(cache_path)
+    ticks = parse_logs(log_dir, sample_sec=sample_sec)
+    ticks.to_pickle(cache_path)
+    if not quiet:
+        print(f"Saved parsed tick cache: {cache_path}", flush=True)
+    return ticks
+
+
 def parse_float_list(text: str) -> list[float]:
     """Parse comma-separated floats or start:end:step ranges."""
     text = text.strip()
@@ -1582,64 +1774,71 @@ def build_grid(args) -> list[Params]:
 def _param_value_lists(args) -> list[list[float] | list[int]]:
     """Return parsed parameter value lists in Params field order."""
     return [
-        parse_float_list(args.boll_std),
-        parse_float_list(args.min_width_usd),
-        parse_float_list(args.min_boll_width_pct),
+        [SOURCE_BOLL_STD],
+        [MIN_BOLL_WIDTH_USD],
+        [MIN_BOLL_WIDTH_PCT],
         parse_float_list(args.min_entry_gap_usd),
-        parse_float_list(args.reprice_gap_usd),
-        parse_int_list(args.entry_max_width_enabled),
+        [REPRICE_GAP_USD],
+        [int(ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED)],
         parse_float_list(args.entry_max_width_pct),
-        parse_float_list(args.entry_max_width_usd),
+        [ENTRY_MAX_BOLL_WIDTH_USD],
         parse_float_list(args.first_batch_ratio),
-        parse_float_list(args.second_batch_ratio),
+        parse_float_list(args.second_batch_dynamic_base_ratio),
+        parse_float_list(args.second_batch_dynamic_min_ratio),
+        parse_float_list(args.second_batch_dynamic_max_ratio),
+        parse_float_list(args.second_batch_dynamic_full_gap_usd),
         parse_float_list(args.dynamic_base_ratio),
         parse_float_list(args.dynamic_min_ratio),
         parse_float_list(args.dynamic_max_ratio),
         parse_float_list(args.max_total_entry_ratio),
-        parse_float_list(args.boll_width_base_price),
-        parse_float_list(args.boll_width_base_usd),
-        parse_float_list(args.boll_width_floor_usd),
-        parse_float_list(args.boll_width_gap_mult),
+        [BOLL_WIDTH_BASE_PRICE],
+        [BOLL_WIDTH_BASE_USD],
+        [MIN_BOLL_WIDTH_FLOOR_USD],
+        [BOLL_WIDTH_GAP_MULT],
+        [int(BOLL_WIDTH_TP_SPACE_ENABLED)],
+        parse_float_list(args.boll_width_tp_space_mult),
         parse_float_list(args.tp_target_margin_return),
-        parse_float_list(args.min_head_liq_buffer_pct),
-        parse_int_list(args.dynamic_tp_enabled),
-        parse_float_list(args.dynamic_tp_arm_return),
-        parse_float_list(args.dynamic_tp_restore_return),
-        parse_float_list(args.dynamic_tp_reprice_gap_usd),
-        parse_int_list(args.boll_tp_compression_enabled),
-        parse_float_list(args.boll_tp_compression_min_return),
-        parse_float_list(args.boll_tp_compression_exit_offset_usd),
-        parse_int_list(args.entry_extreme_gap_adjust_enabled),
-        parse_float_list(args.entry_extreme_gap_base_pct),
-        parse_float_list(args.entry_extreme_gap_full_pct),
-        parse_float_list(args.entry_extreme_gap_max_mult),
-        parse_int_list(args.copy_fixed_loss_stop_enabled),
-        parse_float_list(args.copy_fixed_loss_stop_usdt),
+        [MIN_HEAD_LIQ_BUFFER_PCT],
+        [int(DYNAMIC_TP_ENABLED)],
+        [DYNAMIC_TP_ARM_RETURN],
+        [DYNAMIC_TP_RESTORE_RETURN],
+        [DYNAMIC_TP_REPRICE_GAP_USD],
+        [int(BOLL_TP_COMPRESSION_ENABLED)],
+        [BOLL_TP_COMPRESSION_MIN_RETURN],
+        [BOLL_TP_COMPRESSION_EXIT_OFFSET_USD],
+        [int(ENTRY_EXTREME_GAP_ADJUST_ENABLED)],
+        [ENTRY_EXTREME_GAP_BASE_PCT],
+        [ENTRY_EXTREME_GAP_FULL_PCT],
+        [ENTRY_EXTREME_GAP_MAX_MULT],
+        [int(COPY_FIXED_LOSS_STOP_ENABLED)],
+        [COPY_FIXED_LOSS_STOP_USDT],
         parse_float_list(args.copy_fixed_loss_stop_ratio),
-        parse_int_list(args.disaster_stop_enabled),
+        [int(FIXED_LOSS_HEAD_BUFFER_ENABLED)],
+        parse_float_list(args.fixed_loss_head_buffer_pct),
+        [int(DISASTER_STOP_ENABLED)],
         parse_float_list(args.disaster_head_drop_pct),
         parse_float_list(args.disaster_loss_ratio),
-        parse_int_list(args.boll_trend_guard_enabled),
-        parse_int_list(args.boll_trend_guard_observe_enabled),
-        parse_int_list(args.boll_trend_guard_control_enabled),
-        parse_float_list(args.boll_trend_guard_head_adverse_pct),
-        parse_float_list(args.boll_trend_guard_width_expand),
-        parse_float_list(args.boll_trend_guard_width_pct),
-        parse_float_list(args.boll_trend_guard_slope_window_min),
-        parse_float_list(args.boll_trend_guard_min_hold_min),
-        parse_float_list(args.boll_trend_guard_z_mean),
-        parse_float_list(args.boll_trend_guard_slope_pct_per_hour),
-        parse_int_list(args.boll_trend_guard_stop_after_close),
-        parse_int_list(args.addon_dynamic_gap_enabled),
+        [int(BOLL_TREND_GUARD_ENABLED)],
+        [int(BOLL_TREND_GUARD_OBSERVE_ENABLED)],
+        [int(BOLL_TREND_GUARD_CONTROL_ENABLED)],
+        [BOLL_TREND_GUARD_HEAD_ADVERSE_PCT],
+        [BOLL_TREND_GUARD_WIDTH_EXPAND],
+        [BOLL_TREND_GUARD_WIDTH_PCT],
+        [BOLL_TREND_GUARD_SLOPE_WINDOW_MIN],
+        [BOLL_TREND_GUARD_MIN_HOLD_MIN],
+        [BOLL_TREND_GUARD_Z_MEAN],
+        [BOLL_TREND_GUARD_SLOPE_PCT_PER_HOUR],
+        [int(BOLL_TREND_GUARD_STOP_AFTER_CLOSE)],
+        [int(ADDON_DYNAMIC_GAP_ENABLED)],
         parse_float_list(args.addon_dynamic_gap_max_usd),
-        parse_float_list(args.addon_dynamic_gap_boll_start),
-        parse_float_list(args.addon_dynamic_gap_boll_strong),
-        parse_float_list(args.addon_dynamic_gap_boll_max_mult),
-        parse_float_list(args.addon_dynamic_gap_head_start_pct),
-        parse_float_list(args.addon_dynamic_gap_head_strong_pct),
-        parse_float_list(args.addon_dynamic_gap_head_max_mult),
-        parse_int_list(args.addon_dynamic_gap_trend_klines),
-        parse_float_list(args.addon_dynamic_gap_trend_mult),
+        [ADDON_DYNAMIC_GAP_BOLL_START],
+        [ADDON_DYNAMIC_GAP_BOLL_STRONG],
+        [ADDON_DYNAMIC_GAP_BOLL_MAX_MULT],
+        [ADDON_DYNAMIC_GAP_HEAD_START_PCT],
+        [ADDON_DYNAMIC_GAP_HEAD_STRONG_PCT],
+        [ADDON_DYNAMIC_GAP_HEAD_MAX_MULT],
+        [ADDON_DYNAMIC_GAP_TREND_KLINES],
+        [ADDON_DYNAMIC_GAP_TREND_MULT],
     ]
 
 
@@ -1669,10 +1868,86 @@ def build_random_grid(args) -> list[Params]:
     return params
 
 
+def build_optuna_rows(
+    ticks: pd.DataFrame,
+    args,
+    baseline_params: Params,
+    initial_total: float,
+) -> list[dict]:
+    """Run a TPE/Optuna search and return replay reports."""
+    try:
+        import optuna
+    except ImportError as exc:
+        raise RuntimeError(
+            "Optuna is not installed. Run `pip install -r requirements.txt` "
+            "inside the project virtual environment, then retry."
+        ) from exc
+
+    value_lists = _param_value_lists(args)
+    param_names = [item.name for item in fields(Params)]
+    if len(param_names) != len(value_lists):
+        raise RuntimeError("Params fields and optimizer value lists are out of sync")
+
+    reports: list[dict] = []
+    seen: set[Params] = set()
+
+    def replay(params: Params) -> dict:
+        report = LogReplay(ticks, params, initial_total).run().report()
+        reports.append(report)
+        seen.add(params)
+        return report
+
+    baseline_report = replay(baseline_params)
+    optuna.logging.set_verbosity(optuna.logging.WARNING if args.quiet else optuna.logging.INFO)
+    sampler = optuna.samplers.TPESampler(
+        seed=int(args.random_seed),
+        n_startup_trials=max(1, int(args.optuna_startup_trials)),
+    )
+    study = optuna.create_study(direction="maximize", sampler=sampler)
+
+    def objective(trial) -> float:
+        values = {}
+        for name, candidates in zip(param_names, value_lists):
+            if len(candidates) == 1:
+                values[name] = candidates[0]
+            else:
+                values[name] = trial.suggest_categorical(name, candidates)
+        params = Params(**values)
+        if params in seen:
+            return float(baseline_report["balanced_score"]) - 1e-9
+        return float(replay(params)["balanced_score"])
+
+    if not args.quiet:
+        print(
+            f"Starting Optuna TPE search for {args.optuna_trials} trials "
+            f"(startup={args.optuna_startup_trials})...",
+            flush=True,
+        )
+    study.optimize(
+        objective,
+        n_trials=max(1, int(args.optuna_trials)),
+        show_progress_bar=not args.quiet,
+    )
+    return reports
+
+
+def params_from_rows(rows: list[dict], top_n: int) -> list[Params]:
+    """Return unique Params rebuilt from top report rows."""
+    params: list[Params] = []
+    seen: set[Params] = set()
+    for row in rows[: max(1, top_n)]:
+        param = params_from_report_row(row)
+        if param in seen:
+            continue
+        seen.add(param)
+        params.append(param)
+    return params
+
+
 def current_config_params(args) -> Params:
     """Return a baseline Params object from the current live config values."""
     return Params(
-        boll_std=parse_float_list(args.boll_std)[0],
+        boll_std=SOURCE_BOLL_STD,
         min_width_usd=MIN_BOLL_WIDTH_USD,
         min_width_pct=MIN_BOLL_WIDTH_PCT,
         min_entry_gap_usd=MIN_ENTRY_GAP_USD,
@@ -1681,7 +1956,10 @@ def current_config_params(args) -> Params:
         entry_max_width_pct=ENTRY_MAX_BOLL_WIDTH_PCT,
         entry_max_width_usd=ENTRY_MAX_BOLL_WIDTH_USD,
         first_batch_ratio=FIRST_BATCH_RATIO,
-        second_batch_ratio=SECOND_BATCH_RATIO,
+        second_batch_dynamic_base_ratio=SECOND_BATCH_DYNAMIC_BASE_RATIO,
+        second_batch_dynamic_min_ratio=SECOND_BATCH_DYNAMIC_MIN_RATIO,
+        second_batch_dynamic_max_ratio=SECOND_BATCH_DYNAMIC_MAX_RATIO,
+        second_batch_dynamic_full_gap_usd=SECOND_BATCH_DYNAMIC_FULL_GAP_USD,
         dynamic_base_ratio=DYNAMIC_BASE_ENTRY_RATIO,
         dynamic_min_ratio=DYNAMIC_MIN_ENTRY_RATIO,
         dynamic_max_ratio=DYNAMIC_MAX_ENTRY_RATIO,
@@ -1690,6 +1968,8 @@ def current_config_params(args) -> Params:
         boll_width_base_usd=BOLL_WIDTH_BASE_USD,
         boll_width_floor_usd=MIN_BOLL_WIDTH_FLOOR_USD,
         boll_width_gap_mult=BOLL_WIDTH_GAP_MULT,
+        boll_width_tp_space_enabled=int(BOLL_WIDTH_TP_SPACE_ENABLED),
+        boll_width_tp_space_mult=BOLL_WIDTH_TP_SPACE_MULT,
         tp_target_margin_return=TP_TARGET_MARGIN_RETURN,
         min_head_liq_buffer_pct=MIN_HEAD_LIQ_BUFFER_PCT,
         dynamic_tp_enabled=int(DYNAMIC_TP_ENABLED),
@@ -1706,6 +1986,8 @@ def current_config_params(args) -> Params:
         copy_fixed_loss_stop_enabled=int(COPY_FIXED_LOSS_STOP_ENABLED),
         copy_fixed_loss_stop_usdt=COPY_FIXED_LOSS_STOP_USDT,
         copy_fixed_loss_stop_ratio=COPY_FIXED_LOSS_STOP_RATIO,
+        fixed_loss_head_buffer_enabled=int(FIXED_LOSS_HEAD_BUFFER_ENABLED),
+        fixed_loss_head_buffer_pct=FIXED_LOSS_HEAD_BUFFER_PCT,
         disaster_stop_enabled=int(DISASTER_STOP_ENABLED),
         disaster_head_drop_pct=DISASTER_HEAD_DROP_PCT,
         disaster_loss_ratio=DISASTER_LOSS_RATIO,
@@ -1804,7 +2086,10 @@ def params_from_report_row(row: dict) -> Params:
         entry_max_width_pct=row["entry_max_width_pct"],
         entry_max_width_usd=row["entry_max_width_usd"],
         first_batch_ratio=row["first_batch_ratio"],
-        second_batch_ratio=row["second_batch_ratio"],
+        second_batch_dynamic_base_ratio=row.get("second_batch_dynamic_base_ratio", SECOND_BATCH_DYNAMIC_BASE_RATIO),
+        second_batch_dynamic_min_ratio=row.get("second_batch_dynamic_min_ratio", SECOND_BATCH_DYNAMIC_MIN_RATIO),
+        second_batch_dynamic_max_ratio=row.get("second_batch_dynamic_max_ratio", SECOND_BATCH_DYNAMIC_MAX_RATIO),
+        second_batch_dynamic_full_gap_usd=row.get("second_batch_dynamic_full_gap_usd", SECOND_BATCH_DYNAMIC_FULL_GAP_USD),
         dynamic_base_ratio=row["dynamic_base_ratio"],
         dynamic_min_ratio=row["dynamic_min_ratio"],
         dynamic_max_ratio=row["dynamic_max_ratio"],
@@ -1813,6 +2098,8 @@ def params_from_report_row(row: dict) -> Params:
         boll_width_base_usd=row["boll_width_base_usd"],
         boll_width_floor_usd=row["boll_width_floor_usd"],
         boll_width_gap_mult=row["boll_width_gap_mult"],
+        boll_width_tp_space_enabled=row.get("boll_width_tp_space_enabled", int(BOLL_WIDTH_TP_SPACE_ENABLED)),
+        boll_width_tp_space_mult=row.get("boll_width_tp_space_mult", BOLL_WIDTH_TP_SPACE_MULT),
         tp_target_margin_return=row["tp_target_margin_return"],
         min_head_liq_buffer_pct=row["min_head_liq_buffer_pct"],
         dynamic_tp_enabled=row["dynamic_tp_enabled"],
@@ -1829,6 +2116,8 @@ def params_from_report_row(row: dict) -> Params:
         copy_fixed_loss_stop_enabled=row["copy_fixed_loss_stop_enabled"],
         copy_fixed_loss_stop_usdt=row["copy_fixed_loss_stop_usdt"],
         copy_fixed_loss_stop_ratio=row["copy_fixed_loss_stop_ratio"],
+        fixed_loss_head_buffer_enabled=row.get("fixed_loss_head_buffer_enabled", int(FIXED_LOSS_HEAD_BUFFER_ENABLED)),
+        fixed_loss_head_buffer_pct=row.get("fixed_loss_head_buffer_pct", FIXED_LOSS_HEAD_BUFFER_PCT),
         disaster_stop_enabled=row["disaster_stop_enabled"],
         disaster_head_drop_pct=row["disaster_head_drop_pct"],
         disaster_loss_ratio=row["disaster_loss_ratio"],
@@ -1887,9 +2176,19 @@ def run_walk_forward(
                 "rank": rank,
                 "robustness_score": robustness_score,
                 "min_width_pct": row["min_width_pct"],
+                "entry_max_width_pct": row["entry_max_width_pct"],
                 "min_entry_gap_usd": row["min_entry_gap_usd"],
                 "boll_width_gap_mult": row["boll_width_gap_mult"],
-                "first_second": f"{row['first_batch_ratio']}/{row['second_batch_ratio']}",
+                "boll_width_tp_space_mult": row["boll_width_tp_space_mult"],
+                "first_batch_ratio": row["first_batch_ratio"],
+                "max_total_entry_ratio": row["max_total_entry_ratio"],
+                "head_second_dynamic": (
+                    f"{row['first_batch_ratio']} | "
+                    f"{row['second_batch_dynamic_base_ratio']}/"
+                    f"{row['second_batch_dynamic_min_ratio']}/"
+                    f"{row['second_batch_dynamic_max_ratio']}/"
+                    f"{row['second_batch_dynamic_full_gap_usd']}"
+                ),
                 "dynamic_ratios": f"{row['dynamic_base_ratio']}/{row['dynamic_min_ratio']}/{row['dynamic_max_ratio']}",
                 "train_score": train_row["balanced_score"],
                 "train_pnl": train_row["total_pnl"],
@@ -1909,6 +2208,28 @@ def run_walk_forward(
 def _metric_delta(best: dict, baseline: dict, key: str) -> float:
     """Return best minus baseline for a numeric report metric."""
     return round(float(best.get(key, 0.0)) - float(baseline.get(key, 0.0)), 4)
+
+
+def _markdown_param_rows(rows: list[dict], limit: int = 10) -> list[str]:
+    """Return compact Markdown rows for parameter rankings."""
+    lines: list[str] = []
+    for idx, row in enumerate(rows[:limit], start=1):
+        lines.append(
+            f"|{idx}|{row['balanced_score']}|{row['risk_score']}|{row['total_pnl']}|"
+            f"{row['max_drawdown_pct']}|{row['min_liq_distance_pct']}|{row['wipeout_risk']}|"
+            f"{row['entry_max_width_pct']}|{row['min_entry_gap_usd']}|"
+            f"{row['boll_width_tp_space_mult']}|{row['first_batch_ratio']}/"
+            f"{row['max_total_entry_ratio']}|"
+            f"{row['second_batch_dynamic_base_ratio']}/"
+            f"{row['second_batch_dynamic_min_ratio']}/"
+            f"{row['second_batch_dynamic_max_ratio']}/"
+            f"{row['second_batch_dynamic_full_gap_usd']}|"
+            f"{row['dynamic_base_ratio']}/{row['dynamic_min_ratio']}/{row['dynamic_max_ratio']}|"
+            f"{row['copy_fixed_loss_stop_ratio']}/{row['disaster_head_drop_pct']}/"
+            f"{row['disaster_loss_ratio']}|{row['addon_dynamic_gap_max_usd']}|"
+            f"{row['trades']}|{row['disaster_stop']}|{row['fixed_loss_stop']}|"
+        )
+    return lines
 
 
 def write_markdown_report(
@@ -1931,17 +2252,22 @@ def write_markdown_report(
             f"- Cross copy protection: enabled={CROSS_COPY_PROTECT_ENABLED}, "
             f"protected={CROSS_COPY_PROTECT_EQUITY_USDT:.2f} USDT"
         ),
-        "- Sizing model: live cross-copy sizing, max total entry ratio cap, and completed-candle add-on guard",
+        "- Sizing model: live cross-copy sizing, max total entry ratio cap, second-batch dynamic sizing, and add-on guards",
         "",
         "## Best Balanced Parameters",
         "",
         (
-            f"`MIN_BOLL_WIDTH_PCT={best['min_width_pct']}`, "
             f"`ENTRY_MAX_BOLL_WIDTH={bool(best['entry_max_width_enabled'])}/"
             f"{best['entry_max_width_pct']}/{best['entry_max_width_usd']}`, "
             f"`MIN_ENTRY_GAP_USD={best['min_entry_gap_usd']}`, "
-            f"`BOLL_WIDTH_GAP_MULT={best['boll_width_gap_mult']}`, "
-            f"`FIRST_BATCH_RATIO={best['first_batch_ratio']}`, `SECOND_BATCH_RATIO={best['second_batch_ratio']}`, "
+            f"`BOLL_WIDTH_TP_SPACE_MULT={best['boll_width_tp_space_mult']}`, "
+            f"`FIRST_BATCH_RATIO={best['first_batch_ratio']}`, "
+            f"`MAX_TOTAL_ENTRY_RATIO={best['max_total_entry_ratio']}`, "
+            f"`SECOND_BATCH_DYNAMIC="
+            f"{best['second_batch_dynamic_base_ratio']}/"
+            f"{best['second_batch_dynamic_min_ratio']}/"
+            f"{best['second_batch_dynamic_max_ratio']}/"
+            f"{best['second_batch_dynamic_full_gap_usd']}`, "
             f"`DYNAMIC_BASE_ENTRY_RATIO={best['dynamic_base_ratio']}`, "
             f"`DYNAMIC_MIN_ENTRY_RATIO={best['dynamic_min_ratio']}`, "
             f"`DYNAMIC_MAX_ENTRY_RATIO={best['dynamic_max_ratio']}`, "
@@ -1951,12 +2277,7 @@ def write_markdown_report(
             f"`DISASTER_STOP_ENABLED={bool(best['disaster_stop_enabled'])}`, "
             f"`DISASTER_HEAD_DROP_PCT={best['disaster_head_drop_pct']}`, "
             f"`DISASTER_LOSS_RATIO={best['disaster_loss_ratio']}`, "
-            f"`BOLL_TREND_GUARD=observe:{bool(best['boll_trend_guard_observe_enabled'])}/"
-            f"control:{bool(best['boll_trend_guard_control_enabled'] or best['boll_trend_guard_enabled'])}/"
-            f"{best['boll_trend_guard_head_adverse_pct']}/"
-            f"{best['boll_trend_guard_width_expand']}/"
-            f"{best['boll_trend_guard_width_pct']}/"
-            f"{best['boll_trend_guard_slope_pct_per_hour']}`"
+            f"`ADDON_DYNAMIC_GAP_MAX_USD={best['addon_dynamic_gap_max_usd']}`"
         ),
         "",
         (
@@ -1969,12 +2290,17 @@ def write_markdown_report(
         "## Current Config Baseline",
         "",
         (
-            f"`MIN_BOLL_WIDTH_PCT={baseline_row['min_width_pct']}`, "
             f"`ENTRY_MAX={bool(baseline_row['entry_max_width_enabled'])}/"
             f"{baseline_row['entry_max_width_pct']}/{baseline_row['entry_max_width_usd']}`, "
             f"`MIN_ENTRY_GAP_USD={baseline_row['min_entry_gap_usd']}`, "
-            f"`BOLL_WIDTH_GAP_MULT={baseline_row['boll_width_gap_mult']}`, "
-            f"`FIRST/SECOND={baseline_row['first_batch_ratio']}/{baseline_row['second_batch_ratio']}`, "
+            f"`BOLL_WIDTH_TP_SPACE_MULT={baseline_row['boll_width_tp_space_mult']}`, "
+            f"`HEAD={baseline_row['first_batch_ratio']}`, "
+            f"`MAX_TOTAL={baseline_row['max_total_entry_ratio']}`, "
+            f"`SECOND_DYNAMIC="
+            f"{baseline_row['second_batch_dynamic_base_ratio']}/"
+            f"{baseline_row['second_batch_dynamic_min_ratio']}/"
+            f"{baseline_row['second_batch_dynamic_max_ratio']}/"
+            f"{baseline_row['second_batch_dynamic_full_gap_usd']}`, "
             f"`DYNAMIC={baseline_row['dynamic_base_ratio']}/{baseline_row['dynamic_min_ratio']}/{baseline_row['dynamic_max_ratio']}`"
         ),
         "",
@@ -2005,28 +2331,32 @@ def write_markdown_report(
         "",
         "## Top 20",
         "",
-        "|#|Score|PnL|DD|MinLiq|Wipeout|WidthPct|Entry Gap|Width Gap Mult|First/Second|Dyn Base/Min/Max|Head Buffer|Fixed Stop|Disaster|BTG|Trades|Signals|Guard Block|Cross Stop|FStop|DStop|BTG Signal|BTG Stop|",
-        "|-:|-:|-:|-:|-:|-|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|",
+        "|#|Score|Risk|PnL|DD|MinLiq|Wipeout|EntryMax|Entry Gap|TPSpace|Head/Cap|Second Dyn|Later Dyn|Fix/Disaster|AddonGap|Trades|DStop|FStop|",
+        "|-:|-:|-:|-:|-:|-:|-|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|",
     ]
-    for idx, row in enumerate(rows[:20], start=1):
-        lines.append(
-            f"|{idx}|{row['balanced_score']}|{row['total_pnl']}|{row['max_drawdown_pct']}|"
-            f"{row['min_liq_distance_pct']}|{row['wipeout_risk']}|"
-            f"{row['min_width_pct']}|"
-            f"{row['min_entry_gap_usd']}|"
-            f"{row['boll_width_gap_mult']}|"
-            f"{row['first_batch_ratio']}/{row['second_batch_ratio']}|"
-            f"{row['dynamic_base_ratio']}/{row['dynamic_min_ratio']}/{row['dynamic_max_ratio']}|"
-            f"{row['min_head_liq_buffer_pct']}|"
-            f"{row['copy_fixed_loss_stop_enabled']}/{row['copy_fixed_loss_stop_usdt']}/{row['copy_fixed_loss_stop_ratio']}|"
-            f"{row['disaster_stop_enabled']}/{row['disaster_head_drop_pct']}/{row['disaster_loss_ratio']}|"
-            f"O{row['boll_trend_guard_observe_enabled']}/C{row['boll_trend_guard_control_enabled'] or row['boll_trend_guard_enabled']}/"
-            f"{row['boll_trend_guard_head_adverse_pct']}/{row['boll_trend_guard_width_expand']}/"
-            f"{row['boll_trend_guard_width_pct']}/{row['boll_trend_guard_slope_pct_per_hour']}|"
-            f"{row['trades']}|{row['entry_signals']}|{row['blocked_addon_guard']}|"
-            f"{row['cross_copy_stop']}|{row['fixed_loss_stop']}|{row['disaster_stop']}|"
-            f"{row['boll_trend_guard_signal']}|{row['boll_trend_guard_stop']}|"
-        )
+    lines.extend(_markdown_param_rows(rows, 20))
+    profit_rows = sorted(rows, key=lambda row: (row["total_pnl"], row["min_liq_distance_pct"]), reverse=True)
+    risk_rows = sorted(
+        [row for row in rows if row["total_pnl"] > 0],
+        key=lambda row: (row["risk_score"], row["total_pnl"]),
+        reverse=True,
+    )
+    lines.extend(
+        [
+            "",
+            "## Highest Profit Top 10",
+            "",
+            "|#|Score|Risk|PnL|DD|MinLiq|Wipeout|EntryMax|Entry Gap|TPSpace|Head/Cap|Second Dyn|Later Dyn|Fix/Disaster|AddonGap|Trades|DStop|FStop|",
+            "|-:|-:|-:|-:|-:|-:|-|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|",
+            *_markdown_param_rows(profit_rows, 10),
+            "",
+            "## Safest Positive-PnL Top 10",
+            "",
+            "|#|Score|Risk|PnL|DD|MinLiq|Wipeout|EntryMax|Entry Gap|TPSpace|Head/Cap|Second Dyn|Later Dyn|Fix/Disaster|AddonGap|Trades|DStop|FStop|",
+            "|-:|-:|-:|-:|-:|-:|-|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|",
+            *_markdown_param_rows(risk_rows, 10),
+        ]
+    )
     if walk_forward_rows:
         lines.extend(
             [
@@ -2034,15 +2364,15 @@ def write_markdown_report(
                 "",
                 "Top-ranked full-sample parameters are replayed on the earlier training segment and later validation segment.",
                 "",
-                "|Rank|Robust|WidthPct|Entry Gap|Width Gap Mult|First/Second|Dyn Base/Min/Max|Train PnL|Train DD|Train Trades|Val PnL|Val DD|Val Trades|Val DStop|Val Wipeout|",
+                "|Rank|Robust|EntryMax|Entry Gap|TPSpace|Head/SecondDyn|Dyn Base/Min/Max|Train PnL|Train DD|Train Trades|Val PnL|Val DD|Val Trades|Val DStop|Val Wipeout|",
                 "|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-|",
             ]
         )
         for row in walk_forward_rows:
             lines.append(
-                f"|{row['rank']}|{row['robustness_score']}|{row['min_width_pct']}|"
-                f"{row['min_entry_gap_usd']}|{row['boll_width_gap_mult']}|"
-                f"{row['first_second']}|{row['dynamic_ratios']}|"
+                f"|{row['rank']}|{row['robustness_score']}|{row['entry_max_width_pct']}|"
+                f"{row['min_entry_gap_usd']}|{row['boll_width_tp_space_mult']}|"
+                    f"{row['head_second_dynamic']}|{row['dynamic_ratios']}|"
                 f"{row['train_pnl']}|{row['train_dd']}|{row['train_trades']}|"
                 f"{row['val_pnl']}|{row['val_dd']}|{row['val_trades']}|"
                 f"{row['val_dstop']}|{row['val_wipeout']}|"
@@ -2054,7 +2384,8 @@ def write_markdown_report(
             "",
             "- This replay uses logged mark price and Bollinger snapshots, not order-book level fills.",
             "- It follows the current live cross-copy sizing: sizing equity = min(TRADING_ACCOUNT_TARGET, account equity - protected equity).",
-            "- It includes the completed-candle add-on guard: long add-ons must break the tracked low; short add-ons must break the tracked high.",
+            "- It includes the completed-candle extreme add-on guard: long add-ons must break the tracked low; short add-ons must break the tracked high.",
+            "- It optimizes first add-on dynamic sizing and later add-on dynamic sizing as separate parameter groups.",
             "- It includes the optional disaster stop: head-entry adverse move plus strategy-cycle unrealized loss against TRADING_ACCOUNT_TARGET.",
             "- It can optionally test BTG/Boll Trend Guard: adverse head-entry move plus Bollinger expansion and band-slope confirmation.",
             "- Config is changed only after manual confirmation in the selection prompt.",
@@ -2063,8 +2394,10 @@ def write_markdown_report(
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def _format_config_value(value: float, as_bool: bool = False) -> str:
+def _format_config_value(value: float | str, as_bool: bool = False) -> str:
     """Format a config value with stable Python syntax."""
+    if isinstance(value, str):
+        return repr(value)
     if as_bool:
         return "True" if int(float(value)) else "False"
     if float(value).is_integer():
@@ -2075,43 +2408,32 @@ def _format_config_value(value: float, as_bool: bool = False) -> str:
 def apply_params_to_config(row: dict, config_path: Path = CONFIG_PATH) -> Path:
     """Write selected optimizer parameters into ``src/config.py``."""
     replacements = {
-        "MIN_BOLL_WIDTH_PCT": row["min_width_pct"],
-        "ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED": row["entry_max_width_enabled"],
         "ENTRY_MAX_BOLL_WIDTH_PCT": row["entry_max_width_pct"],
-        "ENTRY_MAX_BOLL_WIDTH_USD": row["entry_max_width_usd"],
         "MIN_ENTRY_GAP_USD": row["min_entry_gap_usd"],
-        "BOLL_WIDTH_GAP_MULT": row["boll_width_gap_mult"],
+        "BOLL_WIDTH_TP_SPACE_MULT": row["boll_width_tp_space_mult"],
         "FIRST_BATCH_RATIO": row["first_batch_ratio"],
-        "SECOND_BATCH_RATIO": row["second_batch_ratio"],
+        "SECOND_BATCH_DYNAMIC_BASE_RATIO": row["second_batch_dynamic_base_ratio"],
+        "SECOND_BATCH_DYNAMIC_MIN_RATIO": row["second_batch_dynamic_min_ratio"],
+        "SECOND_BATCH_DYNAMIC_MAX_RATIO": row["second_batch_dynamic_max_ratio"],
+        "SECOND_BATCH_DYNAMIC_FULL_GAP_USD": row["second_batch_dynamic_full_gap_usd"],
         "DYNAMIC_BASE_ENTRY_RATIO": row["dynamic_base_ratio"],
         "DYNAMIC_MIN_ENTRY_RATIO": row["dynamic_min_ratio"],
         "DYNAMIC_MAX_ENTRY_RATIO": row["dynamic_max_ratio"],
-        "MIN_HEAD_LIQ_BUFFER_PCT": row["min_head_liq_buffer_pct"],
-        "DISASTER_STOP_ENABLED": row["disaster_stop_enabled"],
+        "MAX_TOTAL_ENTRY_RATIO": row["max_total_entry_ratio"],
+        "TP_TARGET_MARGIN_RETURN": row["tp_target_margin_return"],
+        "COPY_FIXED_LOSS_STOP_RATIO": row["copy_fixed_loss_stop_ratio"],
+        "FIXED_LOSS_HEAD_BUFFER_PCT": row["fixed_loss_head_buffer_pct"],
         "DISASTER_HEAD_DROP_PCT": row["disaster_head_drop_pct"],
         "DISASTER_LOSS_RATIO": row["disaster_loss_ratio"],
-        "ADDON_DYNAMIC_GAP_ENABLED": row["addon_dynamic_gap_enabled"],
         "ADDON_DYNAMIC_GAP_MAX_USD": row["addon_dynamic_gap_max_usd"],
-        "ADDON_DYNAMIC_GAP_BOLL_START": row["addon_dynamic_gap_boll_start"],
-        "ADDON_DYNAMIC_GAP_BOLL_STRONG": row["addon_dynamic_gap_boll_strong"],
-        "ADDON_DYNAMIC_GAP_BOLL_MAX_MULT": row["addon_dynamic_gap_boll_max_mult"],
-        "ADDON_DYNAMIC_GAP_HEAD_START_PCT": row["addon_dynamic_gap_head_start_pct"],
-        "ADDON_DYNAMIC_GAP_HEAD_STRONG_PCT": row["addon_dynamic_gap_head_strong_pct"],
-        "ADDON_DYNAMIC_GAP_HEAD_MAX_MULT": row["addon_dynamic_gap_head_max_mult"],
-        "ADDON_DYNAMIC_GAP_TREND_KLINES": row["addon_dynamic_gap_trend_klines"],
-        "ADDON_DYNAMIC_GAP_TREND_MULT": row["addon_dynamic_gap_trend_mult"],
     }
-    bool_keys = {
-        "DISASTER_STOP_ENABLED",
-        "ADDON_DYNAMIC_GAP_ENABLED",
-        "ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED",
-    }
+    bool_keys = set()
     text = config_path.read_text(encoding="utf-8")
     backup_path = config_path.with_suffix(".py.bak")
     backup_path.write_text(text, encoding="utf-8")
 
     for key, value in replacements.items():
-        pattern = re.compile(rf"^({key}\s*=\s*)(True|False|[-+]?\d+(?:\.\d+)?)(.*)$", re.MULTILINE)
+        pattern = re.compile(rf"^({key}\s*=\s*)(True|False|[-+]?\d+(?:\.\d+)?|[\"'][^\"']*[\"'])(.*)$", re.MULTILINE)
         text, count = pattern.subn(
             rf"\g<1>{_format_config_value(value, key in bool_keys)}\3",
             text,
@@ -2150,8 +2472,13 @@ def prompt_apply_params(rows: list[dict], top_n: int = 20) -> None:
         f"{selected['entry_max_width_pct']}/{selected['entry_max_width_usd']}, "
         f"MIN_ENTRY_GAP_USD={selected['min_entry_gap_usd']}, "
         f"BOLL_WIDTH_GAP_MULT={selected['boll_width_gap_mult']}, "
+        f"BOLL_WIDTH_TP_SPACE={bool(selected['boll_width_tp_space_enabled'])}/"
+        f"{selected['boll_width_tp_space_mult']}, "
         f"FIRST_BATCH_RATIO={selected['first_batch_ratio']}, "
-        f"SECOND_BATCH_RATIO={selected['second_batch_ratio']}, "
+        f"SECOND_BATCH_DYNAMIC={selected['second_batch_dynamic_base_ratio']}/"
+        f"{selected['second_batch_dynamic_min_ratio']}/"
+        f"{selected['second_batch_dynamic_max_ratio']}/"
+        f"{selected['second_batch_dynamic_full_gap_usd']}, "
         f"DYNAMIC_BASE_ENTRY_RATIO={selected['dynamic_base_ratio']}, "
         f"DYNAMIC_MIN_ENTRY_RATIO={selected['dynamic_min_ratio']}, "
         f"DYNAMIC_MAX_ENTRY_RATIO={selected['dynamic_max_ratio']}, "
@@ -2160,15 +2487,7 @@ def prompt_apply_params(rows: list[dict], top_n: int = 20) -> None:
         f"DISASTER_HEAD_DROP_PCT={selected['disaster_head_drop_pct']}, "
         f"DISASTER_LOSS_RATIO={selected['disaster_loss_ratio']}, "
         f"ADDON_DYNAMIC_GAP_ENABLED={bool(selected['addon_dynamic_gap_enabled'])}, "
-        f"ADDON_DYNAMIC_GAP_MAX_USD={selected['addon_dynamic_gap_max_usd']}, "
-        f"ADDON_DYNAMIC_GAP_BOLL={selected['addon_dynamic_gap_boll_start']}/"
-        f"{selected['addon_dynamic_gap_boll_strong']}/"
-        f"{selected['addon_dynamic_gap_boll_max_mult']}, "
-        f"ADDON_DYNAMIC_GAP_HEAD={selected['addon_dynamic_gap_head_start_pct']}/"
-        f"{selected['addon_dynamic_gap_head_strong_pct']}/"
-        f"{selected['addon_dynamic_gap_head_max_mult']}, "
-        f"ADDON_DYNAMIC_GAP_TREND={selected['addon_dynamic_gap_trend_klines']}/"
-        f"{selected['addon_dynamic_gap_trend_mult']}"
+        f"ADDON_DYNAMIC_GAP_MAX_USD={selected['addon_dynamic_gap_max_usd']}"
     )
     confirm = input("Type y to confirm: ").strip().lower()
     if confirm != "y":
@@ -2187,33 +2506,35 @@ def print_rankings(rows: list[dict], baseline_row: dict, top_n: int = 10) -> Non
     print("Best Balanced Parameters")
     print("=" * 108)
     print(
-        f"MIN_BOLL_WIDTH_PCT={best['min_width_pct']}  "
-        f"ENTRY_MAX_WIDTH={bool(best['entry_max_width_enabled'])}/"
-        f"{best['entry_max_width_pct']}/{best['entry_max_width_usd']}  "
+        f"ENTRY_MAX_WIDTH_PCT={best['entry_max_width_pct']}  "
         f"MIN_ENTRY_GAP_USD={best['min_entry_gap_usd']}  "
-        f"BOLL_WIDTH_GAP_MULT={best['boll_width_gap_mult']}  "
-        f"MIN_HEAD_LIQ_BUFFER_PCT={best['min_head_liq_buffer_pct']}"
+        f"BOLL_WIDTH_TP_SPACE_MULT={best['boll_width_tp_space_mult']}  "
+        f"TP_TARGET={best['tp_target_margin_return']}  "
+        f"ADDON_GAP_MAX={best['addon_dynamic_gap_max_usd']}"
     )
     print(
-        f"FIRST/SECOND={best['first_batch_ratio']}/{best['second_batch_ratio']}  "
+        f"HEAD={best['first_batch_ratio']}  "
+        f"MAX_TOTAL={best['max_total_entry_ratio']}  "
+        f"SECOND_DYNAMIC={best['second_batch_dynamic_base_ratio']}/"
+        f"{best['second_batch_dynamic_min_ratio']}/"
+        f"{best['second_batch_dynamic_max_ratio']}/"
+        f"{best['second_batch_dynamic_full_gap_usd']}  "
         f"DYNAMIC={best['dynamic_base_ratio']}/{best['dynamic_min_ratio']}/{best['dynamic_max_ratio']}"
     )
     print(
-        f"DISASTER_STOP={bool(best['disaster_stop_enabled'])}  "
-        f"HEAD_DROP={best['disaster_head_drop_pct']}  "
+        f"FIXED_LOSS_RATIO={best['copy_fixed_loss_stop_ratio']}  "
+        f"FIXED_HEAD_BUFFER={best['fixed_loss_head_buffer_pct']}  "
+        f"DISASTER_HEAD_DROP={best['disaster_head_drop_pct']}  "
         f"LOSS_RATIO={best['disaster_loss_ratio']}"
     )
     print(
-        f"FIXED_LOSS_STOP={bool(best['copy_fixed_loss_stop_enabled'])}  "
-        f"LOSS_USDT={best['copy_fixed_loss_stop_usdt']}  "
-        f"LOSS_RATIO={best['copy_fixed_loss_stop_ratio']}"
-    )
-    print(
-        f"BTG_OBSERVE={bool(best['boll_trend_guard_observe_enabled'])}  "
-        f"BTG_CONTROL={bool(best['boll_trend_guard_control_enabled'] or best['boll_trend_guard_enabled'])}  "
-        f"BTG_HEAD={best['boll_trend_guard_head_adverse_pct']}  "
-        f"BTG_EXPAND={best['boll_trend_guard_width_expand']}  "
-        f"BTG_WIDTH={best['boll_trend_guard_width_pct']}"
+        "Fixed live-only guards are replayed but not searched: "
+        f"dynamic-gap detail={best['addon_dynamic_gap_boll_start']}/"
+        f"{best['addon_dynamic_gap_boll_strong']}/"
+        f"{best['addon_dynamic_gap_boll_max_mult']} and "
+        f"{best['addon_dynamic_gap_head_start_pct']}/"
+        f"{best['addon_dynamic_gap_head_strong_pct']}/"
+        f"{best['addon_dynamic_gap_head_max_mult']}"
     )
     print(
         f"Score={best['balanced_score']:+.2f}  "
@@ -2229,12 +2550,16 @@ def print_rankings(rows: list[dict], baseline_row: dict, top_n: int = 10) -> Non
     print("Current config baseline")
     print("-" * 108)
     print(
-        f"WIDTH_PCT={baseline_row['min_width_pct']}  "
-        f"ENTRY_MAX={bool(baseline_row['entry_max_width_enabled'])}/"
-        f"{baseline_row['entry_max_width_pct']}/{baseline_row['entry_max_width_usd']}  "
+        f"ENTRY_MAX_WIDTH_PCT={baseline_row['entry_max_width_pct']}  "
         f"ENTRY_GAP={baseline_row['min_entry_gap_usd']}  "
-        f"GAP_MULT={baseline_row['boll_width_gap_mult']}  "
-        f"FIRST/SECOND={baseline_row['first_batch_ratio']}/{baseline_row['second_batch_ratio']}  "
+        f"TP_SPACE={baseline_row['boll_width_tp_space_mult']}  "
+        f"TP_TARGET={baseline_row['tp_target_margin_return']}  "
+        f"HEAD={baseline_row['first_batch_ratio']}  "
+        f"MAX_TOTAL={baseline_row['max_total_entry_ratio']}  "
+        f"SECOND_DYNAMIC={baseline_row['second_batch_dynamic_base_ratio']}/"
+        f"{baseline_row['second_batch_dynamic_min_ratio']}/"
+        f"{baseline_row['second_batch_dynamic_max_ratio']}/"
+        f"{baseline_row['second_batch_dynamic_full_gap_usd']}  "
         f"DYNAMIC={baseline_row['dynamic_base_ratio']}/{baseline_row['dynamic_min_ratio']}/{baseline_row['dynamic_max_ratio']}"
     )
     print(
@@ -2257,36 +2582,56 @@ def print_rankings(rows: list[dict], baseline_row: dict, top_n: int = 10) -> Non
     )
     print()
     print("Top balanced parameter comparison")
-    print("-" * 152)
-    print("Rank  Score     PnL USDT  DD     MinLiq  Wipeout  WidthPct  EntryMax  EntryGap  GapMult  First/Second  DynBase/Min/Max  HeadBuf  Guard  MaxW  Cross  FStop  DStop  BTGsig BTGst Trades  Signals")
-    print("-" * 152)
+    print("-" * 156)
+    print("Rank  Score     Risk     PnL USDT  DD     MinLiq  Wipeout  EntryMax  EntryGap  TPSpace  TP    Head/Cap   SecondDyn          LaterDyn       Fix/Disaster   AddonGap  Trades")
+    print("-" * 156)
     for idx, row in enumerate(rows[:top_n], start=1):
         dyn = f"{row['dynamic_base_ratio']:g}/{row['dynamic_min_ratio']:g}/{row['dynamic_max_ratio']:g}"
+        second_dyn = (
+            f"{row['second_batch_dynamic_base_ratio']:g}/"
+            f"{row['second_batch_dynamic_min_ratio']:g}/"
+            f"{row['second_batch_dynamic_max_ratio']:g}/"
+            f"{row['second_batch_dynamic_full_gap_usd']:g}"
+        )
         print(
             f"{idx:>2}  "
             f"{row['balanced_score']:>8.2f}  "
+            f"{row['risk_score']:>7.2f}  "
             f"{row['total_pnl']:>9.2f}  "
             f"{row['max_drawdown_pct']:>5.2f}%  "
             f"{row['min_liq_distance_pct']:>6.2f}%  "
             f"{str(row['wipeout_risk']):<7}  "
-            f"{row['min_width_pct']:<9.4f}"
             f"{row['entry_max_width_pct']:<9.4f}"
             f"{row['min_entry_gap_usd']:<9g}"
-            f"{row['boll_width_gap_mult']:<8g}"
-            f"{row['first_batch_ratio']:>5.2f}/{row['second_batch_ratio']:<5.2f}  "
-            f"{dyn:<16}"
-            f"{row['min_head_liq_buffer_pct']:<8.3f}"
-            f"{row['blocked_addon_guard']:<7}"
-            f"{row['blocked_entry_max_width']:<6}"
-            f"{row['cross_copy_stop']:<6}"
-            f"{row['fixed_loss_stop']:<7}"
-            f"{row['disaster_stop']:<7}"
-            f"{row['boll_trend_guard_signal']:<7}"
-            f"{row['boll_trend_guard_stop']:<6}"
-            f"{row['trades']:>3}  "
-            f"{row['entry_signals']:>7}"
+            f"{row['boll_width_tp_space_mult']:<9g}"
+            f"{row['tp_target_margin_return']:<6g}"
+            f"{row['first_batch_ratio']:g}/{row['max_total_entry_ratio']:<8g}"
+            f"{second_dyn:<19}"
+            f"{dyn:<15}"
+            f"{row['copy_fixed_loss_stop_ratio']:g}/"
+            f"{row['disaster_head_drop_pct']:g}/"
+            f"{row['disaster_loss_ratio']:<9g}"
+            f"{row['addon_dynamic_gap_max_usd']:<9g}"
+            f"{row['trades']:>3}"
         )
-    print("-" * 152)
+    print("-" * 156)
+    print()
+    profit_best = max(rows, key=lambda row: (row["total_pnl"], row["min_liq_distance_pct"]))
+    safe_candidates = [row for row in rows if row["total_pnl"] > 0]
+    risk_best = max(safe_candidates, key=lambda row: (row["risk_score"], row["total_pnl"])) if safe_candidates else None
+    print(
+        "Profit best: "
+        f"PnL={profit_best['total_pnl']:+.2f} Score={profit_best['balanced_score']:+.2f} "
+        f"Risk={profit_best['risk_score']:+.2f} MinLiq={profit_best['min_liq_distance_pct']:.2f}% "
+        f"DD={profit_best['max_drawdown_pct']:.2f}%"
+    )
+    if risk_best:
+        print(
+            "Risk best positive-PnL: "
+            f"PnL={risk_best['total_pnl']:+.2f} Score={risk_best['balanced_score']:+.2f} "
+            f"Risk={risk_best['risk_score']:+.2f} MinLiq={risk_best['min_liq_distance_pct']:.2f}% "
+            f"DD={risk_best['max_drawdown_pct']:.2f}%"
+        )
     print()
     print("Full fields, current baseline, and walk-forward validation are saved to CSV/Markdown.")
 
@@ -2298,21 +2643,21 @@ def print_walk_forward(rows: list[dict], top_n: int = 10) -> None:
     print()
     print("Walk-forward validation")
     print("-" * 120)
-    print("Rank  Robust    WidthPct  EntryGap  GapMult  TrainPnL  TrainDD  ValPnL    ValDD   ValTrades  ValDStop  Wipeout")
+    print("Rank  Robust    EntryMax  EntryGap  TPSpace  Head/Cap  TrainPnL  TrainDD  ValPnL    ValDD   ValTrades  Wipeout")
     print("-" * 120)
     for row in rows[:top_n]:
         print(
             f"{row['rank']:>2}  "
             f"{row['robustness_score']:>8.2f}  "
-            f"{row['min_width_pct']:<8.4f}  "
+            f"{row['entry_max_width_pct']:<8.4f}  "
             f"{row['min_entry_gap_usd']:<8g}  "
-            f"{row['boll_width_gap_mult']:<7g}  "
+            f"{row['boll_width_tp_space_mult']:<7g}  "
+            f"{row['first_batch_ratio']:g}/{row['max_total_entry_ratio']:<7g}  "
             f"{row['train_pnl']:>8.2f}  "
             f"{row['train_dd']:>7.2f}%  "
             f"{row['val_pnl']:>8.2f}  "
             f"{row['val_dd']:>6.2f}%  "
             f"{row['val_trades']:>9}  "
-            f"{row['val_dstop']:>8}  "
             f"{row['val_wipeout']}"
         )
     print("-" * 120)
@@ -2325,64 +2670,30 @@ def main() -> None:
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
     parser.add_argument("--initial-total-equity", type=float, default=INITIAL_TOTAL_EQUITY)
     parser.add_argument("--sample-sec", type=int, default=POLL_INTERVAL, help="Replay resample interval in seconds; 0 uses every parsed tick.")
-    parser.add_argument("--boll-std", default="2.0")
-    parser.add_argument("--min-width-usd", default=str(MIN_BOLL_WIDTH_USD))
-    parser.add_argument("--min-boll-width-pct", default="0.0055:0.01:0.0005")
-    parser.add_argument("--min-entry-gap-usd", default="3,4,5,6")
-    parser.add_argument("--reprice-gap-usd", default=str(REPRICE_GAP_USD))
-    parser.add_argument("--entry-max-width-enabled", default=str(int(ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED)))
-    parser.add_argument("--entry-max-width-pct", default="0.02,0.023,0.025,0.03,0.035")
-    parser.add_argument("--entry-max-width-usd", default="0,60,80,100")
-    parser.add_argument("--first-batch-ratio", default=str(FIRST_BATCH_RATIO))
-    parser.add_argument("--second-batch-ratio", default=str(SECOND_BATCH_RATIO))
-    parser.add_argument("--dynamic-base-ratio", default="0.08,0.10")
+    parser.add_argument("--use-cache", action="store_true", help="Cache parsed log ticks by log file metadata and sample interval.")
+    parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR))
+    parser.add_argument("--two-stage", action="store_true", help="Run coarse optimization on sample-sec, then replay top params on final-sample-sec.")
+    parser.add_argument("--final-sample-sec", type=int, default=POLL_INTERVAL)
+    parser.add_argument("--refine-top-n", type=int, default=10)
+    parser.add_argument("--min-boll-width-pct", default=str(MIN_BOLL_WIDTH_PCT), help="Kept for compatibility; no longer optimized when TP-space width is enabled.")
+    parser.add_argument("--min-entry-gap-usd", default="4,5,6")
+    parser.add_argument("--entry-max-width-pct", default="0.03,0.04,0.05")
+    parser.add_argument("--first-batch-ratio", default="0.08,0.10,0.12")
+    parser.add_argument("--second-batch-dynamic-base-ratio", default="0.10,0.12,0.14")
+    parser.add_argument("--second-batch-dynamic-min-ratio", default=str(SECOND_BATCH_DYNAMIC_MIN_RATIO))
+    parser.add_argument("--second-batch-dynamic-max-ratio", default="0.15,0.18")
+    parser.add_argument("--second-batch-dynamic-full-gap-usd", default="8,10,12")
+    parser.add_argument("--dynamic-base-ratio", default="0.06,0.08,0.10")
     parser.add_argument("--dynamic-min-ratio", default=str(DYNAMIC_MIN_ENTRY_RATIO))
-    parser.add_argument("--dynamic-max-ratio", default="0.15,0.18")
-    parser.add_argument("--max-total-entry-ratio", default=str(MAX_TOTAL_ENTRY_RATIO))
-    parser.add_argument("--boll-width-base-price", default=str(BOLL_WIDTH_BASE_PRICE))
-    parser.add_argument("--boll-width-base-usd", default=str(BOLL_WIDTH_BASE_USD))
-    parser.add_argument("--boll-width-floor-usd", default=str(MIN_BOLL_WIDTH_FLOOR_USD))
-    parser.add_argument("--boll-width-gap-mult", default="2.5,3,3.5,4")
+    parser.add_argument("--dynamic-max-ratio", default="0.12,0.15")
+    parser.add_argument("--max-total-entry-ratio", default="0.70,0.80")
+    parser.add_argument("--boll-width-tp-space-mult", default="1.5,2.0")
     parser.add_argument("--tp-target-margin-return", default=str(TP_TARGET_MARGIN_RETURN))
-    parser.add_argument("--min-head-liq-buffer-pct", default="0.03,0.035")
-    parser.add_argument(
-        "--dynamic-tp-enabled",
-        default="0",
-        help="Dynamic take-profit replay switch. Default is 0 for baseline optimization; pass 1 to test dynamic TP.",
-    )
-    parser.add_argument(
-        "--dynamic-tp-arm-return",
-        default=str(DYNAMIC_TP_ARM_RETURN),
-        help=f"Comma list or range. Example sweep: {DEFAULT_DYNAMIC_TP_ARM_GRID} or 0.15:0.24:0.005.",
-    )
-    parser.add_argument("--dynamic-tp-restore-return", default=str(DYNAMIC_TP_RESTORE_RETURN))
-    parser.add_argument("--dynamic-tp-reprice-gap-usd", default=str(DYNAMIC_TP_REPRICE_GAP_USD))
-    parser.add_argument("--boll-tp-compression-enabled", default="0")
-    parser.add_argument("--boll-tp-compression-min-return", default=str(BOLL_TP_COMPRESSION_MIN_RETURN))
-    parser.add_argument("--boll-tp-compression-exit-offset-usd", default=str(BOLL_TP_COMPRESSION_EXIT_OFFSET_USD))
-    parser.add_argument("--entry-extreme-gap-adjust-enabled", default=str(int(ENTRY_EXTREME_GAP_ADJUST_ENABLED)))
-    parser.add_argument("--entry-extreme-gap-base-pct", default=str(ENTRY_EXTREME_GAP_BASE_PCT))
-    parser.add_argument("--entry-extreme-gap-full-pct", default=str(ENTRY_EXTREME_GAP_FULL_PCT))
-    parser.add_argument("--entry-extreme-gap-max-mult", default=str(ENTRY_EXTREME_GAP_MAX_MULT))
-    parser.add_argument("--copy-fixed-loss-stop-enabled", default=str(int(COPY_FIXED_LOSS_STOP_ENABLED)))
-    parser.add_argument("--copy-fixed-loss-stop-usdt", default=str(COPY_FIXED_LOSS_STOP_USDT))
     parser.add_argument("--copy-fixed-loss-stop-ratio", default=str(COPY_FIXED_LOSS_STOP_RATIO))
-    parser.add_argument("--disaster-stop-enabled", default=str(int(DISASTER_STOP_ENABLED)))
-    parser.add_argument("--disaster-head-drop-pct", default=str(DISASTER_HEAD_DROP_PCT))
-    parser.add_argument("--disaster-loss-ratio", default=str(DISASTER_LOSS_RATIO))
-    parser.add_argument("--boll-trend-guard-enabled", default=str(int(BOLL_TREND_GUARD_ENABLED)))
-    parser.add_argument("--boll-trend-guard-observe-enabled", default=str(int(BOLL_TREND_GUARD_OBSERVE_ENABLED)))
-    parser.add_argument("--boll-trend-guard-control-enabled", default=str(int(BOLL_TREND_GUARD_CONTROL_ENABLED)))
-    parser.add_argument("--boll-trend-guard-head-adverse-pct", default=str(BOLL_TREND_GUARD_HEAD_ADVERSE_PCT))
-    parser.add_argument("--boll-trend-guard-width-expand", default=str(BOLL_TREND_GUARD_WIDTH_EXPAND))
-    parser.add_argument("--boll-trend-guard-width-pct", default=str(BOLL_TREND_GUARD_WIDTH_PCT))
-    parser.add_argument("--boll-trend-guard-slope-window-min", default=str(BOLL_TREND_GUARD_SLOPE_WINDOW_MIN))
-    parser.add_argument("--boll-trend-guard-min-hold-min", default=str(BOLL_TREND_GUARD_MIN_HOLD_MIN))
-    parser.add_argument("--boll-trend-guard-z-mean", default=str(BOLL_TREND_GUARD_Z_MEAN))
-    parser.add_argument("--boll-trend-guard-slope-pct-per-hour", default=str(BOLL_TREND_GUARD_SLOPE_PCT_PER_HOUR))
-    parser.add_argument("--boll-trend-guard-stop-after-close", default=str(int(BOLL_TREND_GUARD_STOP_AFTER_CLOSE)))
-    parser.add_argument("--addon-dynamic-gap-enabled", default=str(int(ADDON_DYNAMIC_GAP_ENABLED)))
-    parser.add_argument("--addon-dynamic-gap-max-usd", default=str(ADDON_DYNAMIC_GAP_MAX_USD))
+    parser.add_argument("--fixed-loss-head-buffer-pct", default="0.05")
+    parser.add_argument("--disaster-head-drop-pct", default="0.05")
+    parser.add_argument("--disaster-loss-ratio", default="0.70")
+    parser.add_argument("--addon-dynamic-gap-max-usd", default="16,20,24")
     parser.add_argument("--addon-dynamic-gap-boll-start", default=str(ADDON_DYNAMIC_GAP_BOLL_START))
     parser.add_argument("--addon-dynamic-gap-boll-strong", default=str(ADDON_DYNAMIC_GAP_BOLL_STRONG))
     parser.add_argument("--addon-dynamic-gap-boll-max-mult", default=str(ADDON_DYNAMIC_GAP_BOLL_MAX_MULT))
@@ -2391,9 +2702,11 @@ def main() -> None:
     parser.add_argument("--addon-dynamic-gap-head-max-mult", default=str(ADDON_DYNAMIC_GAP_HEAD_MAX_MULT))
     parser.add_argument("--addon-dynamic-gap-trend-klines", default=str(ADDON_DYNAMIC_GAP_TREND_KLINES))
     parser.add_argument("--addon-dynamic-gap-trend-mult", default=str(ADDON_DYNAMIC_GAP_TREND_MULT))
-    parser.add_argument("--search-mode", choices=("grid", "random"), default="grid")
+    parser.add_argument("--search-mode", choices=("grid", "random", "optuna"), default="grid")
     parser.add_argument("--random-trials", type=int, default=300)
     parser.add_argument("--random-seed", type=int, default=42)
+    parser.add_argument("--optuna-trials", type=int, default=120)
+    parser.add_argument("--optuna-startup-trials", type=int, default=24)
     parser.add_argument("--walk-forward-ratio", type=float, default=0.7)
     parser.add_argument("--walk-forward-top-n", type=int, default=10)
     parser.add_argument("--workers", type=int, default=0, help="Replay worker processes; 0 auto-detects, 1 disables multiprocessing.")
@@ -2406,7 +2719,9 @@ def main() -> None:
 
     if not args.quiet:
         print("Reading strategy logs...", flush=True)
-    ticks = parse_logs(Path(args.log_dir), sample_sec=args.sample_sec)
+    log_dir = Path(args.log_dir)
+    cache_dir = Path(args.cache_dir) if args.use_cache else None
+    ticks = load_or_parse_logs(log_dir, sample_sec=args.sample_sec, cache_dir=cache_dir, quiet=args.quiet)
     if not args.quiet:
         print(
             f"Loaded {len(ticks)} ticks, range {ticks['ts'].min()} -> {ticks['ts'].max()}",
@@ -2414,12 +2729,13 @@ def main() -> None:
         )
 
     baseline_params = current_config_params(args)
-    grid = build_random_grid(args) if args.search_mode == "random" else build_grid(args)
-    grid = ensure_baseline_in_grid(grid, baseline_params)
-    rows = run_replays(ticks, grid, args.initial_total_equity, args.workers, args.quiet)
+    if args.search_mode == "optuna":
+        rows = build_optuna_rows(ticks, args, baseline_params, args.initial_total_equity)
+    else:
+        grid = build_random_grid(args) if args.search_mode == "random" else build_grid(args)
+        grid = ensure_baseline_in_grid(grid, baseline_params)
+        rows = run_replays(ticks, grid, args.initial_total_equity, args.workers, args.quiet)
 
-    if not args.quiet:
-        print("Sorting and writing report...", flush=True)
     rows.sort(
         key=lambda row: (
             row["balanced_score"],
@@ -2429,17 +2745,46 @@ def main() -> None:
         ),
         reverse=True,
     )
-    baseline_row = LogReplay(ticks, baseline_params, args.initial_total_equity).run().report()
+    report_ticks = ticks
+    if args.two_stage:
+        if not args.quiet:
+            print(
+                f"Two-stage refine: replaying top {args.refine_top_n} params "
+                f"with sample-sec={args.final_sample_sec}...",
+                flush=True,
+            )
+        fine_ticks = load_or_parse_logs(
+            log_dir,
+            sample_sec=args.final_sample_sec,
+            cache_dir=cache_dir,
+            quiet=args.quiet,
+        )
+        fine_grid = ensure_baseline_in_grid(params_from_rows(rows, args.refine_top_n), baseline_params)
+        rows = run_replays(fine_ticks, fine_grid, args.initial_total_equity, args.workers, args.quiet)
+        rows.sort(
+            key=lambda row: (
+                row["balanced_score"],
+                row["total_pnl"],
+                -row["max_drawdown_pct"],
+                row["min_liq_distance_pct"],
+            ),
+            reverse=True,
+        )
+        report_ticks = fine_ticks
+
+    if not args.quiet:
+        print("Sorting and writing report...", flush=True)
+    baseline_row = LogReplay(report_ticks, baseline_params, args.initial_total_equity).run().report()
 
     walk_forward_rows = run_walk_forward(
-        ticks,
+        report_ticks,
         rows,
         args.initial_total_equity,
         args.walk_forward_ratio,
         args.walk_forward_top_n,
     )
 
-    stamp = ticks["ts"].max().strftime("%Y%m%d_%H%M%S")
+    stamp = report_ticks["ts"].max().strftime("%Y%m%d_%H%M%S")
     csv_path = out_dir / f"log_param_report_{stamp}.csv"
     md_path = out_dir / f"log_param_report_{stamp}.md"
     wf_csv_path = out_dir / f"log_param_walk_forward_{stamp}.csv"
@@ -2453,7 +2798,7 @@ def main() -> None:
             writer = csv.DictWriter(file, fieldnames=list(walk_forward_rows[0].keys()))
             writer.writeheader()
             writer.writerows(walk_forward_rows)
-    write_markdown_report(md_path, rows, ticks, baseline_row, walk_forward_rows)
+    write_markdown_report(md_path, rows, report_ticks, baseline_row, walk_forward_rows)
 
     print_rankings(rows, baseline_row)
     print_walk_forward(walk_forward_rows)

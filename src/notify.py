@@ -42,14 +42,14 @@ async def notify_cross_copy_protect(
     direction: str,
     total_sz: float,
 ) -> None:
-    """Notify when cross-margin copy-protection closes the strategy."""
+    """Notify when cross-margin copy-protection stops the strategy."""
     title = "ETH 全仓带单保护触发"
     content = (
         f"**账户总权益**: {account_equity:.2f} USDT\n\n"
         f"**保护权益**: {protected_equity:.2f} USDT\n\n"
         f"**当前方向**: {direction.upper()}\n\n"
         f"**当前张数**: {total_sz}\n\n"
-        "账户权益已触及保护线，程序将撤单、平仓并停止运行。"
+        "账户权益已触及保护线，程序将撤单、停止运行，不再主动市价平仓。"
     )
     await wx_push(title, content)
 

@@ -323,7 +323,6 @@ TRADING_ACCOUNT_TARGET = 200
 CROSS_COPY_PROTECT_ENABLED = True
 CROSS_COPY_PROTECT_EQUITY_USDT = 500.0
 CROSS_COPY_DYNAMIC_SIZING_ENABLED = True
-CROSS_COPY_PROTECT_ACTION = "close_stop"
 ```
 
 全仓带单保护 sizing：
@@ -332,7 +331,7 @@ CROSS_COPY_PROTECT_ACTION = "close_stop"
 strategy sizing equity = min(TRADING_ACCOUNT_TARGET, account equity - CROSS_COPY_PROTECT_EQUITY_USDT)
 ```
 
-如果账户权益小于或等于 `CROSS_COPY_PROTECT_EQUITY_USDT`，默认动作是 `close_stop`：平掉当前持仓、撤销订单、发送通知，并停止新开仓。
+如果账户权益小于或等于 `CROSS_COPY_PROTECT_EQUITY_USDT`，程序会撤销订单、发送通知并停止新开仓；不会再主动市价平仓。
 
 平仓后程序优先读取真实成交收益：
 
@@ -400,23 +399,32 @@ logs/boll_pin_*.log
 - 补仓 K 线极值 guard
 - 固定亏损止损
 - 灾难止损
-- BTG 观察/控制参数
 - 动态补仓间距
 - 头仓最大布林宽度过滤
 
-当前重点优化参数包括：
+当前优化器默认只搜索核心风险/收益参数，其他配置固定为实盘当前值参与回放：
 
 ```text
-MIN_BOLL_WIDTH_PCT
 ENTRY_MAX_BOLL_WIDTH_PCT
-ENTRY_MAX_BOLL_WIDTH_USD
+MIN_ENTRY_GAP_USD
+BOLL_WIDTH_TP_SPACE_MULT
 FIRST_BATCH_RATIO
-SECOND_BATCH_RATIO
+SECOND_BATCH_DYNAMIC_BASE_RATIO
+SECOND_BATCH_DYNAMIC_MIN_RATIO
+SECOND_BATCH_DYNAMIC_MAX_RATIO
+SECOND_BATCH_DYNAMIC_FULL_GAP_USD
 DYNAMIC_BASE_ENTRY_RATIO
 DYNAMIC_MIN_ENTRY_RATIO
 DYNAMIC_MAX_ENTRY_RATIO
-MIN_HEAD_LIQ_BUFFER_PCT
+MAX_TOTAL_ENTRY_RATIO
+COPY_FIXED_LOSS_STOP_RATIO
+FIXED_LOSS_HEAD_BUFFER_PCT
+DISASTER_HEAD_DROP_PCT
+DISASTER_LOSS_RATIO
+ADDON_DYNAMIC_GAP_MAX_USD
 ```
+
+行情日志会额外记录 `kline`、`width`、`width_pct` 和 `trading_balance`，用于后续检查回测和实盘状态是否对齐；旧的 `price=... Boll[...]` 格式仍然保留，现有回放脚本可以继续解析。
 
 报告跑完后，终端会显示参数同步菜单。同步前需要再次输入确认，脚本会先生成 `src/config.py.bak` 备份。
 
@@ -472,7 +480,6 @@ TRADING_ACCOUNT_TARGET = 200
 CROSS_COPY_PROTECT_ENABLED = True
 CROSS_COPY_PROTECT_EQUITY_USDT = 500.0
 CROSS_COPY_DYNAMIC_SIZING_ENABLED = True
-CROSS_COPY_PROTECT_ACTION = "close_stop"
 ```
 
 ## GitHub 注意事项

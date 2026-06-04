@@ -103,12 +103,17 @@ MIN_BOLL_WIDTH_FLOOR_USD = 10.0
 # 布林宽度和有效补仓间距联动：有效间距 * 该倍数也会作为宽度候选。
 BOLL_WIDTH_GAP_MULT = 2.5
 
+# Require enough Bollinger width to cover the configured take-profit target.
+# 例如 25% 保证金收益 / 50x = 0.5% 价格波动；乘以 2.0 后，要求布林宽度至少覆盖约 1.0% 的价格空间。
+BOLL_WIDTH_TP_SPACE_ENABLED = True
+BOLL_WIDTH_TP_SPACE_MULT = 1.5
+
 # Head-entry maximum Bollinger width filter.
 # 头仓最大布林宽度过滤：只限制新开头仓，不限制已有持仓补仓。
 # If either threshold is hit, the strategy skips/cancels the first batch.
 # 任一阈值触发时，跳过或撤销未成交头仓。
 ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED = True
-ENTRY_MAX_BOLL_WIDTH_PCT = 0.025
+ENTRY_MAX_BOLL_WIDTH_PCT = 0.04
 ENTRY_MAX_BOLL_WIDTH_USD = 80.0
 
 # Recent-price count for no-new-extreme filter.
@@ -155,7 +160,13 @@ MAX_TOTAL_ENTRY_RATIO = 0.8
 # First and second batch margin ratios.
 # 头仓和第一次补仓比例：按策略目标资金计算保证金占比。
 FIRST_BATCH_RATIO = 0.1
-SECOND_BATCH_RATIO = 0.15
+
+# Second batch dynamic sizing. When enabled, the first add-on ratio is scaled
+# by the gap between the head fill price and the candidate add-on price.
+SECOND_BATCH_DYNAMIC_BASE_RATIO = 0.14
+SECOND_BATCH_DYNAMIC_MIN_RATIO = 0.05
+SECOND_BATCH_DYNAMIC_MAX_RATIO = 0.18
+SECOND_BATCH_DYNAMIC_FULL_GAP_USD = 10.0
 
 # Dynamic add-on ratio for the 3rd batch and later.
 # 第3批及之后动态补仓比例区间。
@@ -310,20 +321,16 @@ BOLL_TREND_GUARD_STOP_AFTER_CLOSE = True
 
 # Strategy target capital.
 # 策略目标资金：开仓/补仓按这个目标资金计算；平仓后利润划走，亏损从资金账户补回。
-TRADING_ACCOUNT_TARGET = 200
+TRADING_ACCOUNT_TARGET = 100
 
 # Cross-margin copy-protection mode.
 # 全仓带单保护：保护固定账户权益，策略只使用可用策略资金部分。
-CROSS_COPY_PROTECT_ENABLED = True
+CROSS_COPY_PROTECT_ENABLED = False
 CROSS_COPY_PROTECT_EQUITY_USDT = 500.0
-CROSS_COPY_DYNAMIC_SIZING_ENABLED = True
-
-# Stop action after protected equity is reached.
-# 保护线触发动作：close_stop=平仓、撤单、通知并停机。
-CROSS_COPY_PROTECT_ACTION = "close_stop"
+CROSS_COPY_DYNAMIC_SIZING_ENABLED = False
 
 # Sizing-equity log threshold.
-# 资金计算日志阈值：变化超过该值才打印，避免刷屏。
+# 资金计算日志固定下限：实际显示阈值 = max(该值, TRADING_ACCOUNT_TARGET * 10%)，避免小波动刷屏。
 SIZING_EQUITY_LOG_THRESHOLD_USDT = 0.5
 
 # Post-close capital calibration.

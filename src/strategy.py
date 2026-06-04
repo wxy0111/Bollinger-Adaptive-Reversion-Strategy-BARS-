@@ -22,6 +22,7 @@ from src.config import (
     MIN_BOLL_WIDTH_USD, MIN_BOLL_WIDTH_PCT,
     BOLL_WIDTH_BASE_PRICE, BOLL_WIDTH_BASE_USD,
     MIN_BOLL_WIDTH_FLOOR_USD, BOLL_WIDTH_GAP_MULT,
+    BOLL_WIDTH_TP_SPACE_ENABLED, BOLL_WIDTH_TP_SPACE_MULT,
     ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED, ENTRY_MAX_BOLL_WIDTH_PCT,
     ENTRY_MAX_BOLL_WIDTH_USD,
     TP_TARGET_MARGIN_RETURN, DYNAMIC_TP_ENABLED,
@@ -49,7 +50,7 @@ from src.config import (
     STRATEGY_EQUITY_CAP_USDT, CT_VAL, CONTRACT_STEP,
     TRADING_ACCOUNT_TARGET,
     CROSS_COPY_PROTECT_ENABLED, CROSS_COPY_PROTECT_EQUITY_USDT,
-    CROSS_COPY_DYNAMIC_SIZING_ENABLED, CROSS_COPY_PROTECT_ACTION,
+    CROSS_COPY_DYNAMIC_SIZING_ENABLED,
     SIZING_EQUITY_LOG_THRESHOLD_USDT,
     CAPITAL_REBALANCE_TOLERANCE_USDT, CAPITAL_REBALANCE_DELAY_SEC,
     COPY_FIXED_LOSS_STOP_ENABLED, COPY_FIXED_LOSS_STOP_USDT,
@@ -62,7 +63,10 @@ from src.config import (
     BOLL_TREND_GUARD_MIN_HOLD_MIN, BOLL_TREND_GUARD_Z_MEAN,
     BOLL_TREND_GUARD_SLOPE_PCT_PER_HOUR, BOLL_TREND_GUARD_NOTIFY_INTERVAL_SEC,
     MAX_ENTRY_BATCHES, MAX_TOTAL_ENTRY_RATIO,
-    FIRST_BATCH_RATIO, SECOND_BATCH_RATIO,
+    FIRST_BATCH_RATIO,
+    SECOND_BATCH_DYNAMIC_BASE_RATIO,
+    SECOND_BATCH_DYNAMIC_MIN_RATIO, SECOND_BATCH_DYNAMIC_MAX_RATIO,
+    SECOND_BATCH_DYNAMIC_FULL_GAP_USD,
     DYNAMIC_BASE_ENTRY_RATIO, DYNAMIC_MIN_ENTRY_RATIO, DYNAMIC_MAX_ENTRY_RATIO,
 )
 from src.okx_client import OKXClient
@@ -178,6 +182,11 @@ class BollPinStrategy:
             return min(base_equity, STRATEGY_EQUITY_CAP_USDT)
         return base_equity
 
+    def _sizing_equity_log_threshold(self) -> float:
+        """Return the minimum sizing-equity change worth printing."""
+        target_threshold = TRADING_ACCOUNT_TARGET * 0.10 if TRADING_ACCOUNT_TARGET > 0 else 0.0
+        return max(SIZING_EQUITY_LOG_THRESHOLD_USDT, target_threshold)
+
     async def _sizing_account_equity(self, client: OKXClient) -> float:
         """Return the account value used for sizing decisions."""
         if CROSS_COPY_DYNAMIC_SIZING_ENABLED:
@@ -195,7 +204,7 @@ class BollPinStrategy:
         if self._state.batches:
             if self._sync_known_batch_sizes():
                 self._save_runtime_state()
-            if abs(previous - desired_equity) >= SIZING_EQUITY_LOG_THRESHOLD_USDT:
+            if abs(previous - desired_equity) >= self._sizing_equity_log_threshold():
                 log_check(
                     f"Sizing equity refreshed {previous:.2f} -> {desired_equity:.2f}; "
                     f"known sizes={self._fixed_batch_sizes}"
@@ -214,24 +223,26 @@ class BollPinStrategy:
             return False
         if CROSS_COPY_PROTECT_EQUITY_USDT <= 0:
             return False
+        if account_equity <= 0:
+            logger.warning(
+                "Account equity read as 0; skip cross copy protection for this tick"
+            )
+            return False
         if account_equity > CROSS_COPY_PROTECT_EQUITY_USDT:
             return False
 
         log_action(
             f"Cross copy protection triggered equity={account_equity:.2f} "
-            f"protected={CROSS_COPY_PROTECT_EQUITY_USDT:.2f} action={CROSS_COPY_PROTECT_ACTION}"
+            f"protected={CROSS_COPY_PROTECT_EQUITY_USDT:.2f}; cancel orders and stop"
         )
         direction = self._state.direction
         total_sz = self._state.total_sz
         await self._cancel_entry_orders(client)
-        if CROSS_COPY_PROTECT_ACTION == "close_stop" and self._state.is_active():
-            await self._emergency_close(client, reason="cross_copy_protect")
-        else:
-            await self._cancel_exchange_exit_orders(client)
-            await self._cancel_exit_orders(client)
-            self._reset_probe_state()
-            self._state.reset()
-            self._clear_runtime_state()
+        await self._cancel_exchange_exit_orders(client)
+        await self._cancel_exit_orders(client)
+        self._reset_probe_state()
+        self._state.reset()
+        self._clear_runtime_state()
         self._running = False
         await notify_cross_copy_protect(
             account_equity,
@@ -485,7 +496,17 @@ class BollPinStrategy:
         if batch_idx == 0:
             return FIRST_BATCH_RATIO
         if batch_idx == 1:
-            return SECOND_BATCH_RATIO
+            head_batch = next(
+                (batch for batch in self._state.filled_batches() if batch.batch_idx == 0),
+                None,
+            )
+            if head_batch is None or head_batch.price <= 0 or SECOND_BATCH_DYNAMIC_FULL_GAP_USD <= 0:
+                return 0.0
+            gap = abs(candidate_price - head_batch.price)
+            dynamic_ratio = SECOND_BATCH_DYNAMIC_BASE_RATIO * gap / SECOND_BATCH_DYNAMIC_FULL_GAP_USD
+            dynamic_ratio = max(SECOND_BATCH_DYNAMIC_MIN_RATIO, dynamic_ratio)
+            dynamic_ratio = min(SECOND_BATCH_DYNAMIC_MAX_RATIO, dynamic_ratio)
+            return dynamic_ratio
 
         filled = sorted(self._state.filled_batches(), key=lambda batch: batch.batch_idx)
         if len(filled) < 2:
@@ -672,15 +693,12 @@ class BollPinStrategy:
         self._sizing_equity = sizing_equity if sizing_equity is not None else self._desired_sizing_equity(equity)
         mark_price = await client.get_mark_price(INST_ID)
         batch_sizes = []
-        for i in range(2):
-            ratio = FIRST_BATCH_RATIO if i == 0 else SECOND_BATCH_RATIO
-            margin_budget = self._sizing_equity * ratio
-            raw_sz = margin_budget * LEVER / (mark_price * CT_VAL)
-            sz = self._floor_contract_size(raw_sz)
-            batch_sizes.append(sz)
+        margin_budget = self._sizing_equity * FIRST_BATCH_RATIO
+        raw_sz = margin_budget * LEVER / (mark_price * CT_VAL)
+        batch_sizes.append(self._floor_contract_size(raw_sz))
         self._fixed_batch_sizes = batch_sizes
         log_check(
-            f"First/second batch reference sizes available={equity:.2f} "
+            f"Head batch reference size available={equity:.2f} "
             f"sizing_equity={self._sizing_equity:.2f} sizes={self._fixed_batch_sizes}; "
             "actual order size is recalculated from live price before placing"
         )
@@ -709,6 +727,7 @@ class BollPinStrategy:
         return {
             "version": 1,
             "inst_id": INST_ID,
+            "saved_at": pd.Timestamp.utcnow().isoformat(),
             "state": {
                 "direction": self._state.direction,
                 "batches": [
@@ -777,6 +796,25 @@ class BollPinStrategy:
             tmp.replace(STATE_FILE)
         except Exception as e:
             logger.warning(f"Save runtime state failed: {e}")
+
+    def _filled_batch_summary(self) -> str:
+        """Return a compact readable summary of filled strategy batches."""
+        filled = sorted(self._state.filled_batches(), key=lambda b: b.batch_idx)
+        if not filled:
+            return "none"
+        return ", ".join(
+            f"#{batch.batch_idx + 1} px={batch.price:.2f} sz={batch.sz:g} ord={batch.ord_id or '--'}"
+            for batch in filled
+        )
+
+    def _log_runtime_state_summary(self, label: str) -> None:
+        """Log the restored local-vs-exchange state in one scannable line."""
+        log_check(
+            f"{label}: direction={self._state.direction} avg={self._state.avg_entry:.2f} "
+            f"sz={self._state.total_sz:g} tp={self._state.plan_tp_price:.2f} "
+            f"sl={self._state.plan_sl_price:.2f} liq={self._state.plan_liq_price:.2f} "
+            f"filled=[{self._filled_batch_summary()}]"
+        )
 
     def _clear_runtime_state(self):
         """Delete the persisted runtime-state file."""
@@ -905,6 +943,7 @@ class BollPinStrategy:
                 f"Loaded local strategy state: direction={self._state.direction} "
                 f"batches={len(self._state.batches)} known_sizes={self._fixed_batch_sizes}"
             )
+            self._log_runtime_state_summary("Loaded local runtime snapshot")
         except Exception as e:
             logger.warning(f"Load local runtime state failed: {e}")
 
@@ -932,10 +971,13 @@ class BollPinStrategy:
             return
         _, last, mark_price = snapshot
         equity = dashboard.state.equity
+        width = float(last["boll_upper"] - last["boll_lower"])
+        width_pct = width / mark_price if mark_price > 0 else 0.0
         log_market(
             f"price={mark_price:.2f}  Boll[{last['boll_lower']:.2f}"
             f" | {last['boll_mid']:.2f} | {last['boll_upper']:.2f}]"
             f"  position={self._state.direction}  equity={equity:.2f}"
+            f"  kline={last['ts']} width={width:.2f} width_pct={width_pct:.4%}"
         )
         self._update_dashboard(mark_price, last, equity)
 
@@ -968,10 +1010,14 @@ class BollPinStrategy:
         self._remember_price(mark_price)
         last = df.iloc[-1].copy()
         last["ts"] = current_kline_ts
+        width = float(last["boll_upper"] - last["boll_lower"])
+        width_pct = width / mark_price if mark_price > 0 else 0.0
         log_market(
             f"price={mark_price:.2f}  Boll[{last['boll_lower']:.2f}"
             f" | {last['boll_mid']:.2f} | {last['boll_upper']:.2f}]"
-            f"  position={self._state.direction}  equity={account_equity:.2f}",
+            f"  position={self._state.direction}  equity={account_equity:.2f}"
+            f"  kline={last['ts']} width={width:.2f} width_pct={width_pct:.4%}"
+            f" trading_balance={trading_balance:.2f}",
             terminal=True,
         )
         self._remember_boll_snapshot(last, mark_price)
@@ -1043,11 +1089,12 @@ class BollPinStrategy:
         width = float(last["boll_width"])
         width_pct = width / mark_price if mark_price > 0 else 0.0
         required = self._effective_min_boll_width(mark_price)
-        required_pct = self._effective_boll_width_pct()
+        required_pct = required / mark_price if mark_price > 0 else 0.0
         log_check(
             f"{reason}: Bollinger width too narrow "
             f"width={width:.2f} < {required:.2f} "
-            f"width_pct={width_pct:.2%} threshold={required_pct:.2%}"
+            f"width_pct={width_pct:.2%} threshold={required_pct:.2%} "
+            f"tp_space={self._tp_space_width_rule(mark_price):.2f}"
         )
         return
         _old_log_check_disabled(
@@ -1094,7 +1141,7 @@ class BollPinStrategy:
 
     def _min_ratio_ladder(self) -> list[float]:
         """Return the assumed minimum-size ladder up to the total-entry cap."""
-        ratios = [FIRST_BATCH_RATIO, SECOND_BATCH_RATIO]
+        ratios = [FIRST_BATCH_RATIO, SECOND_BATCH_DYNAMIC_MIN_RATIO]
         while (
             sum(ratios) + DYNAMIC_MIN_ENTRY_RATIO <= MAX_TOTAL_ENTRY_RATIO + 1e-12
             and len(ratios) < MAX_ENTRY_BATCHES
@@ -1215,10 +1262,20 @@ class BollPinStrategy:
         return 1.0
 
     def _effective_min_boll_width(self, mark_price: float) -> float:
-        """Return dynamic Bollinger-width threshold."""
-        pct_rule = mark_price * self._effective_boll_width_pct() if mark_price > 0 else 0.0
-        gap_rule = self._effective_entry_gap(mark_price) * BOLL_WIDTH_GAP_MULT
-        return max(MIN_BOLL_WIDTH_USD, MIN_BOLL_WIDTH_FLOOR_USD, pct_rule, gap_rule)
+        """Return TP-space Bollinger-width threshold."""
+        tp_space_rule = self._tp_space_width_rule(mark_price)
+        if BOLL_WIDTH_TP_SPACE_ENABLED:
+            return max(MIN_BOLL_WIDTH_FLOOR_USD, tp_space_rule)
+        return MIN_BOLL_WIDTH_USD
+
+    def _tp_space_width_rule(self, mark_price: float) -> float:
+        """Return the minimum Bollinger width implied by the take-profit target."""
+        if not BOLL_WIDTH_TP_SPACE_ENABLED:
+            return 0.0
+        if mark_price <= 0 or LEVER <= 0 or TP_TARGET_MARGIN_RETURN <= 0 or BOLL_WIDTH_TP_SPACE_MULT <= 0:
+            return 0.0
+        tp_price_distance = mark_price * TP_TARGET_MARGIN_RETURN / LEVER
+        return tp_price_distance * BOLL_WIDTH_TP_SPACE_MULT
 
     def _previous_kline_row(self, df, kline_ts=None):
         """Return the candle before ``kline_ts`` or before the current candle."""
@@ -1333,6 +1390,35 @@ class BollPinStrategy:
                 f"guard_high={self._addon_extreme_guard_price:.2f}"
             )
             return False
+        return False
+
+    async def _cancel_pending_batch_due_to_guard(self, client: OKXClient, pending_batch, reason: str) -> None:
+        """Cancel a pending add-on when lifecycle guards no longer allow it."""
+        log_check(
+            f"Cancel pending batch {pending_batch.batch_idx + 1}: {reason} "
+            f"ordId={pending_batch.ord_id}"
+        )
+        try:
+            await client.cancel_order(INST_ID, pending_batch.ord_id)
+        except Exception as exc:
+            log_check(
+                f"Cancel pending batch skipped, order may be filled/canceled/missing "
+                f"ordId={pending_batch.ord_id}: {exc}"
+            )
+        self._state.remove_batch(pending_batch.ord_id)
+        self._save_runtime_state()
+
+    async def _cancel_pending_if_addon_guards_fail(self, client: OKXClient, df, last, pending_batch) -> bool:
+        """Cancel pending add-on orders when add-on guards fail on a new candle."""
+        if pending_batch.batch_idx <= 0:
+            return False
+        if not self._fixed_loss_head_buffer_allows(
+            pending_batch.batch_idx,
+            pending_batch.price,
+            pending_batch.sz,
+        ):
+            await self._cancel_pending_batch_due_to_guard(client, pending_batch, "fixed-loss head buffer failed")
+            return True
         return False
 
     def _entry_extreme_multiplier(self, gap_pct: float) -> float:
@@ -1731,6 +1817,8 @@ class BollPinStrategy:
             if await self._cancel_pending_if_width_too_narrow(client, last, mark_price):
                 return
             if await self._cancel_pending_if_inside_too_long(client, last, mark_price):
+                return
+            if await self._cancel_pending_if_addon_guards_fail(client, df, last, pending_batch):
                 return
             await self._maybe_reprice_pending_batch(client, df, last, equity, mark_price, pending_batch)
             return
@@ -2241,6 +2329,11 @@ class BollPinStrategy:
                     fill_sz, fill_price, fill_ts = self._extract_order_fill(order_info, batch.sz, batch.price)
                     batch_idx = batch.batch_idx
                     self._state.mark_filled(batch.ord_id, fill_sz, fill_price)
+                    log_action(
+                        f"Entry fill synced batch={batch_idx + 1} ordId={batch.ord_id} "
+                        f"fill_px={fill_price:.2f} fill_sz={fill_sz:g} "
+                        f"fill_kline={fill_ts or kline_ts or '--'}"
+                    )
                     if fill_ts is not None:
                         filled_kline_ts = fill_ts
                     newly_filled.append((batch_idx, fill_ts or kline_ts))
@@ -2331,10 +2424,11 @@ class BollPinStrategy:
         if avg_entry > 0 and (not self._dynamic_tp_active or self._state.plan_tp_price <= 0):
             self._state.plan_tp_price = self._tp_price_from_avg(pos_side, avg_entry)
 
-        logger.info(
-            f"交易所持仓同步 avg={avg_entry:.2f} sz={total_sz} "
+        log_check(
+            f"Exchange position synced avg={avg_entry:.2f} sz={total_sz:g} "
             f"real_liq={liq_price:.2f} new_tp={self._state.plan_tp_price:.2f}"
         )
+        self._log_runtime_state_summary("Post-exchange sync state")
         return avg_entry
 
     def _seed_existing_position_batch(self):
@@ -2853,6 +2947,10 @@ class BollPinStrategy:
                 self._last_batch_kline_ts = fill_kline_ts
                 changed = True
             if fill_sz > 0 and abs(fill_sz - batch.sz) > 1e-8:
+                logger.info(
+                    f"Restart refreshed batch {batch.batch_idx + 1} fill size "
+                    f"{batch.sz:g} -> {fill_sz:g}"
+                )
                 batch.sz = fill_sz
                 changed = True
             if fill_price > 0 and abs(fill_price - batch.price) > 1e-8:
@@ -2885,7 +2983,8 @@ class BollPinStrategy:
 
         logger.warning(
             "Local filled batches mismatch exchange position; "
-            f"rebuild from exchange avg filled_sz={filled_sz} real_sz={self._state.total_sz}"
+            f"rebuild from exchange avg filled_sz={filled_sz:g} real_sz={self._state.total_sz:g}. "
+            "Future add-on gap checks will use the exchange average until real fill history is available."
         )
         self._state.batches = [
             OpenBatch(
@@ -2899,6 +2998,7 @@ class BollPinStrategy:
         self._probe_entry_price = self._state.avg_entry
         self._last_plan_entry_price = self._state.avg_entry
         self._save_runtime_state()
+        self._log_runtime_state_summary("Rebuilt runtime state from exchange position")
 
     async def _cancel_exchange_entry_orders(self, client: OKXClient):
         """Cancel exchange entry orders for the current side.
