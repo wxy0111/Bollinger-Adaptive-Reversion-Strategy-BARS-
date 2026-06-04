@@ -1110,10 +1110,10 @@ _DESIGN_HTML = """<!DOCTYPE html>
     box-shadow: var(--shadow), inset 0 0 32px rgba(16, 215, 255, .05);
     padding: 18px 10px;
   }
-  .brand { display: flex; align-items: center; gap: 10px; padding: 0 10px 18px; font-weight: 800; }
+  .brand { display: flex; align-items: center; justify-content: center; padding: 0 10px 18px; }
   .brand-logo {
-    width: 50px;
-    height: 50px;
+    width: 58px;
+    height: 58px;
     object-fit: contain;
     filter: drop-shadow(0 0 18px rgba(16, 215, 255, .45));
   }
@@ -1329,7 +1329,7 @@ _DESIGN_HTML = """<!DOCTYPE html>
 <body>
 <div class="shell">
   <aside class="side">
-    <div class="brand"><img class="brand-logo" src="/assets/bars-favicon.png" alt="BARS logo"><div>BARS<br><span class="muted">Bollinger Adaptive</span></div></div>
+    <div class="brand"><img class="brand-logo" src="/assets/bars-favicon.png" alt="BARS logo"></div>
     <div class="nav">
       <button id="tab-live" class="active" onclick="showTab('live')"><span class="nav-icon">⌂</span>实时</button>
       <button id="tab-history" onclick="showTab('history')"><span class="nav-icon">▧</span>历史日志</button>
