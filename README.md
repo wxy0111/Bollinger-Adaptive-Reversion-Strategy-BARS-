@@ -1,4 +1,16 @@
-# OKX ETH-USDT-SWAP Bollinger Strategy
+# Bollinger Adaptive Reversion Strategy (BARS)
+
+<p align="center">
+  <img src="assets/bars-logo-transparent.png" alt="BARS Logo" width="420">
+</p>
+
+**BARS** stands for **Bollinger Adaptive Reversion Strategy**. It is an
+OKX `ETH-USDT-SWAP` strategy built around Bollinger-band mean reversion,
+adaptive staged entries, capital-lock profit handling, and risk guards.
+
+中文名：**布林自适应回归策略**。核心逻辑是布林带极值入场、动态补仓摊平、
+按目标保证金收益止盈、盈利固本划转，并通过固定亏损止损、强平缓冲和趋势
+风险观察来限制极端行情风险。
 
 这是一个运行在 OKX `ETH-USDT-SWAP` 永续合约上的 15 分钟布林带均值回归策略。程序读取 OKX 15m K 线和实时标记价格，当价格突破布林带外侧并停止继续创新极值时，按动态分批方式建立仓位，并用交易所真实持仓均价管理止盈、止损、补仓、资金固本和微信通知。
 

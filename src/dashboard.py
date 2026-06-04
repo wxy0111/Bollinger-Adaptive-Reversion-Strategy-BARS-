@@ -13,6 +13,7 @@ from src.config import WEB_HOST, WEB_PORT
 
 
 LOG_DIR = Path("logs")
+ASSET_DIR = Path(__file__).resolve().parent.parent / "assets"
 PNL_CORRECTIONS_PATH = LOG_DIR / "pnl_corrections.json"
 TICK_RE = re.compile(
     "^(?P<ts>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d+).*?"
@@ -358,7 +359,14 @@ def _parse_trade_history(paths: list[Path]) -> dict:
 
                 if CLOSE_RE.search(line) or RESET_RE.search(line):
                     fills = current["fills"]
-                    if not fills and not current.get("close_summary") and current["direction"] == "none":
+                    if not fills and not current.get("close_summary"):
+                        current = {
+                            "direction": "none",
+                            "fills": [],
+                            "entry_time": "",
+                            "tp_price": 0.0,
+                            "close_summary": None,
+                        }
                         continue
                     total_sz = sum(item["sz"] for item in fills)
                     avg_entry = (
@@ -512,7 +520,8 @@ _HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>OKX Strategy Dashboard</title>
+<title>BARS Strategy Dashboard</title>
+<link rel="icon" type="image/png" href="/assets/bars-favicon.png">
 <style>
   :root {
     --bg: #0b0e11;
@@ -544,6 +553,8 @@ _HTML = """<!DOCTYPE html>
     background: #0f1419;
   }
   h1 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: 0; }
+  .header-brand { display: flex; align-items: center; gap: 12px; }
+  .header-logo { width: 48px; height: 48px; object-fit: contain; }
   .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
   .status { display: flex; gap: 8px; align-items: center; color: var(--muted); }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); box-shadow: 0 0 10px var(--green); }
@@ -648,9 +659,12 @@ _HTML = """<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <div>
-    <h1>OKX ETH-USDT-SWAP Strategy</h1>
-    <div class="sub">Live monitor and historical log playback</div>
+  <div class="header-brand">
+    <img class="header-logo" src="/assets/bars-favicon.png" alt="BARS logo">
+    <div>
+    <h1>BARS Strategy Dashboard</h1>
+    <div class="sub">Bollinger Adaptive Reversion Strategy · ETH-USDT-SWAP</div>
+    </div>
   </div>
   <div class="status"><span class="dot"></span><span id="updated">waiting for data</span></div>
 </header>
@@ -1056,7 +1070,8 @@ _DESIGN_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>OKX Strategy Dashboard</title>
+<title>BARS Strategy Dashboard</title>
+<link rel="icon" type="image/png" href="/assets/bars-favicon.png">
 <style>
   :root {
     --bg: #070a12;
@@ -1096,12 +1111,11 @@ _DESIGN_HTML = """<!DOCTYPE html>
     padding: 18px 10px;
   }
   .brand { display: flex; align-items: center; gap: 10px; padding: 0 10px 18px; font-weight: 800; }
-  .brand-icon {
-    width: 44px; height: 44px; border-radius: 16px;
-    display: grid; place-items: center;
-    background: linear-gradient(135deg, var(--cyan), #0785a5);
-    color: #031018;
-    box-shadow: 0 0 24px rgba(16, 215, 255, .38);
+  .brand-logo {
+    width: 50px;
+    height: 50px;
+    object-fit: contain;
+    filter: drop-shadow(0 0 18px rgba(16, 215, 255, .45));
   }
   .nav button {
     width: 100%;
@@ -1315,7 +1329,7 @@ _DESIGN_HTML = """<!DOCTYPE html>
 <body>
 <div class="shell">
   <aside class="side">
-    <div class="brand"><div class="brand-icon">▥</div><div>OKX<br><span class="muted">Boll Pin</span></div></div>
+    <div class="brand"><img class="brand-logo" src="/assets/bars-favicon.png" alt="BARS logo"><div>BARS<br><span class="muted">Bollinger Adaptive</span></div></div>
     <div class="nav">
       <button id="tab-live" class="active" onclick="showTab('live')"><span class="nav-icon">⌂</span>实时</button>
       <button id="tab-history" onclick="showTab('history')"><span class="nav-icon">▧</span>历史日志</button>
@@ -1324,8 +1338,8 @@ _DESIGN_HTML = """<!DOCTYPE html>
   <main class="main">
     <div class="topbar">
       <div>
-        <h1>ETH-USDT-SWAP 策略看板</h1>
-        <div class="sub">实时监控、历史复盘、实际收益统计</div>
+        <h1>BARS 策略看板</h1>
+        <div class="sub">Bollinger Adaptive Reversion Strategy · ETH-USDT-SWAP</div>
       </div>
       <div class="status-pill"><span class="dot"></span><span id="updated">等待策略数据</span></div>
     </div>
@@ -1849,6 +1863,17 @@ async def _handle_index(request):
     return web.Response(text=_DESIGN_HTML, content_type="text/html", charset="utf-8")
 
 
+async def _handle_asset(request):
+    """Return whitelisted dashboard image assets."""
+    filename = Path(request.match_info["filename"]).name
+    if filename not in {"bars-logo-transparent.png", "bars-favicon.png"}:
+        raise web.HTTPNotFound()
+    path = ASSET_DIR / filename
+    if not path.exists():
+        raise web.HTTPNotFound()
+    return web.FileResponse(path)
+
+
 async def _handle_state(request):
     """Return the current dashboard state as JSON."""
     data = asdict(state)
@@ -1891,6 +1916,7 @@ async def start_dashboard():
     """Start the dashboard server in the current event loop."""
     app = web.Application()
     app.router.add_get("/", _handle_index)
+    app.router.add_get("/assets/{filename}", _handle_asset)
     app.router.add_get("/api/state", _handle_state)
     app.router.add_get("/api/logs", _handle_logs)
     app.router.add_get("/api/history", _handle_history)
