@@ -57,11 +57,11 @@ from src.config import (
     COPY_FIXED_LOSS_STOP_RATIO,
     FIXED_LOSS_HEAD_BUFFER_ENABLED, FIXED_LOSS_HEAD_BUFFER_PCT,
     DISASTER_STOP_ENABLED, DISASTER_HEAD_DROP_PCT, DISASTER_LOSS_RATIO,
-    BOLL_TREND_GUARD_OBSERVE_ENABLED, BOLL_TREND_GUARD_CONTROL_ENABLED,
-    BOLL_TREND_GUARD_HEAD_ADVERSE_PCT, BOLL_TREND_GUARD_WIDTH_EXPAND,
-    BOLL_TREND_GUARD_WIDTH_PCT, BOLL_TREND_GUARD_SLOPE_WINDOW_MIN,
-    BOLL_TREND_GUARD_MIN_HOLD_MIN, BOLL_TREND_GUARD_Z_MEAN,
-    BOLL_TREND_GUARD_SLOPE_PCT_PER_HOUR, BOLL_TREND_GUARD_NOTIFY_INTERVAL_SEC,
+    TREND_RISK_GUARD_ENABLED, TREND_RISK_SCORE_THRESHOLD,
+    TREND_RISK_HEAD_ADVERSE_PCT, TREND_RISK_KLINE_COUNT,
+    TREND_RISK_MIN_HOLD_MIN, TREND_RISK_SLOPE_WINDOW_MIN,
+    TREND_RISK_MID_SLOPE_PCT_PER_HOUR, TREND_RISK_EDGE_SLOPE_PCT_PER_HOUR,
+    TREND_RISK_WIDTH_EXPAND, TREND_RISK_NOTIFY_INTERVAL_SEC,
     MAX_ENTRY_BATCHES, MAX_TOTAL_ENTRY_RATIO,
     FIRST_BATCH_RATIO,
     SECOND_BATCH_DYNAMIC_BASE_RATIO,
@@ -76,7 +76,7 @@ from src.position_manager import PositionState, OpenBatch
 from src.notify import (
     notify_entry_order, notify_open, notify_close, notify_liq_warning,
     notify_capital_shortage, notify_capital_restored,
-    notify_cross_copy_protect, notify_boll_trend_guard,
+    notify_cross_copy_protect, notify_trend_risk_guard,
 )
 from src.logging_utils import log_action, log_check, log_market
 import src.dashboard as dashboard
@@ -129,10 +129,10 @@ class BollPinStrategy:
         self._boll_history = []
         self._gap_context_df = None
         self._gap_context_row = None
-        self._btg_entry_width = 0.0
-        self._btg_entry_width_pct = 0.0
-        self._btg_entry_time = None
-        self._btg_last_notify_ts = 0.0
+        self._trend_entry_width = 0.0
+        self._trend_entry_width_pct = 0.0
+        self._trend_entry_time = None
+        self._trend_last_notify_ts = 0.0
 
     async def run(self):
         """Run the strategy loop until stopped."""
@@ -264,7 +264,7 @@ class BollPinStrategy:
         return 0.0
 
     def _remember_boll_snapshot(self, row, mark_price: float) -> None:
-        """Keep recent Bollinger shape data for BTG checks."""
+        """Keep recent Bollinger and candle-shape data for trend-risk checks."""
         if mark_price <= 0:
             return
         lower = float(row["boll_lower"])
@@ -276,6 +276,8 @@ class BollPinStrategy:
         self._boll_history.append(
             {
                 "ts": pd.Timestamp(row["ts"]),
+                "high": float(row.get("high", mark_price) or mark_price),
+                "low": float(row.get("low", mark_price) or mark_price),
                 "lower": lower,
                 "mid": mid,
                 "upper": upper,
@@ -285,22 +287,22 @@ class BollPinStrategy:
             }
         )
         keep_after = pd.Timestamp(row["ts"]) - pd.Timedelta(
-            minutes=max(BOLL_TREND_GUARD_SLOPE_WINDOW_MIN * 2, 180)
+            minutes=max(TREND_RISK_SLOPE_WINDOW_MIN * 2, 180)
         )
         while self._boll_history and self._boll_history[0]["ts"] < keep_after:
             self._boll_history.pop(0)
 
-    def _record_btg_entry_reference(self, row, mark_price: float) -> None:
+    def _record_trend_entry_reference(self, row, mark_price: float) -> None:
         """Record the Bollinger width at the first filled batch."""
-        if not self._state.is_active() or self._btg_entry_width > 0:
+        if not self._state.is_active() or self._trend_entry_width > 0:
             return
         width = float(row["boll_upper"] - row["boll_lower"])
         if width <= 0 or mark_price <= 0:
             return
-        self._btg_entry_width = width
-        self._btg_entry_width_pct = width / mark_price
-        self._btg_entry_time = pd.Timestamp(row["ts"])
-        self._btg_last_notify_ts = 0.0
+        self._trend_entry_width = width
+        self._trend_entry_width_pct = width / mark_price
+        self._trend_entry_time = pd.Timestamp(row["ts"])
+        self._trend_last_notify_ts = 0.0
         self._save_runtime_state()
 
     def _series_slope_pct_per_hour(self, values: list[float], start_ts, end_ts) -> float:
@@ -312,64 +314,105 @@ class BollPinStrategy:
             return 0.0
         return (values[-1] - values[0]) / values[0] * 100 / hours
 
-    def _btg_signal(self, row, mark_price: float) -> dict | None:
-        """Return BTG signal metrics when the trend-expansion guard triggers."""
-        if not (BOLL_TREND_GUARD_OBSERVE_ENABLED or BOLL_TREND_GUARD_CONTROL_ENABLED):
+    def _recent_unique_boll_history(self, count: int) -> list[dict]:
+        """Return recent unique candle snapshots from Bollinger history."""
+        unique = []
+        seen = set()
+        for item in reversed(self._boll_history):
+            ts = item["ts"]
+            if ts in seen:
+                continue
+            unique.append(item)
+            seen.add(ts)
+            if len(unique) >= count:
+                break
+        return list(reversed(unique))
+
+    def _trend_risk_signal(self, row, mark_price: float) -> dict | None:
+        """Return trend-risk metrics when adverse trend conditions stack up."""
+        if not TREND_RISK_GUARD_ENABLED:
             return None
         if not self._state.is_active():
             return None
-        if self._btg_entry_width <= 0:
-            self._record_btg_entry_reference(row, mark_price)
+        if self._trend_entry_width <= 0:
+            self._record_trend_entry_reference(row, mark_price)
             return None
-        if self._btg_entry_time is None:
-            self._btg_entry_time = pd.Timestamp(row["ts"])
+        if self._trend_entry_time is None:
+            self._trend_entry_time = pd.Timestamp(row["ts"])
             return None
 
         now = pd.Timestamp(row["ts"])
-        hold_min = (now - pd.Timestamp(self._btg_entry_time)).total_seconds() / 60
-        if hold_min < BOLL_TREND_GUARD_MIN_HOLD_MIN:
+        hold_min = (now - pd.Timestamp(self._trend_entry_time)).total_seconds() / 60
+        if hold_min < TREND_RISK_MIN_HOLD_MIN:
             return None
 
         adverse_pct = self._head_adverse_move_pct(mark_price)
-        if adverse_pct < BOLL_TREND_GUARD_HEAD_ADVERSE_PCT:
+        if adverse_pct < TREND_RISK_HEAD_ADVERSE_PCT:
             return None
 
         width = float(row["boll_upper"] - row["boll_lower"])
-        width_expand = width / self._btg_entry_width if self._btg_entry_width > 0 else 0.0
+        width_expand = width / self._trend_entry_width if self._trend_entry_width > 0 else 0.0
         width_pct = width / mark_price if mark_price > 0 else 0.0
-        if width_expand < BOLL_TREND_GUARD_WIDTH_EXPAND:
-            return None
-        if width_pct < BOLL_TREND_GUARD_WIDTH_PCT:
-            return None
+        mid = float(row["boll_mid"])
 
-        window_start = now - pd.Timedelta(minutes=BOLL_TREND_GUARD_SLOPE_WINDOW_MIN)
+        window_start = now - pd.Timedelta(minutes=TREND_RISK_SLOPE_WINDOW_MIN)
         window = [item for item in self._boll_history if item["ts"] >= window_start]
         if len(window) < 2:
             return None
 
-        z_mean = sum(item["z"] for item in window) / len(window)
-        slope_limit = BOLL_TREND_GUARD_SLOPE_PCT_PER_HOUR
+        mid_slope = self._series_slope_pct_per_hour(
+            [item["mid"] for item in window],
+            window[0]["ts"],
+            window[-1]["ts"],
+        )
+        lower_slope = self._series_slope_pct_per_hour(
+            [item["lower"] for item in window],
+            window[0]["ts"],
+            window[-1]["ts"],
+        )
+        upper_slope = self._series_slope_pct_per_hour(
+            [item["upper"] for item in window],
+            window[0]["ts"],
+            window[-1]["ts"],
+        )
+
+        recent = self._recent_unique_boll_history(max(TREND_RISK_KLINE_COUNT, 2))
+        lows = [item["low"] for item in recent]
+        highs = [item["high"] for item in recent]
+        lower_lows = len(lows) >= TREND_RISK_KLINE_COUNT and all(
+            lows[i] < lows[i - 1] for i in range(1, len(lows))
+        )
+        higher_highs = len(highs) >= TREND_RISK_KLINE_COUNT and all(
+            highs[i] > highs[i - 1] for i in range(1, len(highs))
+        )
+
+        reasons = ["head_adverse"]
+        if width_expand >= TREND_RISK_WIDTH_EXPAND:
+            reasons.append("width_expand")
+
         if self._state.direction == "long":
-            if z_mean > -BOLL_TREND_GUARD_Z_MEAN:
-                return None
-            slope = self._series_slope_pct_per_hour(
-                [item["lower"] for item in window],
-                window[0]["ts"],
-                window[-1]["ts"],
-            )
-            if slope > -slope_limit:
-                return None
+            if mark_price < mid:
+                reasons.append("below_mid")
+            if lower_lows:
+                reasons.append("lower_lows")
+            if mid_slope <= -TREND_RISK_MID_SLOPE_PCT_PER_HOUR:
+                reasons.append("mid_slope_down")
+            if lower_slope <= -TREND_RISK_EDGE_SLOPE_PCT_PER_HOUR:
+                reasons.append("lower_band_down")
         elif self._state.direction == "short":
-            if z_mean < BOLL_TREND_GUARD_Z_MEAN:
-                return None
-            slope = self._series_slope_pct_per_hour(
-                [item["upper"] for item in window],
-                window[0]["ts"],
-                window[-1]["ts"],
-            )
-            if slope < slope_limit:
-                return None
+            if mark_price > mid:
+                reasons.append("above_mid")
+            if higher_highs:
+                reasons.append("higher_highs")
+            if mid_slope >= TREND_RISK_MID_SLOPE_PCT_PER_HOUR:
+                reasons.append("mid_slope_up")
+            if upper_slope >= TREND_RISK_EDGE_SLOPE_PCT_PER_HOUR:
+                reasons.append("upper_band_up")
         else:
+            return None
+
+        score = len(reasons)
+        if score < TREND_RISK_SCORE_THRESHOLD:
             return None
 
         return {
@@ -378,52 +421,52 @@ class BollPinStrategy:
             "adverse_pct": adverse_pct,
             "width_expand": width_expand,
             "width_pct": width_pct,
-            "z_mean": z_mean,
-            "slope_pct_per_hour": slope,
+            "mid_slope": mid_slope,
+            "lower_slope": lower_slope,
+            "upper_slope": upper_slope,
+            "score": score,
+            "reasons": reasons,
             "hold_min": hold_min,
         }
 
-    async def _check_boll_trend_guard(self, client: OKXClient, row, mark_price: float) -> bool:
-        """Notify or close when BTG detects fast trend expansion."""
-        signal = self._btg_signal(row, mark_price)
+    async def _check_trend_risk_guard(self, client: OKXClient, row, mark_price: float) -> bool:
+        """Close the current position when stacked trend-risk signals trigger."""
+        signal = self._trend_risk_signal(row, mark_price)
         if signal is None:
             return False
 
         now = time.time()
-        should_notify = (
-            BOLL_TREND_GUARD_OBSERVE_ENABLED
-            and now - self._btg_last_notify_ts >= BOLL_TREND_GUARD_NOTIFY_INTERVAL_SEC
-        )
+        should_notify = now - self._trend_last_notify_ts >= TREND_RISK_NOTIFY_INTERVAL_SEC
         if should_notify:
             log_action(
-                "BTG observe triggered "
+                "Trend risk guard triggered "
                 f"direction={self._state.direction} mark={mark_price:.2f} "
                 f"head={signal['head_price']:.2f} adverse={signal['adverse_pct']:.2%} "
+                f"score={signal['score']} reasons={','.join(signal['reasons'])} "
                 f"width_expand={signal['width_expand']:.3f} "
                 f"width_pct={signal['width_pct']:.2%} "
-                f"z_mean={signal['z_mean']:.3f} "
-                f"slope={signal['slope_pct_per_hour']:.3f}%/h"
+                f"mid_slope={signal['mid_slope']:.3f}%/h "
+                f"lower_slope={signal['lower_slope']:.3f}%/h "
+                f"upper_slope={signal['upper_slope']:.3f}%/h"
             )
-            self._btg_last_notify_ts = now
+            self._trend_last_notify_ts = now
             self._save_runtime_state()
-            await notify_boll_trend_guard(
+            await notify_trend_risk_guard(
                 self._state.direction,
                 mark_price,
                 signal["head_price"],
                 signal["adverse_pct"],
+                signal["score"],
+                signal["reasons"],
                 signal["width_expand"],
                 signal["width_pct"],
-                signal["z_mean"],
-                signal["slope_pct_per_hour"],
-                BOLL_TREND_GUARD_CONTROL_ENABLED,
+                signal["mid_slope"],
+                signal["lower_slope"],
+                signal["upper_slope"],
             )
 
-        if not BOLL_TREND_GUARD_CONTROL_ENABLED:
-            return False
-
-        log_action("BTG control triggered; emergency close position")
-        await self._emergency_close(client, reason="boll_trend_guard")
-        self._running = False
+        log_action("Trend risk guard close; strategy keeps running")
+        await self._emergency_close(client, reason="trend_risk_guard")
         return True
 
     def _strategy_unrealized_pnl(self, mark_price: float) -> float:
@@ -780,10 +823,10 @@ class BollPinStrategy:
                 "addon_extreme_guard_started": (
                     self._addon_extreme_guard_started if self._state.has_working_plan() else False
                 ),
-                "btg_entry_width": self._btg_entry_width if self._state.is_active() else 0.0,
-                "btg_entry_width_pct": self._btg_entry_width_pct if self._state.is_active() else 0.0,
-                "btg_entry_time": self._ts_to_str(self._btg_entry_time) if self._state.is_active() else None,
-                "btg_last_notify_ts": self._btg_last_notify_ts if self._state.is_active() else 0.0,
+                "trend_entry_width": self._trend_entry_width if self._state.is_active() else 0.0,
+                "trend_entry_width_pct": self._trend_entry_width_pct if self._state.is_active() else 0.0,
+                "trend_entry_time": self._ts_to_str(self._trend_entry_time) if self._state.is_active() else None,
+                "trend_last_notify_ts": self._trend_last_notify_ts if self._state.is_active() else 0.0,
             },
         }
 
@@ -825,10 +868,10 @@ class BollPinStrategy:
         self._addon_extreme_guard_kline_ts = None
         self._addon_extreme_guard_batch_idx = -1
         self._addon_extreme_guard_started = False
-        self._btg_entry_width = 0.0
-        self._btg_entry_width_pct = 0.0
-        self._btg_entry_time = None
-        self._btg_last_notify_ts = 0.0
+        self._trend_entry_width = 0.0
+        self._trend_entry_width_pct = 0.0
+        self._trend_entry_time = None
+        self._trend_last_notify_ts = 0.0
         try:
             if STATE_FILE.exists():
                 STATE_FILE.unlink()
@@ -931,10 +974,18 @@ class BollPinStrategy:
             self._addon_extreme_guard_kline_ts = self._str_to_ts(strategy.get("addon_extreme_guard_kline_ts"))
             self._addon_extreme_guard_batch_idx = int(strategy.get("addon_extreme_guard_batch_idx", -1) or -1)
             self._addon_extreme_guard_started = bool(strategy.get("addon_extreme_guard_started", False))
-            self._btg_entry_width = float(strategy.get("btg_entry_width", 0) or 0)
-            self._btg_entry_width_pct = float(strategy.get("btg_entry_width_pct", 0) or 0)
-            self._btg_entry_time = self._str_to_ts(strategy.get("btg_entry_time"))
-            self._btg_last_notify_ts = float(strategy.get("btg_last_notify_ts", 0) or 0)
+            self._trend_entry_width = float(
+                strategy.get("trend_entry_width", strategy.get("btg_entry_width", 0)) or 0
+            )
+            self._trend_entry_width_pct = float(
+                strategy.get("trend_entry_width_pct", strategy.get("btg_entry_width_pct", 0)) or 0
+            )
+            self._trend_entry_time = self._str_to_ts(
+                strategy.get("trend_entry_time", strategy.get("btg_entry_time"))
+            )
+            self._trend_last_notify_ts = float(
+                strategy.get("trend_last_notify_ts", strategy.get("btg_last_notify_ts", 0)) or 0
+            )
             self._sanitize_runtime_state()
             if self._sync_known_batch_sizes():
                 self._save_runtime_state()
@@ -1030,9 +1081,11 @@ class BollPinStrategy:
         # 4. 濠电姷鏁告慨鐑藉极閸涘﹥鍙忛柣鎴ｆ閺嬩線鏌涘☉姗堟敾闁告瑥绻橀弻锝夊箣濠垫劖缍楅梺閫炲苯澧柛濠傛健楠炴劖绻濋崘顏嗗骄闂佸啿鎼鍥╃矓椤旈敮鍋撶憴鍕８闁告梹鍨甸锝夊醇閺囩偟顓洪梺缁樼懃閹虫劙鐛姀锛勭瘈闁汇垽娼ф禒锕傛煙缁嬫鐓肩€规洘妞藉畷姗€顢欓懖鈺嬬幢闂備浇顫夐崕鎶芥倶閸儱纾婚柟鎹愬煐閸犲棝鏌涢弴銊ュ妞わ富鍙冨铏规兜閸涱喚褰ч梺瑙勬倐缁犳牕鐣烽敐澶婂窛妞ゆ挆鍕槣闂備線娼ч悧鍡涘箠閹邦喚涓嶅ù鐓庣摠閻撴瑩鏌涢幇顓炵祷妞ゆ帇鍨荤槐鎺楀磼濮樻瘷銏ゆ懚閺嶎厽鐓曟繛鎴濆船閺嬫捇鏌熼柨瀣仢闁哄矉缍侀幃鈺呭礂閸涙澘鐒婚梻浣告啞閺屻劑鎯岄崒姘煎殨闁归棿绀佸Λ姗€骞栫€涙ɑ灏伴柡鍌楀亾濠碉紕鍋戦崐鏍ь潖婵犳艾鐓曢柛顐犲劚閸氬綊鏌ｉ弮鍥仩缁炬儳鍚嬮妵鍕籍閸屾瀚涢梺缁樻崄閸嬫劙鍩€椤掍緡鍟忛柛鐘崇☉閳绘柨鈽夊鍛綍闂傚倸鍊搁崐鎼佹偋婵犲嫮鐭欓柟鎯у閻挻绻涘顔荤凹闁绘挻绋戦湁闁挎繂娲﹂崵鈧繝娈垮枛閻楀繘鍩€椤掆偓閻忔艾顭垮Ο灏栧亾濮樼厧澧查柣蹇斿笒閳规垿鎮欑捄铏规缂備緡鍣崹鎯版＂濠电偞鍨惰彜闁衡偓娴犲鐓熸俊顖濇娴犳盯鏌￠崱蹇旀珚闁哄本绋撻埀顒婄秵閸嬪棗煤閹绢喗瀵犳繝闈涙储娴滄粓鏌熼幆褍鑸归柣蹇婃櫊閺屾盯濡搁妷銉㈠亾閹间焦绠掗梻浣虹帛閿氭俊顖氾躬瀹曟洝绠涘☉娆戝弮闂佸憡鍔︽禍婊堝几濞戙垺鐓涢悘鐐额嚙婵倿鏌熼鍝勭伈鐎规洦鍋婂畷鐔煎箣濞嗗繒浼勭紓浣介哺鐢繝宕洪埀顒併亜閹烘垵鈧敻宕戦幘缁樻櫜閹肩补鍓濋悘宥夋⒑閹惰姤鏁遍悽顖ょ節瀵鈽夐姀鈺傛櫇闂侀潧鐗嗛幊蹇涙倶娓氣偓濮婃椽妫冨☉娆樻！闁汇埄鍨辩敮鈥筹耿娓氣偓濮婅櫣绱掑鍫滅返闂佺顑呴幊搴ㄥ煝瀹ュ棛绡€闁告劏鏅涘鎸庣節閻㈤潧孝闁瑰啿绻橀、鏃堟偐缂佹鍘垫俊鐐差儏妤犳悂鍩㈤崼銉︾厱闁靛绠戦崝銈夋煟閿濆洤鍘寸€规洖鐖奸弫鍌炴寠婢跺苯骞堢紓鍌氬€搁崐鎼佸磹閹间礁纾瑰瀣婵ジ鏌＄仦璇插姎缁炬儳顭烽弻鐔煎礈瑜嶆禒娲煃瑜滈崜姘辨暜閹烘缍栨繝闈涱儐閺呮煡鏌涘☉鍗炲妞ゃ儲鑹鹃埞鎴︽晬閸曨偂鏉梺绋匡攻閸ㄥ灝鐣烽悷鎳婃椽顢旈崨顓濈敾闂備線娼ц噹闁告侗鍓涢悷婵囩節閻㈤潧浠﹂柛銊﹀劶瑜版粌鈹戦埄鍐ㄧ祷闁绘锕ョ粚杈ㄧ節閸ヨ埖鏅┑鐘欏懎浜鹃悗姘洴濮婃椽宕妷銉ょ钵缂備緡鍠楅悷銉╋綖韫囨洜纾兼俊顖濐嚙椤庢捇姊洪崨濠勨槈闁挎洏鍔庡☉鐢稿焵椤掑嫭鈷掑ù锝勮閻掑墽绱掗妸锔姐仢鐎规洘鍔曢埞鎴犫偓锝庘偓顓滃劦閺屾盯骞囬棃娑欑亪濡ょ姷鍋戦崹铏规崲濞戙垹骞㈡俊銈勭劍瀹曟娊姊洪崨濠冨蔼闁告柨鐭傞崺鐐哄箣閿旇棄鈧兘鏌涘▎蹇ｆ▓婵☆偓绻濆娲捶椤撗呭姼濡炪値鍘鹃崗妯虹暦閸濆嫧妲堥柕蹇曞Х椤撴椽姊洪幐搴⑩拻闁哄拋鍋婂畷銏ゆ偨閻㈢數锛濇繛杈剧到婢瑰﹪宕曢幇鐗堝€电紒妤佺☉濞层倗绮婚弻銉︾叆婵犻潧妫Σ褰掓煟閹惧啿鏆ｉ柡宀嬬畱铻ｅ〒姘煎灡閳绘挸鈹戦埥鍡楃仚闁稿鎹囧缁樻媴閸涘﹥鍎撻柣鐐村嚬閸嬪﹤鐣烽幇鏉垮嵆闁绘ɑ褰冮悿楣冩⒒娴ｈ棄鍚瑰┑顔芥綑鐓ら柍鍝勫暕閻掑﹥绻涢崱妯哄妞も晝鍏橀弻鐔兼⒒鐎电濡介梺鎶芥敱閸ㄥ潡寮婚敐澶嬪亜缂佸顑欏Λ鍡涙⒑閹稿海鈽夌紒澶婄秺瀵鈽夐姀鈥充汗閻庤娲栧ú銈夊煕鐏炶娇鏃堟偐闂堟稐绮堕梺鍝ュ枎閻°劑骞堥妸鈺佺劦妞ゆ帒瀚悡蹇涙煕椤愶絿绠栨い銉︾矊闇夋繝濠傚濞堟粓鏌″畝鈧崰鏍箠濠靛鍋嬮柛顐ｇ箖闁款厾绱撻崒娆戝妽鐟滄澘鍟…鍥灳閹颁礁娈ㄩ梺瑙勫劶濡嫰锝為崨瀛樼厪闁割偅绻冮ˉ鎴︽煙妞嬪海甯涚紒缁樼洴楠炴﹢寮堕幋鐘插Р闂備胶顭堥鍡涘箰閼姐倖宕叉繛鎴炵懄婵挳鏌涢幇顒€绾ч柛锝堟閳ь剝顫夊ú姗€鎮￠敓鐘茶摕闁绘柨鍚嬮崐缁樹繆椤栨繍鍤欑痪鏉跨Ч濮婃椽骞栭悙鎻掝瀴濠殿喖锕ょ紞濠冧繆閻㈢绀嬫い鏍ㄦ皑椤旀帡鏌ｉ悩鑽ょ窗闁靛棌鍋撻梺绋款儐閹瑰洭寮幇顓炵窞閻庯綆鍋呴悵鎶芥⒒娴ｈ櫣銆婇柛鎾寸箞閹柉顦归柟顖欑窔瀹曠厧鈹戦崘鈺傛澑婵＄偑鍊栧褰掑几缂佹鐟规繛鎴欏灪閻撴洘鎱ㄥ璇蹭壕缂備胶濮甸悧鏇㈡偩閻戣棄顫呴柕鍫濇噽椤旀劖绻涙潏鍓у埌闁告ɑ绮撻獮蹇撁洪鍛嫼闂佸憡绋戦敃锕傚煡婢舵劖鐓ラ柡鍥埀顒佺墵楠炲牓濡搁埡浣哄€炲銈嗗笂缁€渚€鍩€椤掆偓閻忔岸骞堥妸銉庣喖鎮℃惔鈥茬帛濠电姭鎷冮崘鎯ф闂侀€炲苯澧叉い顐㈩槸鐓ゆ慨妞诲亾鐎规洘绻傝灃闁告侗鍘鹃鍡涙⒑缂佹﹩鐒炬い銉ユ瀹曠兘顢樺☉妯瑰闂佹寧绻傛鍛婄閻愯鐟邦煥閸曨厽鍣板┑顔硷功缁垳绮悢鐓庣劦妞ゆ巻鍋撴い顓炴穿椤︽挳鏌熼獮鍨伈妤犵偞甯￠獮姗€鎳犻鍌滄毎缂傚倷鑳堕崑鎾诲磿閹剁瓔鏁勯柛鎰ㄦ櫇椤╄尙鎲搁悧鍫濈瑲闁绘挻鐟╅弻锝夊箣閻愬棙鍨规禍鎼佹偋閸垻顔曢梺鍛婁緱閸犳岸鎯岄幒鎾村弿濠电姴鍟妵婵堚偓瑙勬磸閸斿秶鎹㈠┑鍥ㄥ闁惧繐婀遍悾鎶芥⒒閸屾瑧鍔嶉柟顔肩埣瀹曟繂鐣濋埀顒傚垝閺冨倹鍠嗛柛鏇ㄤ簽缁犳岸姊洪崜鎻掍簼婵炲弶鐗犻幃娆愮節閸ャ劎鍙嗗┑鐘绘涧濡瑩宕崇粙娆剧唵閻熸瑥瀚粈瀣煛瀹€瀣М闁诡喓鍨藉畷顐﹀Ψ閿曗偓濞呮垿姊虹拠鎻掝劉闁告垵缍婂畷鎶芥晲婢跺苯绁﹀┑掳鍊曢幊搴ｇ矆閸愨斂浜滄い鎾跺枎閻忥箓鎮楅棃娑氱劯闁哄矉绲鹃幆鏃堝Ω閿斾粙鏁┑鐘灮閹虫捇鏁冮鍫濈畺闁绘劗鍎ら崐閿嬨亜閹存繂缍栫紒銊ヮ煼濮婃椽宕崟顒€顦╅梺鎸庡哺閺屾盯寮幘鎰佹喘闂侀€炲苯澧叉い顐㈩槸鐓ゆ繝濠傜墕缁愭鏌″搴″箲闁逞屽厸缁€浣界亙婵炶揪绲块幊鎾活敁閹剧粯鈷戦柟顖嗗懐顔囨繝鈷€宥囩М濠德ゅ煐瀵板嫮鈧急鍕伜婵犵數鍋犻幓顏嗗緤閸фせ鈧箓宕奸妷銉﹁緢闂備緡鍓欑粔鐢告偂濞嗘垹妫柡澶婄仢閼哥懓霉濠婂嫬顥嬮柍褜鍓濋～澶娒哄鈧畷婵嬪冀椤愶絽搴婂┑鐘绘涧濡厼顭囬埡鍌樹簻闁瑰搫绉电粊鎵磼闊彃鐏叉慨濠勭帛閹峰懘鎼归悷鎵偧婵＄偑鍊ら崢鐓幟洪妸鈺佺闁圭儤顨忛弫宥夋煟閹邦厽缍戝ù婊勵殜濮婅櫣绱掑Ο鑽ゅ弳闂佸憡鑹鹃澶愬箖閿熺姵鍋勯柛蹇氬亹閸樼敻姊绘笟鍥у伎缂佺姵鍨堕弲鑸电節濮橆厾鍘遍梺闈涚墕濞层倝寮稿☉銏＄厸閻忕偟鏅倴缂備緡鍣崣鍐ㄧ暦椤愶箑绀嬮柕濞垮劙婢规洖鈹戦悩缁樻锭妞ゆ垵鎳橀幏鎴︽偄閸濄儳顔曢梺鐟邦嚟閸嬬喖骞婇崟顖涚厱閹艰揪绲介弸娑㈡煛鐏炵偓绀夌紒鐘崇洴瀵挳鎮滈崱蹇撲壕閻忕偛褰炵换鍡樸亜閹扳晛鐏い銉ｅ灪閹便劍绻濋崘鈹夸虎閻庤娲忛崝宥囨崲濠靛纾兼繝濠傛噺閸ゅ啴姊绘担鍦菇闁糕晛瀚板畷褰掝敂閸繄顦┑鐘绘涧濞层劑鍩炲鍛斀闁绘ê寮堕幖鎰磼閻樺灚鍤€闂囧鏌ㄥ┑鍡樺櫤闁瑰弶鎮傞弻娑樜熼悜妯烘殘缂備胶绮粙鎺戭焽韫囨稑绀堢憸宥夘敋闁秵鐓熼柣姗嗗亜娴滈箖姊洪幐搴㈢闁稿﹤鎽滅槐?
         if self._state.is_active():
             await self._check_position_closed(client, mark_price, last["ts"])
+        if self._state.is_active():
+            self._record_trend_entry_reference(last, mark_price)
         if self._state.is_active() and self._update_addon_extreme_guard_from_completed_kline(df, last):
             self._save_runtime_state()
-        if await self._check_boll_trend_guard(client, last, mark_price):
+        if await self._check_trend_risk_guard(client, last, mark_price):
             self._update_dashboard(mark_price, last, account_equity)
             return
         if await self._check_disaster_stop(client, mark_price):
@@ -1214,9 +1267,9 @@ class BollPinStrategy:
 
         mult = 1.0
         row = self._gap_context_row
-        if row is not None and self._btg_entry_width > 0:
+        if row is not None and self._trend_entry_width > 0:
             width = float(row["boll_upper"] - row["boll_lower"])
-            expand = width / self._btg_entry_width
+            expand = width / self._trend_entry_width
             if expand >= ADDON_DYNAMIC_GAP_BOLL_STRONG:
                 mult *= ADDON_DYNAMIC_GAP_BOLL_MAX_MULT
             elif expand >= ADDON_DYNAMIC_GAP_BOLL_START:

@@ -78,7 +78,7 @@ SERVERCHAN_KEY=你的SendKey
 3. 在 SendKey 页面复制自己的 SendKey。
 4. 写入 `.env` 的 `SERVERCHAN_KEY`。
 
-程序会在策略触发的开仓挂单、开仓成交、补仓挂单、补仓成交、平仓、资金不足、资金恢复、BTG 观察、带单保护和强平风险事件中发送通知。强平预警只在距离强平价 `10U` 内提醒，并且同一持仓最多每 1 小时提醒一次。
+程序会在策略触发的开仓挂单、开仓成交、补仓挂单、补仓成交、平仓、资金不足、资金恢复、趋势风险守卫、带单保护和强平风险事件中发送通知。强平预警只在距离强平价 `10U` 内提醒，并且同一持仓最多每 1 小时提醒一次。
 
 ## 行情采样和交易节奏
 
@@ -302,17 +302,16 @@ DISASTER_LOSS_RATIO = 0.7
 
 只有同时满足头仓逆向达到 `5%`，并且本轮浮亏达到 `TRADING_ACCOUNT_TARGET * 70%`，才触发灾难止损。
 
-BTG 布林趋势扩张守卫：
+趋势风险守卫：
 
 ```python
-BOLL_TREND_GUARD_OBSERVE_ENABLED = True
-BOLL_TREND_GUARD_CONTROL_ENABLED = False
-BOLL_TREND_GUARD_HEAD_ADVERSE_PCT = 0.03
-BOLL_TREND_GUARD_WIDTH_EXPAND = 2.5
-BOLL_TREND_GUARD_WIDTH_PCT = 0.035
+TREND_RISK_GUARD_ENABLED = False
+TREND_RISK_SCORE_THRESHOLD = 4
+TREND_RISK_HEAD_ADVERSE_PCT = 0.03
+TREND_RISK_WIDTH_EXPAND = 2.0
 ```
 
-当前 BTG 是观察模式：只记录和推送，不自动平仓。控制模式只有在 `BOLL_TREND_GUARD_CONTROL_ENABLED=True` 时才会平仓。
+默认关闭。开启后，程序会在头仓逆向幅度、布林中轨/边轨斜率、连续 K 线极值恶化、价格相对中轨位置、布林宽度扩张等条件同时恶化时平掉当前仓位，但不会停机，后续仍按策略继续运行。
 
 ## 固本资金和全仓带单保护
 
@@ -421,6 +420,10 @@ COPY_FIXED_LOSS_STOP_RATIO
 FIXED_LOSS_HEAD_BUFFER_PCT
 DISASTER_HEAD_DROP_PCT
 DISASTER_LOSS_RATIO
+TREND_RISK_GUARD_ENABLED
+TREND_RISK_SCORE_THRESHOLD
+TREND_RISK_HEAD_ADVERSE_PCT
+TREND_RISK_WIDTH_EXPAND
 ADDON_DYNAMIC_GAP_MAX_USD
 ```
 

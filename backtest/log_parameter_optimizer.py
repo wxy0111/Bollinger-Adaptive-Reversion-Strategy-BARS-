@@ -50,17 +50,15 @@ from src.config import (
     BOLL_TP_COMPRESSION_ENABLED,
     BOLL_TP_COMPRESSION_EXIT_OFFSET_USD,
     BOLL_TP_COMPRESSION_MIN_RETURN,
-    BOLL_TREND_GUARD_ENABLED,
-    BOLL_TREND_GUARD_CONTROL_ENABLED,
-    BOLL_TREND_GUARD_HEAD_ADVERSE_PCT,
-    BOLL_TREND_GUARD_MIN_HOLD_MIN,
-    BOLL_TREND_GUARD_OBSERVE_ENABLED,
-    BOLL_TREND_GUARD_SLOPE_PCT_PER_HOUR,
-    BOLL_TREND_GUARD_SLOPE_WINDOW_MIN,
-    BOLL_TREND_GUARD_STOP_AFTER_CLOSE,
-    BOLL_TREND_GUARD_WIDTH_EXPAND,
-    BOLL_TREND_GUARD_WIDTH_PCT,
-    BOLL_TREND_GUARD_Z_MEAN,
+    TREND_RISK_GUARD_ENABLED,
+    TREND_RISK_SCORE_THRESHOLD,
+    TREND_RISK_HEAD_ADVERSE_PCT,
+    TREND_RISK_KLINE_COUNT,
+    TREND_RISK_MIN_HOLD_MIN,
+    TREND_RISK_SLOPE_WINDOW_MIN,
+    TREND_RISK_MID_SLOPE_PCT_PER_HOUR,
+    TREND_RISK_EDGE_SLOPE_PCT_PER_HOUR,
+    TREND_RISK_WIDTH_EXPAND,
     DISASTER_HEAD_DROP_PCT,
     DISASTER_LOSS_RATIO,
     DISASTER_STOP_ENABLED,
@@ -141,6 +139,10 @@ CORE_OPTIMIZED_FIELDS = (
     "fixed_loss_head_buffer_pct",
     "disaster_head_drop_pct",
     "disaster_loss_ratio",
+    "trend_risk_guard_enabled",
+    "trend_risk_score_threshold",
+    "trend_risk_head_adverse_pct",
+    "trend_risk_width_expand",
     "addon_dynamic_gap_max_usd",
 )
 
@@ -201,17 +203,15 @@ class Params:
     disaster_stop_enabled: int = int(DISASTER_STOP_ENABLED)
     disaster_head_drop_pct: float = DISASTER_HEAD_DROP_PCT
     disaster_loss_ratio: float = DISASTER_LOSS_RATIO
-    boll_trend_guard_enabled: int = int(BOLL_TREND_GUARD_ENABLED)
-    boll_trend_guard_observe_enabled: int = int(BOLL_TREND_GUARD_OBSERVE_ENABLED)
-    boll_trend_guard_control_enabled: int = int(BOLL_TREND_GUARD_CONTROL_ENABLED)
-    boll_trend_guard_head_adverse_pct: float = BOLL_TREND_GUARD_HEAD_ADVERSE_PCT
-    boll_trend_guard_width_expand: float = BOLL_TREND_GUARD_WIDTH_EXPAND
-    boll_trend_guard_width_pct: float = BOLL_TREND_GUARD_WIDTH_PCT
-    boll_trend_guard_slope_window_min: float = BOLL_TREND_GUARD_SLOPE_WINDOW_MIN
-    boll_trend_guard_min_hold_min: float = BOLL_TREND_GUARD_MIN_HOLD_MIN
-    boll_trend_guard_z_mean: float = BOLL_TREND_GUARD_Z_MEAN
-    boll_trend_guard_slope_pct_per_hour: float = BOLL_TREND_GUARD_SLOPE_PCT_PER_HOUR
-    boll_trend_guard_stop_after_close: int = int(BOLL_TREND_GUARD_STOP_AFTER_CLOSE)
+    trend_risk_guard_enabled: int = int(TREND_RISK_GUARD_ENABLED)
+    trend_risk_score_threshold: int = TREND_RISK_SCORE_THRESHOLD
+    trend_risk_head_adverse_pct: float = TREND_RISK_HEAD_ADVERSE_PCT
+    trend_risk_kline_count: int = TREND_RISK_KLINE_COUNT
+    trend_risk_min_hold_min: float = TREND_RISK_MIN_HOLD_MIN
+    trend_risk_slope_window_min: float = TREND_RISK_SLOPE_WINDOW_MIN
+    trend_risk_mid_slope_pct_per_hour: float = TREND_RISK_MID_SLOPE_PCT_PER_HOUR
+    trend_risk_edge_slope_pct_per_hour: float = TREND_RISK_EDGE_SLOPE_PCT_PER_HOUR
+    trend_risk_width_expand: float = TREND_RISK_WIDTH_EXPAND
     addon_dynamic_gap_enabled: int = int(ADDON_DYNAMIC_GAP_ENABLED)
     addon_dynamic_gap_max_usd: float = ADDON_DYNAMIC_GAP_MAX_USD
     addon_dynamic_gap_boll_start: float = ADDON_DYNAMIC_GAP_BOLL_START
@@ -306,6 +306,7 @@ class LogReplay:
         self.current_price = 0.0
         self._current_row = None
         self.kline_extremes = ticks.groupby("kline_ts").agg(low=("price", "min"), high=("price", "max"))
+        self._trend_kline_extremes: dict[pd.Timestamp, dict[str, float]] = {}
         self.addon_extreme_guard_price = 0.0
         self.addon_extreme_guard_kline = None
         self.addon_extreme_guard_started = False
@@ -332,9 +333,9 @@ class LogReplay:
         self.cross_copy_stop = 0
         self.fixed_loss_stop = 0
         self.disaster_stop = 0
-        self.boll_trend_guard_signal = 0
-        self.boll_trend_guard_stop = 0
-        self.boll_trend_guard_active = False
+        self.trend_risk_guard_signal = 0
+        self.trend_risk_guard_stop = 0
+        self.trend_risk_guard_active = False
         self.stopped = False
         self.width_cancel = 0
         self.inside_cancel = 0
@@ -481,9 +482,19 @@ class LogReplay:
         price = float(row.price)
         half_width = upper - mid
         z = (price - mid) / half_width if half_width else 0.0
+        kline_ts = pd.Timestamp(row.kline_ts)
+        kline_extreme = self._trend_kline_extremes.setdefault(
+            kline_ts,
+            {"high": price, "low": price},
+        )
+        kline_extreme["high"] = max(kline_extreme["high"], price)
+        kline_extreme["low"] = min(kline_extreme["low"], price)
         self.boll_history.append(
             {
                 "ts": pd.Timestamp(row.ts),
+                "kline_ts": kline_ts,
+                "high": kline_extreme["high"],
+                "low": kline_extreme["low"],
                 "lower": lower,
                 "mid": mid,
                 "upper": upper,
@@ -493,10 +504,14 @@ class LogReplay:
             }
         )
         keep_after = pd.Timestamp(row.ts) - pd.Timedelta(
-            minutes=max(self.params.boll_trend_guard_slope_window_min * 2, 180)
+            minutes=max(self.params.trend_risk_slope_window_min * 2, 180)
         )
         while self.boll_history and self.boll_history[0]["ts"] < keep_after:
             self.boll_history.pop(0)
+        active_klines = {item["kline_ts"] for item in self.boll_history}
+        self._trend_kline_extremes = {
+            ts: value for ts, value in self._trend_kline_extremes.items() if ts in active_klines
+        }
 
     def _width_ok(self, row) -> bool:
         _, _, _, width = self._bands(row)
@@ -984,13 +999,23 @@ class LogReplay:
             return 0.0
         return (values[-1] - values[0]) / values[0] * 100 / hours
 
-    def _boll_trend_guard_triggered(self, row) -> bool:
-        """Detect one-way trend expansion after entry."""
-        if not (
-            self.params.boll_trend_guard_enabled
-            or self.params.boll_trend_guard_observe_enabled
-            or self.params.boll_trend_guard_control_enabled
-        ):
+    def _recent_unique_boll_history(self, count: int) -> list[dict]:
+        """Return recent unique candle snapshots from Bollinger history."""
+        unique = []
+        seen = set()
+        for item in reversed(self.boll_history):
+            ts = item.get("kline_ts", item["ts"])
+            if ts in seen:
+                continue
+            unique.append(item)
+            seen.add(ts)
+            if len(unique) >= count:
+                break
+        return list(reversed(unique))
+
+    def _trend_risk_guard_triggered(self, row) -> bool:
+        """Detect stacked trend-risk conditions after entry."""
+        if not self.params.trend_risk_guard_enabled:
             return False
         if not self.pos.is_active():
             return False
@@ -1000,48 +1025,64 @@ class LogReplay:
         now = pd.Timestamp(row.ts)
         entry_ts = pd.Timestamp(self.entry_time)
         hold_min = (now - entry_ts).total_seconds() / 60
-        if hold_min < self.params.boll_trend_guard_min_hold_min:
+        if hold_min < self.params.trend_risk_min_hold_min:
             return False
 
         mark_price = float(row.price)
-        if self._head_adverse_move_pct(mark_price) < self.params.boll_trend_guard_head_adverse_pct:
+        adverse_pct = self._head_adverse_move_pct(mark_price)
+        if adverse_pct < self.params.trend_risk_head_adverse_pct:
             return False
 
-        _, _, _, width = self._bands(row)
+        _, mid, _, width = self._bands(row)
         width_pct = width / mark_price if mark_price > 0 else 0.0
-        if width / self.entry_boll_width < self.params.boll_trend_guard_width_expand:
-            return False
-        if width_pct < self.params.boll_trend_guard_width_pct:
-            return False
-
-        window_start = now - pd.Timedelta(minutes=self.params.boll_trend_guard_slope_window_min)
+        width_expand = width / self.entry_boll_width if self.entry_boll_width > 0 else 0.0
+        window_start = now - pd.Timedelta(minutes=self.params.trend_risk_slope_window_min)
         window = [item for item in self.boll_history if item["ts"] >= window_start]
         if len(window) < 2:
             return False
 
-        z_mean = float(np.mean([item["z"] for item in window]))
-        slope_limit = self.params.boll_trend_guard_slope_pct_per_hour
+        mid_slope = self._series_slope_pct_per_hour(
+            [item["mid"] for item in window],
+            window[0]["ts"],
+            window[-1]["ts"],
+        )
+        lower_slope = self._series_slope_pct_per_hour(
+            [item["lower"] for item in window],
+            window[0]["ts"],
+            window[-1]["ts"],
+        )
+        upper_slope = self._series_slope_pct_per_hour(
+            [item["upper"] for item in window],
+            window[0]["ts"],
+            window[-1]["ts"],
+        )
+
+        recent = self._recent_unique_boll_history(max(self.params.trend_risk_kline_count, 2))
+        lows = [item["low"] for item in recent]
+        highs = [item["high"] for item in recent]
+        lower_lows = len(lows) >= self.params.trend_risk_kline_count and all(
+            lows[i] < lows[i - 1] for i in range(1, len(lows))
+        )
+        higher_highs = len(highs) >= self.params.trend_risk_kline_count and all(
+            highs[i] > highs[i - 1] for i in range(1, len(highs))
+        )
+
+        score = 1
+        if width_expand >= self.params.trend_risk_width_expand:
+            score += 1
         if self.pos.direction == "long":
-            if z_mean > -self.params.boll_trend_guard_z_mean:
-                return False
-            slope = self._series_slope_pct_per_hour(
-                [item["lower"] for item in window],
-                window[0]["ts"],
-                window[-1]["ts"],
-            )
-            return slope <= -slope_limit
+            score += int(mark_price < mid)
+            score += int(lower_lows)
+            score += int(mid_slope <= -self.params.trend_risk_mid_slope_pct_per_hour)
+            score += int(lower_slope <= -self.params.trend_risk_edge_slope_pct_per_hour)
 
-        if self.pos.direction == "short":
-            if z_mean < self.params.boll_trend_guard_z_mean:
-                return False
-            slope = self._series_slope_pct_per_hour(
-                [item["upper"] for item in window],
-                window[0]["ts"],
-                window[-1]["ts"],
-            )
-            return slope >= slope_limit
+        elif self.pos.direction == "short":
+            score += int(mark_price > mid)
+            score += int(higher_highs)
+            score += int(mid_slope >= self.params.trend_risk_mid_slope_pct_per_hour)
+            score += int(upper_slope >= self.params.trend_risk_edge_slope_pct_per_hour)
 
-        return False
+        return score >= self.params.trend_risk_score_threshold
 
     def _process_tick(self, row) -> None:
         if self.stopped:
@@ -1076,27 +1117,19 @@ class LogReplay:
                 reason="鍥哄畾浜忔崯淇濇姢骞充粨",
             )
             self.fixed_loss_stop += 1
-        if self.pos.is_active() and self._boll_trend_guard_triggered(row):
-            if not self.boll_trend_guard_active:
-                self.boll_trend_guard_signal += 1
-                self.boll_trend_guard_active = True
-            control_enabled = bool(
-                self.params.boll_trend_guard_enabled
-                or self.params.boll_trend_guard_control_enabled
+        if self.pos.is_active() and self._trend_risk_guard_triggered(row):
+            if not self.trend_risk_guard_active:
+                self.trend_risk_guard_signal += 1
+                self.trend_risk_guard_active = True
+            self._close(
+                float(row.price),
+                str(row.ts),
+                float(row.price),
+                row.kline_ts,
+                rebalance=True,
+                reason="Trend risk guard close",
             )
-            if control_enabled:
-                self._close(
-                    float(row.price),
-                    str(row.ts),
-                    float(row.price),
-                    row.kline_ts,
-                    rebalance=True,
-                    reason="BTG control close",
-                )
-                self.boll_trend_guard_stop += 1
-                if self.params.boll_trend_guard_stop_after_close:
-                    self.stopped = True
-                    return
+            self.trend_risk_guard_stop += 1
         if self.pos.is_active() and self._disaster_stop_triggered(float(row.price)):
             self._close(
                 float(row.price),
@@ -1451,7 +1484,7 @@ class LogReplay:
         self.addon_extreme_guard_started = False
         self.entry_boll_width = 0.0
         self.entry_boll_width_pct = 0.0
-        self.boll_trend_guard_active = False
+        self.trend_risk_guard_active = False
         self.entry_time = ""
         self.last_batch_kline = None
         self.last_entry_check_kline = None
@@ -1600,17 +1633,15 @@ class LogReplay:
             "disaster_stop_enabled": self.params.disaster_stop_enabled,
             "disaster_head_drop_pct": self.params.disaster_head_drop_pct,
             "disaster_loss_ratio": self.params.disaster_loss_ratio,
-            "boll_trend_guard_enabled": self.params.boll_trend_guard_enabled,
-            "boll_trend_guard_observe_enabled": self.params.boll_trend_guard_observe_enabled,
-            "boll_trend_guard_control_enabled": self.params.boll_trend_guard_control_enabled,
-            "boll_trend_guard_head_adverse_pct": self.params.boll_trend_guard_head_adverse_pct,
-            "boll_trend_guard_width_expand": self.params.boll_trend_guard_width_expand,
-            "boll_trend_guard_width_pct": self.params.boll_trend_guard_width_pct,
-            "boll_trend_guard_slope_window_min": self.params.boll_trend_guard_slope_window_min,
-            "boll_trend_guard_min_hold_min": self.params.boll_trend_guard_min_hold_min,
-            "boll_trend_guard_z_mean": self.params.boll_trend_guard_z_mean,
-            "boll_trend_guard_slope_pct_per_hour": self.params.boll_trend_guard_slope_pct_per_hour,
-            "boll_trend_guard_stop_after_close": self.params.boll_trend_guard_stop_after_close,
+            "trend_risk_guard_enabled": self.params.trend_risk_guard_enabled,
+            "trend_risk_score_threshold": self.params.trend_risk_score_threshold,
+            "trend_risk_head_adverse_pct": self.params.trend_risk_head_adverse_pct,
+            "trend_risk_kline_count": self.params.trend_risk_kline_count,
+            "trend_risk_min_hold_min": self.params.trend_risk_min_hold_min,
+            "trend_risk_slope_window_min": self.params.trend_risk_slope_window_min,
+            "trend_risk_mid_slope_pct_per_hour": self.params.trend_risk_mid_slope_pct_per_hour,
+            "trend_risk_edge_slope_pct_per_hour": self.params.trend_risk_edge_slope_pct_per_hour,
+            "trend_risk_width_expand": self.params.trend_risk_width_expand,
             "addon_dynamic_gap_enabled": self.params.addon_dynamic_gap_enabled,
             "addon_dynamic_gap_max_usd": self.params.addon_dynamic_gap_max_usd,
             "addon_dynamic_gap_boll_start": self.params.addon_dynamic_gap_boll_start,
@@ -1662,8 +1693,8 @@ class LogReplay:
             "cross_copy_stop": self.cross_copy_stop,
             "fixed_loss_stop": self.fixed_loss_stop,
             "disaster_stop": self.disaster_stop,
-            "boll_trend_guard_signal": self.boll_trend_guard_signal,
-            "boll_trend_guard_stop": self.boll_trend_guard_stop,
+            "trend_risk_guard_signal": self.trend_risk_guard_signal,
+            "trend_risk_guard_stop": self.trend_risk_guard_stop,
             "dynamic_gap_events": self.dynamic_gap_events,
             "dynamic_gap_avg_mult": round(
                 self.dynamic_gap_mult_total / self.dynamic_gap_events, 4
@@ -1818,17 +1849,15 @@ def _param_value_lists(args) -> list[list[float] | list[int]]:
         [int(DISASTER_STOP_ENABLED)],
         parse_float_list(args.disaster_head_drop_pct),
         parse_float_list(args.disaster_loss_ratio),
-        [int(BOLL_TREND_GUARD_ENABLED)],
-        [int(BOLL_TREND_GUARD_OBSERVE_ENABLED)],
-        [int(BOLL_TREND_GUARD_CONTROL_ENABLED)],
-        [BOLL_TREND_GUARD_HEAD_ADVERSE_PCT],
-        [BOLL_TREND_GUARD_WIDTH_EXPAND],
-        [BOLL_TREND_GUARD_WIDTH_PCT],
-        [BOLL_TREND_GUARD_SLOPE_WINDOW_MIN],
-        [BOLL_TREND_GUARD_MIN_HOLD_MIN],
-        [BOLL_TREND_GUARD_Z_MEAN],
-        [BOLL_TREND_GUARD_SLOPE_PCT_PER_HOUR],
-        [int(BOLL_TREND_GUARD_STOP_AFTER_CLOSE)],
+        parse_int_list(args.trend_risk_guard_enabled),
+        parse_int_list(args.trend_risk_score_threshold),
+        parse_float_list(args.trend_risk_head_adverse_pct),
+        [TREND_RISK_KLINE_COUNT],
+        [TREND_RISK_MIN_HOLD_MIN],
+        [TREND_RISK_SLOPE_WINDOW_MIN],
+        [TREND_RISK_MID_SLOPE_PCT_PER_HOUR],
+        [TREND_RISK_EDGE_SLOPE_PCT_PER_HOUR],
+        parse_float_list(args.trend_risk_width_expand),
         [int(ADDON_DYNAMIC_GAP_ENABLED)],
         parse_float_list(args.addon_dynamic_gap_max_usd),
         [ADDON_DYNAMIC_GAP_BOLL_START],
@@ -1991,17 +2020,15 @@ def current_config_params(args) -> Params:
         disaster_stop_enabled=int(DISASTER_STOP_ENABLED),
         disaster_head_drop_pct=DISASTER_HEAD_DROP_PCT,
         disaster_loss_ratio=DISASTER_LOSS_RATIO,
-        boll_trend_guard_enabled=int(BOLL_TREND_GUARD_ENABLED),
-        boll_trend_guard_observe_enabled=int(BOLL_TREND_GUARD_OBSERVE_ENABLED),
-        boll_trend_guard_control_enabled=int(BOLL_TREND_GUARD_CONTROL_ENABLED),
-        boll_trend_guard_head_adverse_pct=BOLL_TREND_GUARD_HEAD_ADVERSE_PCT,
-        boll_trend_guard_width_expand=BOLL_TREND_GUARD_WIDTH_EXPAND,
-        boll_trend_guard_width_pct=BOLL_TREND_GUARD_WIDTH_PCT,
-        boll_trend_guard_slope_window_min=BOLL_TREND_GUARD_SLOPE_WINDOW_MIN,
-        boll_trend_guard_min_hold_min=BOLL_TREND_GUARD_MIN_HOLD_MIN,
-        boll_trend_guard_z_mean=BOLL_TREND_GUARD_Z_MEAN,
-        boll_trend_guard_slope_pct_per_hour=BOLL_TREND_GUARD_SLOPE_PCT_PER_HOUR,
-        boll_trend_guard_stop_after_close=int(BOLL_TREND_GUARD_STOP_AFTER_CLOSE),
+        trend_risk_guard_enabled=int(TREND_RISK_GUARD_ENABLED),
+        trend_risk_score_threshold=TREND_RISK_SCORE_THRESHOLD,
+        trend_risk_head_adverse_pct=TREND_RISK_HEAD_ADVERSE_PCT,
+        trend_risk_kline_count=TREND_RISK_KLINE_COUNT,
+        trend_risk_min_hold_min=TREND_RISK_MIN_HOLD_MIN,
+        trend_risk_slope_window_min=TREND_RISK_SLOPE_WINDOW_MIN,
+        trend_risk_mid_slope_pct_per_hour=TREND_RISK_MID_SLOPE_PCT_PER_HOUR,
+        trend_risk_edge_slope_pct_per_hour=TREND_RISK_EDGE_SLOPE_PCT_PER_HOUR,
+        trend_risk_width_expand=TREND_RISK_WIDTH_EXPAND,
         addon_dynamic_gap_enabled=int(ADDON_DYNAMIC_GAP_ENABLED),
         addon_dynamic_gap_max_usd=ADDON_DYNAMIC_GAP_MAX_USD,
         addon_dynamic_gap_boll_start=ADDON_DYNAMIC_GAP_BOLL_START,
@@ -2121,17 +2148,19 @@ def params_from_report_row(row: dict) -> Params:
         disaster_stop_enabled=row["disaster_stop_enabled"],
         disaster_head_drop_pct=row["disaster_head_drop_pct"],
         disaster_loss_ratio=row["disaster_loss_ratio"],
-        boll_trend_guard_enabled=row["boll_trend_guard_enabled"],
-        boll_trend_guard_observe_enabled=row["boll_trend_guard_observe_enabled"],
-        boll_trend_guard_control_enabled=row["boll_trend_guard_control_enabled"],
-        boll_trend_guard_head_adverse_pct=row["boll_trend_guard_head_adverse_pct"],
-        boll_trend_guard_width_expand=row["boll_trend_guard_width_expand"],
-        boll_trend_guard_width_pct=row["boll_trend_guard_width_pct"],
-        boll_trend_guard_slope_window_min=row["boll_trend_guard_slope_window_min"],
-        boll_trend_guard_min_hold_min=row["boll_trend_guard_min_hold_min"],
-        boll_trend_guard_z_mean=row["boll_trend_guard_z_mean"],
-        boll_trend_guard_slope_pct_per_hour=row["boll_trend_guard_slope_pct_per_hour"],
-        boll_trend_guard_stop_after_close=row["boll_trend_guard_stop_after_close"],
+        trend_risk_guard_enabled=row.get("trend_risk_guard_enabled", int(TREND_RISK_GUARD_ENABLED)),
+        trend_risk_score_threshold=row.get("trend_risk_score_threshold", TREND_RISK_SCORE_THRESHOLD),
+        trend_risk_head_adverse_pct=row.get("trend_risk_head_adverse_pct", TREND_RISK_HEAD_ADVERSE_PCT),
+        trend_risk_kline_count=row.get("trend_risk_kline_count", TREND_RISK_KLINE_COUNT),
+        trend_risk_min_hold_min=row.get("trend_risk_min_hold_min", TREND_RISK_MIN_HOLD_MIN),
+        trend_risk_slope_window_min=row.get("trend_risk_slope_window_min", TREND_RISK_SLOPE_WINDOW_MIN),
+        trend_risk_mid_slope_pct_per_hour=row.get(
+            "trend_risk_mid_slope_pct_per_hour", TREND_RISK_MID_SLOPE_PCT_PER_HOUR
+        ),
+        trend_risk_edge_slope_pct_per_hour=row.get(
+            "trend_risk_edge_slope_pct_per_hour", TREND_RISK_EDGE_SLOPE_PCT_PER_HOUR
+        ),
+        trend_risk_width_expand=row.get("trend_risk_width_expand", TREND_RISK_WIDTH_EXPAND),
         addon_dynamic_gap_enabled=row["addon_dynamic_gap_enabled"],
         addon_dynamic_gap_max_usd=row["addon_dynamic_gap_max_usd"],
         addon_dynamic_gap_boll_start=row["addon_dynamic_gap_boll_start"],
@@ -2225,9 +2254,12 @@ def _markdown_param_rows(rows: list[dict], limit: int = 10) -> list[str]:
             f"{row['second_batch_dynamic_max_ratio']}/"
             f"{row['second_batch_dynamic_full_gap_usd']}|"
             f"{row['dynamic_base_ratio']}/{row['dynamic_min_ratio']}/{row['dynamic_max_ratio']}|"
+            f"{row['trend_risk_guard_enabled']}/{row['trend_risk_score_threshold']}/"
+            f"{row['trend_risk_head_adverse_pct']}/{row['trend_risk_width_expand']}|"
             f"{row['copy_fixed_loss_stop_ratio']}/{row['disaster_head_drop_pct']}/"
             f"{row['disaster_loss_ratio']}|{row['addon_dynamic_gap_max_usd']}|"
-            f"{row['trades']}|{row['disaster_stop']}|{row['fixed_loss_stop']}|"
+            f"{row['trades']}|{row['disaster_stop']}|{row['trend_risk_guard_stop']}|"
+            f"{row['fixed_loss_stop']}|"
         )
     return lines
 
@@ -2277,6 +2309,10 @@ def write_markdown_report(
             f"`DISASTER_STOP_ENABLED={bool(best['disaster_stop_enabled'])}`, "
             f"`DISASTER_HEAD_DROP_PCT={best['disaster_head_drop_pct']}`, "
             f"`DISASTER_LOSS_RATIO={best['disaster_loss_ratio']}`, "
+            f"`TREND_RISK={bool(best['trend_risk_guard_enabled'])}/"
+            f"{best['trend_risk_score_threshold']}/"
+            f"{best['trend_risk_head_adverse_pct']}/"
+            f"{best['trend_risk_width_expand']}`, "
             f"`ADDON_DYNAMIC_GAP_MAX_USD={best['addon_dynamic_gap_max_usd']}`"
         ),
         "",
@@ -2309,8 +2345,9 @@ def write_markdown_report(
             f"trades `{baseline_row['trades']}`, win rate `{baseline_row['win_rate_pct']}%`, "
             f"drawdown `{baseline_row['max_drawdown_pct']}%`, "
             f"min liquidation distance `{baseline_row['min_liq_distance_pct']}%`, "
-            f"DStop `{baseline_row['disaster_stop']}`, BTG signal `{baseline_row['boll_trend_guard_signal']}`, "
-            f"BTG stop `{baseline_row['boll_trend_guard_stop']}`, "
+            f"DStop `{baseline_row['disaster_stop']}`, "
+            f"TrendRisk signal `{baseline_row['trend_risk_guard_signal']}`, "
+            f"TrendRisk stop `{baseline_row['trend_risk_guard_stop']}`, "
             f"FStop `{baseline_row['fixed_loss_stop']}`."
         ),
         "",
@@ -2325,14 +2362,14 @@ def write_markdown_report(
         f"|Drawdown %|{baseline_row['max_drawdown_pct']}|{best['max_drawdown_pct']}|{_metric_delta(best, baseline_row, 'max_drawdown_pct')}|",
         f"|Min Liq %|{baseline_row['min_liq_distance_pct']}|{best['min_liq_distance_pct']}|{_metric_delta(best, baseline_row, 'min_liq_distance_pct')}|",
         f"|DStop|{baseline_row['disaster_stop']}|{best['disaster_stop']}|{_metric_delta(best, baseline_row, 'disaster_stop')}|",
-        f"|BTG Signal|{baseline_row['boll_trend_guard_signal']}|{best['boll_trend_guard_signal']}|{_metric_delta(best, baseline_row, 'boll_trend_guard_signal')}|",
-        f"|BTG Stop|{baseline_row['boll_trend_guard_stop']}|{best['boll_trend_guard_stop']}|{_metric_delta(best, baseline_row, 'boll_trend_guard_stop')}|",
+        f"|TrendRisk Signal|{baseline_row['trend_risk_guard_signal']}|{best['trend_risk_guard_signal']}|{_metric_delta(best, baseline_row, 'trend_risk_guard_signal')}|",
+        f"|TrendRisk Stop|{baseline_row['trend_risk_guard_stop']}|{best['trend_risk_guard_stop']}|{_metric_delta(best, baseline_row, 'trend_risk_guard_stop')}|",
         f"|FStop|{baseline_row['fixed_loss_stop']}|{best['fixed_loss_stop']}|{_metric_delta(best, baseline_row, 'fixed_loss_stop')}|",
         "",
         "## Top 20",
         "",
-        "|#|Score|Risk|PnL|DD|MinLiq|Wipeout|EntryMax|Entry Gap|TPSpace|Head/Cap|Second Dyn|Later Dyn|Fix/Disaster|AddonGap|Trades|DStop|FStop|",
-        "|-:|-:|-:|-:|-:|-:|-|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|",
+        "|#|Score|Risk|PnL|DD|MinLiq|Wipeout|EntryMax|Entry Gap|TPSpace|Head/Cap|Second Dyn|Later Dyn|TrendRisk|Fix/Disaster|AddonGap|Trades|DStop|TrendStop|FStop|",
+        "|-:|-:|-:|-:|-:|-:|-|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|",
     ]
     lines.extend(_markdown_param_rows(rows, 20))
     profit_rows = sorted(rows, key=lambda row: (row["total_pnl"], row["min_liq_distance_pct"]), reverse=True)
@@ -2346,14 +2383,14 @@ def write_markdown_report(
             "",
             "## Highest Profit Top 10",
             "",
-            "|#|Score|Risk|PnL|DD|MinLiq|Wipeout|EntryMax|Entry Gap|TPSpace|Head/Cap|Second Dyn|Later Dyn|Fix/Disaster|AddonGap|Trades|DStop|FStop|",
-            "|-:|-:|-:|-:|-:|-:|-|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|",
+            "|#|Score|Risk|PnL|DD|MinLiq|Wipeout|EntryMax|Entry Gap|TPSpace|Head/Cap|Second Dyn|Later Dyn|TrendRisk|Fix/Disaster|AddonGap|Trades|DStop|TrendStop|FStop|",
+            "|-:|-:|-:|-:|-:|-:|-|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|",
             *_markdown_param_rows(profit_rows, 10),
             "",
             "## Safest Positive-PnL Top 10",
             "",
-            "|#|Score|Risk|PnL|DD|MinLiq|Wipeout|EntryMax|Entry Gap|TPSpace|Head/Cap|Second Dyn|Later Dyn|Fix/Disaster|AddonGap|Trades|DStop|FStop|",
-            "|-:|-:|-:|-:|-:|-:|-|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|",
+            "|#|Score|Risk|PnL|DD|MinLiq|Wipeout|EntryMax|Entry Gap|TPSpace|Head/Cap|Second Dyn|Later Dyn|TrendRisk|Fix/Disaster|AddonGap|Trades|DStop|TrendStop|FStop|",
+            "|-:|-:|-:|-:|-:|-:|-|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|",
             *_markdown_param_rows(risk_rows, 10),
         ]
     )
@@ -2387,7 +2424,7 @@ def write_markdown_report(
             "- It includes the completed-candle extreme add-on guard: long add-ons must break the tracked low; short add-ons must break the tracked high.",
             "- It optimizes first add-on dynamic sizing and later add-on dynamic sizing as separate parameter groups.",
             "- It includes the optional disaster stop: head-entry adverse move plus strategy-cycle unrealized loss against TRADING_ACCOUNT_TARGET.",
-            "- It can optionally test BTG/Boll Trend Guard: adverse head-entry move plus Bollinger expansion and band-slope confirmation.",
+            "- It can optionally test Trend Risk Guard: stacked adverse move, Bollinger slope, candle extremes, and width-expansion checks.",
             "- Config is changed only after manual confirmation in the selection prompt.",
         ]
     )
@@ -2425,9 +2462,13 @@ def apply_params_to_config(row: dict, config_path: Path = CONFIG_PATH) -> Path:
         "FIXED_LOSS_HEAD_BUFFER_PCT": row["fixed_loss_head_buffer_pct"],
         "DISASTER_HEAD_DROP_PCT": row["disaster_head_drop_pct"],
         "DISASTER_LOSS_RATIO": row["disaster_loss_ratio"],
+        "TREND_RISK_GUARD_ENABLED": row["trend_risk_guard_enabled"],
+        "TREND_RISK_SCORE_THRESHOLD": row["trend_risk_score_threshold"],
+        "TREND_RISK_HEAD_ADVERSE_PCT": row["trend_risk_head_adverse_pct"],
+        "TREND_RISK_WIDTH_EXPAND": row["trend_risk_width_expand"],
         "ADDON_DYNAMIC_GAP_MAX_USD": row["addon_dynamic_gap_max_usd"],
     }
-    bool_keys = set()
+    bool_keys = {"TREND_RISK_GUARD_ENABLED"}
     text = config_path.read_text(encoding="utf-8")
     backup_path = config_path.with_suffix(".py.bak")
     backup_path.write_text(text, encoding="utf-8")
@@ -2570,8 +2611,8 @@ def print_rankings(rows: list[dict], baseline_row: dict, top_n: int = 10) -> Non
         f"drawdown={baseline_row['max_drawdown_pct']:.2f}%  "
         f"min_liq={baseline_row['min_liq_distance_pct']:.2f}%  "
         f"DStop={baseline_row['disaster_stop']}  "
-        f"BTGSignal={baseline_row['boll_trend_guard_signal']}  "
-        f"BTGStop={baseline_row['boll_trend_guard_stop']}  "
+        f"TrendSig={baseline_row['trend_risk_guard_signal']}  "
+        f"TrendStop={baseline_row['trend_risk_guard_stop']}  "
         f"FStop={baseline_row['fixed_loss_stop']}"
     )
     print(
@@ -2583,7 +2624,7 @@ def print_rankings(rows: list[dict], baseline_row: dict, top_n: int = 10) -> Non
     print()
     print("Top balanced parameter comparison")
     print("-" * 156)
-    print("Rank  Score     Risk     PnL USDT  DD     MinLiq  Wipeout  EntryMax  EntryGap  TPSpace  TP    Head/Cap   SecondDyn          LaterDyn       Fix/Disaster   AddonGap  Trades")
+    print("Rank  Score     Risk     PnL USDT  DD     MinLiq  Wipeout  EntryMax  EntryGap  TPSpace  TP    Head/Cap   SecondDyn          LaterDyn       TrendRisk       Fix/Disaster   AddonGap  Trades  D/T/F")
     print("-" * 156)
     for idx, row in enumerate(rows[:top_n], start=1):
         dyn = f"{row['dynamic_base_ratio']:g}/{row['dynamic_min_ratio']:g}/{row['dynamic_max_ratio']:g}"
@@ -2592,6 +2633,12 @@ def print_rankings(rows: list[dict], baseline_row: dict, top_n: int = 10) -> Non
             f"{row['second_batch_dynamic_min_ratio']:g}/"
             f"{row['second_batch_dynamic_max_ratio']:g}/"
             f"{row['second_batch_dynamic_full_gap_usd']:g}"
+        )
+        trend_risk = (
+            f"{row['trend_risk_guard_enabled']}/"
+            f"{row['trend_risk_score_threshold']}/"
+            f"{row['trend_risk_head_adverse_pct']:g}/"
+            f"{row['trend_risk_width_expand']:g}"
         )
         print(
             f"{idx:>2}  "
@@ -2608,11 +2655,13 @@ def print_rankings(rows: list[dict], baseline_row: dict, top_n: int = 10) -> Non
             f"{row['first_batch_ratio']:g}/{row['max_total_entry_ratio']:<8g}"
             f"{second_dyn:<19}"
             f"{dyn:<15}"
+            f"{trend_risk:<16}"
             f"{row['copy_fixed_loss_stop_ratio']:g}/"
             f"{row['disaster_head_drop_pct']:g}/"
             f"{row['disaster_loss_ratio']:<9g}"
             f"{row['addon_dynamic_gap_max_usd']:<9g}"
-            f"{row['trades']:>3}"
+            f"{row['trades']:>3}  "
+            f"{row['disaster_stop']}/{row['trend_risk_guard_stop']}/{row['fixed_loss_stop']}"
         )
     print("-" * 156)
     print()
@@ -2693,6 +2742,10 @@ def main() -> None:
     parser.add_argument("--fixed-loss-head-buffer-pct", default="0.05")
     parser.add_argument("--disaster-head-drop-pct", default="0.05")
     parser.add_argument("--disaster-loss-ratio", default="0.70")
+    parser.add_argument("--trend-risk-guard-enabled", default="0,1")
+    parser.add_argument("--trend-risk-score-threshold", default="4,5")
+    parser.add_argument("--trend-risk-head-adverse-pct", default="0.03,0.04,0.05")
+    parser.add_argument("--trend-risk-width-expand", default="1.8,2.0,2.5")
     parser.add_argument("--addon-dynamic-gap-max-usd", default="16,20,24")
     parser.add_argument("--addon-dynamic-gap-boll-start", default=str(ADDON_DYNAMIC_GAP_BOLL_START))
     parser.add_argument("--addon-dynamic-gap-boll-strong", default=str(ADDON_DYNAMIC_GAP_BOLL_STRONG))

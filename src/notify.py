@@ -126,30 +126,34 @@ async def notify_liq_warning(
     await wx_push(title, content)
 
 
-async def notify_boll_trend_guard(
+async def notify_trend_risk_guard(
     direction: str,
     mark_price: float,
     head_price: float,
     adverse_pct: float,
+    score: int,
+    reasons: list[str],
     width_expand: float,
     width_pct: float,
-    z_mean: float,
-    slope_pct_per_hour: float,
-    control_enabled: bool,
+    mid_slope: float,
+    lower_slope: float,
+    upper_slope: float,
 ) -> None:
-    """Notify when the Bollinger trend-expansion guard is triggered."""
-    mode = "CONTROL" if control_enabled else "OBSERVE"
-    title = f"ETH BTG {mode} triggered"
+    """Notify when the trend-risk guard closes a position."""
+    title = "ETH trend risk guard close"
     content = (
         f"**Direction**: {direction.upper()}\n\n"
         f"**Mark price**: {mark_price:.2f}\n\n"
         f"**Head entry**: {head_price:.2f}\n\n"
         f"**Head adverse**: {adverse_pct:.2%}\n\n"
+        f"**Score**: {score}\n\n"
+        f"**Reasons**: {', '.join(reasons)}\n\n"
         f"**Boll width expand**: {width_expand:.3f}x\n\n"
         f"**Boll width pct**: {width_pct:.2%}\n\n"
-        f"**z_mean**: {z_mean:.3f}\n\n"
-        f"**Band slope**: {slope_pct_per_hour:.3f}%/h\n\n"
-        f"**Action**: {'close position' if control_enabled else 'notify only'}"
+        f"**Mid slope**: {mid_slope:.3f}%/h\n\n"
+        f"**Lower slope**: {lower_slope:.3f}%/h\n\n"
+        f"**Upper slope**: {upper_slope:.3f}%/h\n\n"
+        "**Action**: close current position and keep strategy running"
     )
     await wx_push(title, content)
 
