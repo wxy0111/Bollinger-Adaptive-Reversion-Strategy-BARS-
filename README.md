@@ -1,7 +1,7 @@
 # Bollinger Adaptive Reversion Strategy (BARS)
 
 <p align="center">
-  <img src="assets/bars-logo-transparent.png" alt="BARS Logo" width="420">
+  <img src="assets/bars-logo-dark.png" alt="BARS Logo" width="420">
 </p>
 
 **BARS** stands for **Bollinger Adaptive Reversion Strategy**. It is an
