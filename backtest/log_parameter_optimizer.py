@@ -77,6 +77,9 @@ from src.config import (
     ADDON_DYNAMIC_GAP_HEAD_MAX_MULT,
     ADDON_DYNAMIC_GAP_TREND_KLINES,
     ADDON_DYNAMIC_GAP_TREND_MULT,
+    ADDON_RISK_BUDGET_ENABLED,
+    ADDON_MIN_AVG_IMPROVE_USD,
+    ADDON_MIN_AVG_IMPROVE_GAP_RATIO,
     ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED,
     ADDON_MAX_BOLL_WIDTH_PCT,
     ADDON_MAX_BOLL_WIDTH_USD,
@@ -93,6 +96,14 @@ from src.config import (
     ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED,
     ENTRY_MAX_BOLL_WIDTH_PCT,
     ENTRY_MAX_BOLL_WIDTH_USD,
+    ENTRY_TREND_FILTER_ENABLED,
+    ENTRY_TREND_FILTER_KLINES,
+    ENTRY_TREND_FILTER_SCORE_THRESHOLD,
+    ENTRY_TREND_FILTER_MID_SLOPE_PCT_PER_HOUR,
+    ENTRY_TREND_FILTER_EDGE_SLOPE_PCT_PER_HOUR,
+    ENTRY_TREND_FILTER_WIDTH_SLOPE_PCT_PER_HOUR,
+    ENTRY_TREND_FILTER_STRONG_BREAK_ENABLED,
+    ENTRY_TREND_FILTER_STRONG_KLINES,
     MIN_ENTRY_GAP_USD,
     MIN_BOLL_WIDTH_FLOOR_USD,
     MIN_HEAD_LIQ_BUFFER_PCT,
@@ -172,6 +183,14 @@ class Params:
     entry_max_width_enabled: int = int(ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED)
     entry_max_width_pct: float = ENTRY_MAX_BOLL_WIDTH_PCT
     entry_max_width_usd: float = ENTRY_MAX_BOLL_WIDTH_USD
+    entry_trend_filter_enabled: int = int(ENTRY_TREND_FILTER_ENABLED)
+    entry_trend_filter_klines: int = ENTRY_TREND_FILTER_KLINES
+    entry_trend_filter_score_threshold: int = ENTRY_TREND_FILTER_SCORE_THRESHOLD
+    entry_trend_filter_mid_slope_pct_per_hour: float = ENTRY_TREND_FILTER_MID_SLOPE_PCT_PER_HOUR
+    entry_trend_filter_edge_slope_pct_per_hour: float = ENTRY_TREND_FILTER_EDGE_SLOPE_PCT_PER_HOUR
+    entry_trend_filter_width_slope_pct_per_hour: float = ENTRY_TREND_FILTER_WIDTH_SLOPE_PCT_PER_HOUR
+    entry_trend_filter_strong_break_enabled: int = int(ENTRY_TREND_FILTER_STRONG_BREAK_ENABLED)
+    entry_trend_filter_strong_klines: int = ENTRY_TREND_FILTER_STRONG_KLINES
     addon_max_width_enabled: int = int(ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED)
     addon_max_width_pct: float = ADDON_MAX_BOLL_WIDTH_PCT
     addon_max_width_usd: float = ADDON_MAX_BOLL_WIDTH_USD
@@ -232,6 +251,9 @@ class Params:
     addon_dynamic_gap_head_max_mult: float = ADDON_DYNAMIC_GAP_HEAD_MAX_MULT
     addon_dynamic_gap_trend_klines: int = ADDON_DYNAMIC_GAP_TREND_KLINES
     addon_dynamic_gap_trend_mult: float = ADDON_DYNAMIC_GAP_TREND_MULT
+    addon_risk_budget_enabled: int = int(ADDON_RISK_BUDGET_ENABLED)
+    addon_min_avg_improve_usd: float = ADDON_MIN_AVG_IMPROVE_USD
+    addon_min_avg_improve_gap_ratio: float = ADDON_MIN_AVG_IMPROVE_GAP_RATIO
 
 
 @dataclass
@@ -321,6 +343,7 @@ class LogReplay:
         self.addon_extreme_guard_kline = None
         self.addon_extreme_guard_started = False
         self.entry_gap_cache: dict[float, float] = {}
+        self.entry_trend_cache: dict[tuple, bool] = {}
         self.recent_prices: list[float] = []
         self.last_plan_price = 0.0
         self.last_batch_kline = None
@@ -337,10 +360,12 @@ class LogReplay:
         self.skipped_funds = 0
         self.blocked_width = 0
         self.blocked_entry_max_width = 0
+        self.blocked_entry_trend = 0
         self.blocked_addon_max_width = 0
         self.blocked_gap = 0
         self.blocked_extreme = 0
         self.blocked_addon_guard = 0
+        self.blocked_addon_risk_budget = 0
         self.cross_copy_stop = 0
         self.fixed_loss_stop = 0
         self.disaster_stop = 0
@@ -540,6 +565,82 @@ class LogReplay:
         pct_hit = self.params.entry_max_width_pct > 0 and width_pct >= self.params.entry_max_width_pct
         usd_hit = self.params.entry_max_width_usd > 0 and width >= self.params.entry_max_width_usd
         return not (pct_hit or usd_hit)
+
+    def _entry_trend_filter_blocks(self, direction: str, row) -> bool:
+        """Return whether pre-entry Bollinger shape is too directional."""
+        if not self.params.entry_trend_filter_enabled or direction not in ("long", "short"):
+            return False
+        cache_key = None
+        if not self.params.entry_trend_filter_strong_break_enabled:
+            cache_key = (pd.Timestamp(row.kline_ts), direction)
+            if cache_key in self.entry_trend_cache:
+                return self.entry_trend_cache[cache_key]
+        count = max(
+            self.params.entry_trend_filter_klines,
+            self.params.entry_trend_filter_strong_klines + 1,
+            2,
+        )
+        recent = self._recent_unique_boll_history(count)
+        if len(recent) < count:
+            if cache_key is not None:
+                self.entry_trend_cache[cache_key] = False
+            return False
+
+        price = float(row.price)
+        completed = recent[:-1]
+        if self.params.entry_trend_filter_strong_break_enabled and len(completed) >= self.params.entry_trend_filter_strong_klines:
+            strong = completed[-self.params.entry_trend_filter_strong_klines:]
+            lows = [item["low"] for item in strong]
+            highs = [item["high"] for item in strong]
+            lower_lows = all(lows[i] < lows[i - 1] for i in range(1, len(lows)))
+            higher_highs = all(highs[i] > highs[i - 1] for i in range(1, len(highs)))
+            if direction == "long" and lower_lows and price <= lows[-1]:
+                return True
+            if direction == "short" and higher_highs and price >= highs[-1]:
+                return True
+
+        window = recent[-self.params.entry_trend_filter_klines:]
+        start, end = window[0], window[-1]
+        mid_slope = self._series_slope_pct_per_hour(
+            [item["mid"] for item in window],
+            start["ts"],
+            end["ts"],
+        )
+        lower_slope = self._series_slope_pct_per_hour(
+            [item["lower"] for item in window],
+            start["ts"],
+            end["ts"],
+        )
+        upper_slope = self._series_slope_pct_per_hour(
+            [item["upper"] for item in window],
+            start["ts"],
+            end["ts"],
+        )
+        width_slope = self._series_slope_pct_per_hour(
+            [item["width_pct"] for item in window],
+            start["ts"],
+            end["ts"],
+        )
+        lows = [item["low"] for item in window]
+        highs = [item["high"] for item in window]
+        lower_lows = all(lows[i] < lows[i - 1] for i in range(1, len(lows)))
+        higher_highs = all(highs[i] > highs[i - 1] for i in range(1, len(highs)))
+
+        score = 0
+        if width_slope >= self.params.entry_trend_filter_width_slope_pct_per_hour:
+            score += 1
+        if direction == "long":
+            score += int(lower_lows)
+            score += int(mid_slope <= -self.params.entry_trend_filter_mid_slope_pct_per_hour)
+            score += int(lower_slope <= -self.params.entry_trend_filter_edge_slope_pct_per_hour)
+        else:
+            score += int(higher_highs)
+            score += int(mid_slope >= self.params.entry_trend_filter_mid_slope_pct_per_hour)
+            score += int(upper_slope >= self.params.entry_trend_filter_edge_slope_pct_per_hour)
+        blocked = score >= self.params.entry_trend_filter_score_threshold
+        if cache_key is not None:
+            self.entry_trend_cache[cache_key] = blocked
+        return blocked
 
     def _addon_max_width_ok(self, row) -> bool:
         """Return whether Bollinger width is not too wide for add-on batches."""
@@ -888,6 +989,9 @@ class LogReplay:
         if not self.pos.has_plan() and not self._entry_max_width_ok(row):
             self.blocked_entry_max_width += 1
             return "none"
+        if not self.pos.has_plan() and self._entry_trend_filter_blocks(direction, row):
+            self.blocked_entry_trend += 1
+            return "none"
         self.signal_count += 1
         if direction == "long" and self._still_making_new_low():
             self.blocked_extreme += 1
@@ -1001,6 +1105,30 @@ class LogReplay:
         if not allowed:
             self.fixed_loss_head_buffer_block += 1
         return allowed
+
+    def _addon_risk_budget_allows(self, idx: int, price: float, sz: float) -> bool:
+        """Return whether candidate add-on improves average entry enough."""
+        if not self.params.addon_risk_budget_enabled or idx <= 0:
+            return True
+        if self.pos.avg_entry <= 0 or price <= 0 or sz <= 0:
+            return True
+        avg_entry, _ = self._candidate_entry_totals(idx, price, sz)
+        if avg_entry <= 0:
+            return True
+        if self.pos.direction == "long":
+            improvement = self.pos.avg_entry - avg_entry
+        elif self.pos.direction == "short":
+            improvement = avg_entry - self.pos.avg_entry
+        else:
+            return True
+        required = max(
+            self.params.addon_min_avg_improve_usd,
+            self._effective_entry_gap(price) * self.params.addon_min_avg_improve_gap_ratio,
+        )
+        if improvement >= required:
+            return True
+        self.blocked_addon_risk_budget += 1
+        return False
 
     def _head_adverse_move_pct(self, mark_price: float) -> float:
         """Return adverse move from the first filled batch as a ratio."""
@@ -1231,6 +1359,15 @@ class LogReplay:
                 self.pos.pending = None
                 self.pos.reset()
                 return
+            if (
+                self.pos.pending.idx == 0
+                and not self.pos.is_active()
+                and self._entry_trend_filter_blocks(self.pos.direction, row)
+            ):
+                self.blocked_entry_trend += 1
+                self.pos.pending = None
+                self.pos.reset()
+                return
             if self.pos.pending.idx > 0 and not self._addon_max_width_ok(row):
                 self.blocked_addon_max_width += 1
                 self.pos.pending = None
@@ -1295,6 +1432,8 @@ class LogReplay:
         order = self._order_at(self.pos.next_idx(), price)
         if order is None:
             return
+        if not self._addon_risk_budget_allows(order.idx, order.price, order.sz):
+            return
         self.pos.pending = order
         self.events.append(
             {
@@ -1337,7 +1476,15 @@ class LogReplay:
             self._update_addon_guard(row)
             if not self._addon_guard_allows(replacement.price):
                 return
+            if not self._addon_risk_budget_allows(replacement.idx, replacement.price, replacement.sz):
+                self.pos.pending = None
+                return
         if self.pos.pending.idx == 0:
+            if self._entry_trend_filter_blocks(self.pos.direction, row):
+                self.blocked_entry_trend += 1
+                self.pos.pending = None
+                self.pos.reset()
+                return
             self._record_entry_extreme_adjustment(self.pos.direction, float(row.price), row)
         self.pos.pending = replacement
         self.events.append(
@@ -1640,6 +1787,14 @@ class LogReplay:
             "entry_max_width_enabled": self.params.entry_max_width_enabled,
             "entry_max_width_pct": self.params.entry_max_width_pct,
             "entry_max_width_usd": self.params.entry_max_width_usd,
+            "entry_trend_filter_enabled": self.params.entry_trend_filter_enabled,
+            "entry_trend_filter_klines": self.params.entry_trend_filter_klines,
+            "entry_trend_filter_score_threshold": self.params.entry_trend_filter_score_threshold,
+            "entry_trend_filter_mid_slope_pct_per_hour": self.params.entry_trend_filter_mid_slope_pct_per_hour,
+            "entry_trend_filter_edge_slope_pct_per_hour": self.params.entry_trend_filter_edge_slope_pct_per_hour,
+            "entry_trend_filter_width_slope_pct_per_hour": self.params.entry_trend_filter_width_slope_pct_per_hour,
+            "entry_trend_filter_strong_break_enabled": self.params.entry_trend_filter_strong_break_enabled,
+            "entry_trend_filter_strong_klines": self.params.entry_trend_filter_strong_klines,
             "addon_max_width_enabled": self.params.addon_max_width_enabled,
             "addon_max_width_pct": self.params.addon_max_width_pct,
             "addon_max_width_usd": self.params.addon_max_width_usd,
@@ -1702,6 +1857,9 @@ class LogReplay:
             "addon_dynamic_gap_head_max_mult": self.params.addon_dynamic_gap_head_max_mult,
             "addon_dynamic_gap_trend_klines": self.params.addon_dynamic_gap_trend_klines,
             "addon_dynamic_gap_trend_mult": self.params.addon_dynamic_gap_trend_mult,
+            "addon_risk_budget_enabled": self.params.addon_risk_budget_enabled,
+            "addon_min_avg_improve_usd": self.params.addon_min_avg_improve_usd,
+            "addon_min_avg_improve_gap_ratio": self.params.addon_min_avg_improve_gap_ratio,
             "entry_extreme_entries": self.entry_extreme_entries,
             "entry_extreme_avg_gap_pct": round(
                 self.entry_extreme_gap_total / self.entry_extreme_entries * 100, 4
@@ -1736,10 +1894,12 @@ class LogReplay:
             "boll_tp_compression_activated": self.boll_tp_compression_activated,
             "blocked_width": self.blocked_width,
             "blocked_entry_max_width": self.blocked_entry_max_width,
+            "blocked_entry_trend": self.blocked_entry_trend,
             "blocked_addon_max_width": self.blocked_addon_max_width,
             "blocked_gap": self.blocked_gap,
             "blocked_extreme": self.blocked_extreme,
             "blocked_addon_guard": self.blocked_addon_guard,
+            "blocked_addon_risk_budget": self.blocked_addon_risk_budget,
             "fixed_loss_head_buffer_block": self.fixed_loss_head_buffer_block,
             "cross_copy_stop": self.cross_copy_stop,
             "fixed_loss_stop": self.fixed_loss_stop,
@@ -1866,6 +2026,14 @@ def _param_value_lists(args) -> list[list[float] | list[int]]:
         [int(ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED)],
         parse_float_list(args.entry_max_width_pct),
         [ENTRY_MAX_BOLL_WIDTH_USD],
+        [int(ENTRY_TREND_FILTER_ENABLED)],
+        [ENTRY_TREND_FILTER_KLINES],
+        [ENTRY_TREND_FILTER_SCORE_THRESHOLD],
+        [ENTRY_TREND_FILTER_MID_SLOPE_PCT_PER_HOUR],
+        [ENTRY_TREND_FILTER_EDGE_SLOPE_PCT_PER_HOUR],
+        [ENTRY_TREND_FILTER_WIDTH_SLOPE_PCT_PER_HOUR],
+        [int(ENTRY_TREND_FILTER_STRONG_BREAK_ENABLED)],
+        [ENTRY_TREND_FILTER_STRONG_KLINES],
         [int(ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED)],
         [ADDON_MAX_BOLL_WIDTH_PCT],
         [ADDON_MAX_BOLL_WIDTH_USD],
@@ -1926,6 +2094,9 @@ def _param_value_lists(args) -> list[list[float] | list[int]]:
         [ADDON_DYNAMIC_GAP_HEAD_MAX_MULT],
         [ADDON_DYNAMIC_GAP_TREND_KLINES],
         [ADDON_DYNAMIC_GAP_TREND_MULT],
+        [int(ADDON_RISK_BUDGET_ENABLED)],
+        [ADDON_MIN_AVG_IMPROVE_USD],
+        [ADDON_MIN_AVG_IMPROVE_GAP_RATIO],
     ]
 
 
@@ -2042,6 +2213,14 @@ def current_config_params(args) -> Params:
         entry_max_width_enabled=int(ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED),
         entry_max_width_pct=ENTRY_MAX_BOLL_WIDTH_PCT,
         entry_max_width_usd=ENTRY_MAX_BOLL_WIDTH_USD,
+        entry_trend_filter_enabled=int(ENTRY_TREND_FILTER_ENABLED),
+        entry_trend_filter_klines=ENTRY_TREND_FILTER_KLINES,
+        entry_trend_filter_score_threshold=ENTRY_TREND_FILTER_SCORE_THRESHOLD,
+        entry_trend_filter_mid_slope_pct_per_hour=ENTRY_TREND_FILTER_MID_SLOPE_PCT_PER_HOUR,
+        entry_trend_filter_edge_slope_pct_per_hour=ENTRY_TREND_FILTER_EDGE_SLOPE_PCT_PER_HOUR,
+        entry_trend_filter_width_slope_pct_per_hour=ENTRY_TREND_FILTER_WIDTH_SLOPE_PCT_PER_HOUR,
+        entry_trend_filter_strong_break_enabled=int(ENTRY_TREND_FILTER_STRONG_BREAK_ENABLED),
+        entry_trend_filter_strong_klines=ENTRY_TREND_FILTER_STRONG_KLINES,
         addon_max_width_enabled=int(ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED),
         addon_max_width_pct=ADDON_MAX_BOLL_WIDTH_PCT,
         addon_max_width_usd=ADDON_MAX_BOLL_WIDTH_USD,
@@ -2102,6 +2281,9 @@ def current_config_params(args) -> Params:
         addon_dynamic_gap_head_max_mult=ADDON_DYNAMIC_GAP_HEAD_MAX_MULT,
         addon_dynamic_gap_trend_klines=ADDON_DYNAMIC_GAP_TREND_KLINES,
         addon_dynamic_gap_trend_mult=ADDON_DYNAMIC_GAP_TREND_MULT,
+        addon_risk_budget_enabled=int(ADDON_RISK_BUDGET_ENABLED),
+        addon_min_avg_improve_usd=ADDON_MIN_AVG_IMPROVE_USD,
+        addon_min_avg_improve_gap_ratio=ADDON_MIN_AVG_IMPROVE_GAP_RATIO,
     )
 
 
@@ -2175,6 +2357,26 @@ def params_from_report_row(row: dict) -> Params:
         entry_max_width_enabled=row["entry_max_width_enabled"],
         entry_max_width_pct=row["entry_max_width_pct"],
         entry_max_width_usd=row["entry_max_width_usd"],
+        entry_trend_filter_enabled=row.get("entry_trend_filter_enabled", int(ENTRY_TREND_FILTER_ENABLED)),
+        entry_trend_filter_klines=row.get("entry_trend_filter_klines", ENTRY_TREND_FILTER_KLINES),
+        entry_trend_filter_score_threshold=row.get(
+            "entry_trend_filter_score_threshold", ENTRY_TREND_FILTER_SCORE_THRESHOLD
+        ),
+        entry_trend_filter_mid_slope_pct_per_hour=row.get(
+            "entry_trend_filter_mid_slope_pct_per_hour", ENTRY_TREND_FILTER_MID_SLOPE_PCT_PER_HOUR
+        ),
+        entry_trend_filter_edge_slope_pct_per_hour=row.get(
+            "entry_trend_filter_edge_slope_pct_per_hour", ENTRY_TREND_FILTER_EDGE_SLOPE_PCT_PER_HOUR
+        ),
+        entry_trend_filter_width_slope_pct_per_hour=row.get(
+            "entry_trend_filter_width_slope_pct_per_hour", ENTRY_TREND_FILTER_WIDTH_SLOPE_PCT_PER_HOUR
+        ),
+        entry_trend_filter_strong_break_enabled=row.get(
+            "entry_trend_filter_strong_break_enabled", int(ENTRY_TREND_FILTER_STRONG_BREAK_ENABLED)
+        ),
+        entry_trend_filter_strong_klines=row.get(
+            "entry_trend_filter_strong_klines", ENTRY_TREND_FILTER_STRONG_KLINES
+        ),
         addon_max_width_enabled=row.get("addon_max_width_enabled", int(ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED)),
         addon_max_width_pct=row.get("addon_max_width_pct", ADDON_MAX_BOLL_WIDTH_PCT),
         addon_max_width_usd=row.get("addon_max_width_usd", ADDON_MAX_BOLL_WIDTH_USD),
@@ -2243,6 +2445,11 @@ def params_from_report_row(row: dict) -> Params:
         addon_dynamic_gap_head_max_mult=row["addon_dynamic_gap_head_max_mult"],
         addon_dynamic_gap_trend_klines=row["addon_dynamic_gap_trend_klines"],
         addon_dynamic_gap_trend_mult=row["addon_dynamic_gap_trend_mult"],
+        addon_risk_budget_enabled=row.get("addon_risk_budget_enabled", int(ADDON_RISK_BUDGET_ENABLED)),
+        addon_min_avg_improve_usd=row.get("addon_min_avg_improve_usd", ADDON_MIN_AVG_IMPROVE_USD),
+        addon_min_avg_improve_gap_ratio=row.get(
+            "addon_min_avg_improve_gap_ratio", ADDON_MIN_AVG_IMPROVE_GAP_RATIO
+        ),
     )
 
 
