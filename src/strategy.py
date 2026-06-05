@@ -25,13 +25,6 @@ from src.config import (
     BOLL_WIDTH_TP_SPACE_ENABLED, BOLL_WIDTH_TP_SPACE_MULT,
     ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED, ENTRY_MAX_BOLL_WIDTH_PCT,
     ENTRY_MAX_BOLL_WIDTH_USD,
-    ENTRY_TREND_FILTER_ENABLED, ENTRY_TREND_FILTER_KLINES,
-    ENTRY_TREND_FILTER_SCORE_THRESHOLD,
-    ENTRY_TREND_FILTER_MID_SLOPE_PCT_PER_HOUR,
-    ENTRY_TREND_FILTER_EDGE_SLOPE_PCT_PER_HOUR,
-    ENTRY_TREND_FILTER_WIDTH_SLOPE_PCT_PER_HOUR,
-    ENTRY_TREND_FILTER_STRONG_BREAK_ENABLED,
-    ENTRY_TREND_FILTER_STRONG_KLINES,
     TP_TARGET_MARGIN_RETURN, DYNAMIC_TP_ENABLED,
     DYNAMIC_TP_ARM_RETURN, DYNAMIC_TP_RESTORE_RETURN,
     DYNAMIC_TP_REPRICE_GAP_USD,
@@ -46,8 +39,6 @@ from src.config import (
     ADDON_DYNAMIC_GAP_HEAD_START_PCT, ADDON_DYNAMIC_GAP_HEAD_STRONG_PCT,
     ADDON_DYNAMIC_GAP_HEAD_MAX_MULT,
     ADDON_DYNAMIC_GAP_TREND_KLINES, ADDON_DYNAMIC_GAP_TREND_MULT,
-    ADDON_RISK_BUDGET_ENABLED, ADDON_MIN_AVG_IMPROVE_USD,
-    ADDON_MIN_AVG_IMPROVE_GAP_RATIO,
     ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED, ADDON_MAX_BOLL_WIDTH_PCT,
     ADDON_MAX_BOLL_WIDTH_USD,
     ADDON_EXTREME_GUARD_ENABLED,
@@ -341,97 +332,6 @@ class BollPinStrategy:
             if len(unique) >= count:
                 break
         return list(reversed(unique))
-
-    def _entry_trend_filter_blocks(self, direction: str, mark_price: float) -> bool:
-        """Return whether the current pre-entry trend shape is too directional."""
-        if not ENTRY_TREND_FILTER_ENABLED or direction not in ("long", "short"):
-            return False
-        count = max(ENTRY_TREND_FILTER_KLINES, ENTRY_TREND_FILTER_STRONG_KLINES + 1, 2)
-        recent = self._recent_unique_boll_history(count)
-        if len(recent) < count:
-            return False
-
-        current = recent[-1]
-        completed = recent[:-1]
-        if ENTRY_TREND_FILTER_STRONG_BREAK_ENABLED and len(completed) >= ENTRY_TREND_FILTER_STRONG_KLINES:
-            strong = completed[-ENTRY_TREND_FILTER_STRONG_KLINES:]
-            lows = [item["low"] for item in strong]
-            highs = [item["high"] for item in strong]
-            lower_lows = all(lows[i] < lows[i - 1] for i in range(1, len(lows)))
-            higher_highs = all(highs[i] > highs[i - 1] for i in range(1, len(highs)))
-            if direction == "long" and lower_lows and mark_price <= lows[-1]:
-                log_check(
-                    "Entry trend filter blocked long: completed lower-lows and current breaks low"
-                )
-                return True
-            if direction == "short" and higher_highs and mark_price >= highs[-1]:
-                log_check(
-                    "Entry trend filter blocked short: completed higher-highs and current breaks high"
-                )
-                return True
-
-        window = recent[-ENTRY_TREND_FILTER_KLINES:]
-        start, end = window[0], window[-1]
-        mid_slope = self._series_slope_pct_per_hour(
-            [item["mid"] for item in window],
-            start["ts"],
-            end["ts"],
-        )
-        lower_slope = self._series_slope_pct_per_hour(
-            [item["lower"] for item in window],
-            start["ts"],
-            end["ts"],
-        )
-        upper_slope = self._series_slope_pct_per_hour(
-            [item["upper"] for item in window],
-            start["ts"],
-            end["ts"],
-        )
-        width_slope = self._series_slope_pct_per_hour(
-            [item["width_pct"] for item in window],
-            start["ts"],
-            end["ts"],
-        )
-        lows = [item["low"] for item in window]
-        highs = [item["high"] for item in window]
-        lower_lows = all(lows[i] < lows[i - 1] for i in range(1, len(lows)))
-        higher_highs = all(highs[i] > highs[i - 1] for i in range(1, len(highs)))
-
-        score = 0
-        reasons = []
-        if width_slope >= ENTRY_TREND_FILTER_WIDTH_SLOPE_PCT_PER_HOUR:
-            score += 1
-            reasons.append("width_expand")
-        if direction == "long":
-            if lower_lows:
-                score += 1
-                reasons.append("lower_lows")
-            if mid_slope <= -ENTRY_TREND_FILTER_MID_SLOPE_PCT_PER_HOUR:
-                score += 1
-                reasons.append("mid_down")
-            if lower_slope <= -ENTRY_TREND_FILTER_EDGE_SLOPE_PCT_PER_HOUR:
-                score += 1
-                reasons.append("lower_down")
-        else:
-            if higher_highs:
-                score += 1
-                reasons.append("higher_highs")
-            if mid_slope >= ENTRY_TREND_FILTER_MID_SLOPE_PCT_PER_HOUR:
-                score += 1
-                reasons.append("mid_up")
-            if upper_slope >= ENTRY_TREND_FILTER_EDGE_SLOPE_PCT_PER_HOUR:
-                score += 1
-                reasons.append("upper_up")
-
-        if score < ENTRY_TREND_FILTER_SCORE_THRESHOLD:
-            return False
-        log_check(
-            f"Entry trend filter blocked {direction}: score={score} "
-            f"reasons={','.join(reasons)} width_slope={width_slope:.2f}%/h "
-            f"mid_slope={mid_slope:.3f}%/h lower_slope={lower_slope:.3f}%/h "
-            f"upper_slope={upper_slope:.3f}%/h"
-        )
-        return True
 
     def _trend_risk_signal(self, row, mark_price: float) -> dict | None:
         """Return trend-risk metrics when adverse trend conditions stack up."""
@@ -794,42 +694,6 @@ class BollPinStrategy:
             f"Fixed-loss head buffer skipped: batch={batch_idx + 1} "
             f"stop={stop_price:.2f} must>= {required_stop:.2f} "
             f"head={head_price:.2f} buffer={FIXED_LOSS_HEAD_BUFFER_PCT:.2%}"
-        )
-        return False
-
-    def _addon_risk_budget_allows(
-        self,
-        batch_idx: int,
-        candidate_price: float,
-        candidate_sz: float,
-        mark_price: float,
-    ) -> bool:
-        """Return whether an add-on improves average entry enough for its risk."""
-        if not ADDON_RISK_BUDGET_ENABLED or batch_idx <= 0:
-            return True
-        if self._state.avg_entry <= 0 or candidate_price <= 0 or candidate_sz <= 0:
-            return True
-
-        avg_entry, _ = self._simulated_entry_totals(batch_idx, candidate_price, candidate_sz)
-        if avg_entry <= 0:
-            return True
-        if self._state.direction == "long":
-            improvement = self._state.avg_entry - avg_entry
-        elif self._state.direction == "short":
-            improvement = avg_entry - self._state.avg_entry
-        else:
-            return True
-
-        required = max(
-            ADDON_MIN_AVG_IMPROVE_USD,
-            self._effective_entry_gap(mark_price) * ADDON_MIN_AVG_IMPROVE_GAP_RATIO,
-        )
-        if improvement >= required:
-            return True
-        log_check(
-            f"Add-on risk budget skipped: batch={batch_idx + 1} "
-            f"avg_improve={improvement:.2f} < required={required:.2f} "
-            f"current_avg={self._state.avg_entry:.2f} candidate_avg={avg_entry:.2f}"
         )
         return False
 
@@ -1893,8 +1757,6 @@ class BollPinStrategy:
         if not self._entry_max_boll_width_ok(last, mark_price):
             self._log_entry_max_boll_width_skip("probe_skip", last, mark_price)
             return
-        if self._entry_trend_filter_blocks(direction, mark_price):
-            return
 
         if direction == "long" and self._still_making_new_low():
             logger.info("Price is still making new lows; skip first long batch")
@@ -2190,8 +2052,6 @@ class BollPinStrategy:
         self._update_addon_extreme_guard_from_completed_kline(df, last)
         if not self._addon_extreme_guard_allows(next_order.price, next_idx):
             return
-        if not self._addon_risk_budget_allows(next_idx, next_order.price, next_order.sz, mark_price):
-            return
 
         log_check(f"Add-on batch triggered: batch={next_idx + 1} direction={self._state.direction}")
         self._log_plan(next_plan, mark_price)
@@ -2275,14 +2135,6 @@ class BollPinStrategy:
         if not self._addon_extreme_guard_allows(next_order.price, pending_batch.batch_idx):
             self._save_runtime_state()
             return
-        if not self._addon_risk_budget_allows(
-            pending_batch.batch_idx,
-            next_order.price,
-            next_order.sz,
-            mark_price,
-        ):
-            self._save_runtime_state()
-            return
 
         log_check(
             f"Reprice pending batch {pending_batch.batch_idx + 1}: "
@@ -2320,9 +2172,6 @@ class BollPinStrategy:
 
         direction = self._intrabar_probe_direction(df, last, mark_price)
         if direction != self._state.direction:
-            self._save_runtime_state()
-            return
-        if self._entry_trend_filter_blocks(direction, mark_price):
             self._save_runtime_state()
             return
         if direction == "long" and self._still_making_new_low():
