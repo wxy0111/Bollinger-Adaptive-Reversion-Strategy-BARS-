@@ -51,6 +51,8 @@ from src.config import (
     BOLL_TP_COMPRESSION_EXIT_OFFSET_USD,
     BOLL_TP_COMPRESSION_MIN_RETURN,
     TREND_RISK_GUARD_ENABLED,
+    TREND_RISK_GUARD_CLOSE_ENABLED,
+    TREND_RISK_FREEZE_ADDON_ENABLED,
     TREND_RISK_SCORE_THRESHOLD,
     TREND_RISK_HEAD_ADVERSE_PCT,
     TREND_RISK_KLINE_COUNT,
@@ -75,6 +77,9 @@ from src.config import (
     ADDON_DYNAMIC_GAP_HEAD_MAX_MULT,
     ADDON_DYNAMIC_GAP_TREND_KLINES,
     ADDON_DYNAMIC_GAP_TREND_MULT,
+    ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED,
+    ADDON_MAX_BOLL_WIDTH_PCT,
+    ADDON_MAX_BOLL_WIDTH_USD,
     ENTRY_EXTREME_GAP_ADJUST_ENABLED,
     ENTRY_EXTREME_GAP_BASE_PCT,
     ENTRY_EXTREME_GAP_FULL_PCT,
@@ -167,6 +172,9 @@ class Params:
     entry_max_width_enabled: int = int(ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED)
     entry_max_width_pct: float = ENTRY_MAX_BOLL_WIDTH_PCT
     entry_max_width_usd: float = ENTRY_MAX_BOLL_WIDTH_USD
+    addon_max_width_enabled: int = int(ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED)
+    addon_max_width_pct: float = ADDON_MAX_BOLL_WIDTH_PCT
+    addon_max_width_usd: float = ADDON_MAX_BOLL_WIDTH_USD
     first_batch_ratio: float = FIRST_BATCH_RATIO
     second_batch_dynamic_base_ratio: float = SECOND_BATCH_DYNAMIC_BASE_RATIO
     second_batch_dynamic_min_ratio: float = SECOND_BATCH_DYNAMIC_MIN_RATIO
@@ -204,6 +212,8 @@ class Params:
     disaster_head_drop_pct: float = DISASTER_HEAD_DROP_PCT
     disaster_loss_ratio: float = DISASTER_LOSS_RATIO
     trend_risk_guard_enabled: int = int(TREND_RISK_GUARD_ENABLED)
+    trend_risk_guard_close_enabled: int = int(TREND_RISK_GUARD_CLOSE_ENABLED)
+    trend_risk_freeze_addon_enabled: int = int(TREND_RISK_FREEZE_ADDON_ENABLED)
     trend_risk_score_threshold: int = TREND_RISK_SCORE_THRESHOLD
     trend_risk_head_adverse_pct: float = TREND_RISK_HEAD_ADVERSE_PCT
     trend_risk_kline_count: int = TREND_RISK_KLINE_COUNT
@@ -327,6 +337,7 @@ class LogReplay:
         self.skipped_funds = 0
         self.blocked_width = 0
         self.blocked_entry_max_width = 0
+        self.blocked_addon_max_width = 0
         self.blocked_gap = 0
         self.blocked_extreme = 0
         self.blocked_addon_guard = 0
@@ -336,6 +347,8 @@ class LogReplay:
         self.trend_risk_guard_signal = 0
         self.trend_risk_guard_stop = 0
         self.trend_risk_guard_active = False
+        self.trend_risk_freeze_blocks = 0
+        self.trend_risk_freeze_cancels = 0
         self.stopped = False
         self.width_cancel = 0
         self.inside_cancel = 0
@@ -528,6 +541,17 @@ class LogReplay:
         usd_hit = self.params.entry_max_width_usd > 0 and width >= self.params.entry_max_width_usd
         return not (pct_hit or usd_hit)
 
+    def _addon_max_width_ok(self, row) -> bool:
+        """Return whether Bollinger width is not too wide for add-on batches."""
+        if not self.params.addon_max_width_enabled:
+            return True
+        _, _, _, width = self._bands(row)
+        price = float(row.price)
+        width_pct = width / price if price > 0 else 0.0
+        pct_hit = self.params.addon_max_width_pct > 0 and width_pct >= self.params.addon_max_width_pct
+        usd_hit = self.params.addon_max_width_usd > 0 and width >= self.params.addon_max_width_usd
+        return not (pct_hit or usd_hit)
+
     def _effective_boll_width_pct(self) -> float:
         base_pct = (
             self.params.boll_width_base_usd / self.params.boll_width_base_price
@@ -707,10 +731,9 @@ class LogReplay:
         return 1.0
 
     def _effective_min_boll_width(self, price: float) -> float:
-        tp_space_rule = self._tp_space_width_rule(price)
-        if self.params.boll_width_tp_space_enabled:
-            return max(self.params.boll_width_floor_usd, tp_space_rule)
-        return self.params.min_width_usd
+        if price <= 0:
+            return self.params.min_width_usd
+        return max(self.params.boll_width_floor_usd, price * self.params.min_width_pct)
 
     def _tp_space_width_rule(self, price: float) -> float:
         """Return the Bollinger width required by the configured TP target."""
@@ -1121,15 +1144,16 @@ class LogReplay:
             if not self.trend_risk_guard_active:
                 self.trend_risk_guard_signal += 1
                 self.trend_risk_guard_active = True
-            self._close(
-                float(row.price),
-                str(row.ts),
-                float(row.price),
-                row.kline_ts,
-                rebalance=True,
-                reason="Trend risk guard close",
-            )
-            self.trend_risk_guard_stop += 1
+            if self.params.trend_risk_guard_close_enabled:
+                self._close(
+                    float(row.price),
+                    str(row.ts),
+                    float(row.price),
+                    row.kline_ts,
+                    rebalance=True,
+                    reason="Trend risk guard close",
+                )
+                self.trend_risk_guard_stop += 1
         if self.pos.is_active() and self._disaster_stop_triggered(float(row.price)):
             self._close(
                 float(row.price),
@@ -1140,7 +1164,6 @@ class LogReplay:
                 reason="鐏鹃毦姝㈡崯骞充粨",
             )
             self.disaster_stop += 1
-            self.stopped = True
             return
         if self.pos.is_active():
             compressed = self._maybe_update_boll_tp_compression(row)
@@ -1208,6 +1231,18 @@ class LogReplay:
                 self.pos.pending = None
                 self.pos.reset()
                 return
+            if self.pos.pending.idx > 0 and not self._addon_max_width_ok(row):
+                self.blocked_addon_max_width += 1
+                self.pos.pending = None
+                return
+            if (
+                self.pos.pending.idx > 0
+                and self.params.trend_risk_freeze_addon_enabled
+                and self.trend_risk_guard_active
+            ):
+                self.trend_risk_freeze_cancels += 1
+                self.pos.pending = None
+                return
             if self._outside_direction(row) != self.pos.direction:
                 if row.kline_ts != self.last_entry_check_kline:
                     self.inside_cancel += 1
@@ -1225,7 +1260,13 @@ class LogReplay:
     def _maybe_place_next_batch(self, row) -> None:
         if self.capital_shortage_active:
             return
+        if self.params.trend_risk_freeze_addon_enabled and self.trend_risk_guard_active:
+            self.trend_risk_freeze_blocks += 1
+            return
         if not self._width_ok(row):
+            return
+        if not self._addon_max_width_ok(row):
+            self.blocked_addon_max_width += 1
             return
         if self._outside_direction(row) != self.pos.direction:
             return
@@ -1273,6 +1314,10 @@ class LogReplay:
 
     def _maybe_reprice(self, row) -> None:
         if self.pos.pending is None:
+            return
+        if self.pos.pending.idx > 0 and not self._addon_max_width_ok(row):
+            self.blocked_addon_max_width += 1
+            self.pos.pending = None
             return
         if self.pos.direction == "long" and self._still_making_new_low():
             return
@@ -1595,6 +1640,9 @@ class LogReplay:
             "entry_max_width_enabled": self.params.entry_max_width_enabled,
             "entry_max_width_pct": self.params.entry_max_width_pct,
             "entry_max_width_usd": self.params.entry_max_width_usd,
+            "addon_max_width_enabled": self.params.addon_max_width_enabled,
+            "addon_max_width_pct": self.params.addon_max_width_pct,
+            "addon_max_width_usd": self.params.addon_max_width_usd,
             "min_entry_gap_usd": self.params.min_entry_gap_usd,
             "reprice_gap_usd": self.params.reprice_gap_usd,
             "first_batch_ratio": self.params.first_batch_ratio,
@@ -1634,6 +1682,8 @@ class LogReplay:
             "disaster_head_drop_pct": self.params.disaster_head_drop_pct,
             "disaster_loss_ratio": self.params.disaster_loss_ratio,
             "trend_risk_guard_enabled": self.params.trend_risk_guard_enabled,
+            "trend_risk_guard_close_enabled": self.params.trend_risk_guard_close_enabled,
+            "trend_risk_freeze_addon_enabled": self.params.trend_risk_freeze_addon_enabled,
             "trend_risk_score_threshold": self.params.trend_risk_score_threshold,
             "trend_risk_head_adverse_pct": self.params.trend_risk_head_adverse_pct,
             "trend_risk_kline_count": self.params.trend_risk_kline_count,
@@ -1686,6 +1736,7 @@ class LogReplay:
             "boll_tp_compression_activated": self.boll_tp_compression_activated,
             "blocked_width": self.blocked_width,
             "blocked_entry_max_width": self.blocked_entry_max_width,
+            "blocked_addon_max_width": self.blocked_addon_max_width,
             "blocked_gap": self.blocked_gap,
             "blocked_extreme": self.blocked_extreme,
             "blocked_addon_guard": self.blocked_addon_guard,
@@ -1695,6 +1746,8 @@ class LogReplay:
             "disaster_stop": self.disaster_stop,
             "trend_risk_guard_signal": self.trend_risk_guard_signal,
             "trend_risk_guard_stop": self.trend_risk_guard_stop,
+            "trend_risk_freeze_blocks": self.trend_risk_freeze_blocks,
+            "trend_risk_freeze_cancels": self.trend_risk_freeze_cancels,
             "dynamic_gap_events": self.dynamic_gap_events,
             "dynamic_gap_avg_mult": round(
                 self.dynamic_gap_mult_total / self.dynamic_gap_events, 4
@@ -1813,6 +1866,9 @@ def _param_value_lists(args) -> list[list[float] | list[int]]:
         [int(ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED)],
         parse_float_list(args.entry_max_width_pct),
         [ENTRY_MAX_BOLL_WIDTH_USD],
+        [int(ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED)],
+        [ADDON_MAX_BOLL_WIDTH_PCT],
+        [ADDON_MAX_BOLL_WIDTH_USD],
         parse_float_list(args.first_batch_ratio),
         parse_float_list(args.second_batch_dynamic_base_ratio),
         parse_float_list(args.second_batch_dynamic_min_ratio),
@@ -1850,6 +1906,8 @@ def _param_value_lists(args) -> list[list[float] | list[int]]:
         parse_float_list(args.disaster_head_drop_pct),
         parse_float_list(args.disaster_loss_ratio),
         parse_int_list(args.trend_risk_guard_enabled),
+        parse_int_list(args.trend_risk_guard_close_enabled),
+        [int(TREND_RISK_FREEZE_ADDON_ENABLED)],
         parse_int_list(args.trend_risk_score_threshold),
         parse_float_list(args.trend_risk_head_adverse_pct),
         [TREND_RISK_KLINE_COUNT],
@@ -1984,6 +2042,9 @@ def current_config_params(args) -> Params:
         entry_max_width_enabled=int(ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED),
         entry_max_width_pct=ENTRY_MAX_BOLL_WIDTH_PCT,
         entry_max_width_usd=ENTRY_MAX_BOLL_WIDTH_USD,
+        addon_max_width_enabled=int(ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED),
+        addon_max_width_pct=ADDON_MAX_BOLL_WIDTH_PCT,
+        addon_max_width_usd=ADDON_MAX_BOLL_WIDTH_USD,
         first_batch_ratio=FIRST_BATCH_RATIO,
         second_batch_dynamic_base_ratio=SECOND_BATCH_DYNAMIC_BASE_RATIO,
         second_batch_dynamic_min_ratio=SECOND_BATCH_DYNAMIC_MIN_RATIO,
@@ -2021,6 +2082,8 @@ def current_config_params(args) -> Params:
         disaster_head_drop_pct=DISASTER_HEAD_DROP_PCT,
         disaster_loss_ratio=DISASTER_LOSS_RATIO,
         trend_risk_guard_enabled=int(TREND_RISK_GUARD_ENABLED),
+        trend_risk_guard_close_enabled=int(TREND_RISK_GUARD_CLOSE_ENABLED),
+        trend_risk_freeze_addon_enabled=int(TREND_RISK_FREEZE_ADDON_ENABLED),
         trend_risk_score_threshold=TREND_RISK_SCORE_THRESHOLD,
         trend_risk_head_adverse_pct=TREND_RISK_HEAD_ADVERSE_PCT,
         trend_risk_kline_count=TREND_RISK_KLINE_COUNT,
@@ -2112,6 +2175,9 @@ def params_from_report_row(row: dict) -> Params:
         entry_max_width_enabled=row["entry_max_width_enabled"],
         entry_max_width_pct=row["entry_max_width_pct"],
         entry_max_width_usd=row["entry_max_width_usd"],
+        addon_max_width_enabled=row.get("addon_max_width_enabled", int(ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED)),
+        addon_max_width_pct=row.get("addon_max_width_pct", ADDON_MAX_BOLL_WIDTH_PCT),
+        addon_max_width_usd=row.get("addon_max_width_usd", ADDON_MAX_BOLL_WIDTH_USD),
         first_batch_ratio=row["first_batch_ratio"],
         second_batch_dynamic_base_ratio=row.get("second_batch_dynamic_base_ratio", SECOND_BATCH_DYNAMIC_BASE_RATIO),
         second_batch_dynamic_min_ratio=row.get("second_batch_dynamic_min_ratio", SECOND_BATCH_DYNAMIC_MIN_RATIO),
@@ -2149,6 +2215,12 @@ def params_from_report_row(row: dict) -> Params:
         disaster_head_drop_pct=row["disaster_head_drop_pct"],
         disaster_loss_ratio=row["disaster_loss_ratio"],
         trend_risk_guard_enabled=row.get("trend_risk_guard_enabled", int(TREND_RISK_GUARD_ENABLED)),
+        trend_risk_guard_close_enabled=row.get(
+            "trend_risk_guard_close_enabled", int(TREND_RISK_GUARD_CLOSE_ENABLED)
+        ),
+        trend_risk_freeze_addon_enabled=row.get(
+            "trend_risk_freeze_addon_enabled", int(TREND_RISK_FREEZE_ADDON_ENABLED)
+        ),
         trend_risk_score_threshold=row.get("trend_risk_score_threshold", TREND_RISK_SCORE_THRESHOLD),
         trend_risk_head_adverse_pct=row.get("trend_risk_head_adverse_pct", TREND_RISK_HEAD_ADVERSE_PCT),
         trend_risk_kline_count=row.get("trend_risk_kline_count", TREND_RISK_KLINE_COUNT),
@@ -2254,7 +2326,8 @@ def _markdown_param_rows(rows: list[dict], limit: int = 10) -> list[str]:
             f"{row['second_batch_dynamic_max_ratio']}/"
             f"{row['second_batch_dynamic_full_gap_usd']}|"
             f"{row['dynamic_base_ratio']}/{row['dynamic_min_ratio']}/{row['dynamic_max_ratio']}|"
-            f"{row['trend_risk_guard_enabled']}/{row['trend_risk_score_threshold']}/"
+            f"{row['trend_risk_guard_enabled']}/{row['trend_risk_guard_close_enabled']}/"
+            f"{row['trend_risk_score_threshold']}/"
             f"{row['trend_risk_head_adverse_pct']}/{row['trend_risk_width_expand']}|"
             f"{row['copy_fixed_loss_stop_ratio']}/{row['disaster_head_drop_pct']}/"
             f"{row['disaster_loss_ratio']}|{row['addon_dynamic_gap_max_usd']}|"
@@ -2310,6 +2383,7 @@ def write_markdown_report(
             f"`DISASTER_HEAD_DROP_PCT={best['disaster_head_drop_pct']}`, "
             f"`DISASTER_LOSS_RATIO={best['disaster_loss_ratio']}`, "
             f"`TREND_RISK={bool(best['trend_risk_guard_enabled'])}/"
+            f"{bool(best['trend_risk_guard_close_enabled'])}/"
             f"{best['trend_risk_score_threshold']}/"
             f"{best['trend_risk_head_adverse_pct']}/"
             f"{best['trend_risk_width_expand']}`, "
@@ -2446,6 +2520,9 @@ def apply_params_to_config(row: dict, config_path: Path = CONFIG_PATH) -> Path:
     """Write selected optimizer parameters into ``src/config.py``."""
     replacements = {
         "ENTRY_MAX_BOLL_WIDTH_PCT": row["entry_max_width_pct"],
+        "ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED": row["addon_max_width_enabled"],
+        "ADDON_MAX_BOLL_WIDTH_PCT": row["addon_max_width_pct"],
+        "ADDON_MAX_BOLL_WIDTH_USD": row["addon_max_width_usd"],
         "MIN_ENTRY_GAP_USD": row["min_entry_gap_usd"],
         "BOLL_WIDTH_TP_SPACE_MULT": row["boll_width_tp_space_mult"],
         "FIRST_BATCH_RATIO": row["first_batch_ratio"],
@@ -2463,12 +2540,19 @@ def apply_params_to_config(row: dict, config_path: Path = CONFIG_PATH) -> Path:
         "DISASTER_HEAD_DROP_PCT": row["disaster_head_drop_pct"],
         "DISASTER_LOSS_RATIO": row["disaster_loss_ratio"],
         "TREND_RISK_GUARD_ENABLED": row["trend_risk_guard_enabled"],
+        "TREND_RISK_GUARD_CLOSE_ENABLED": row["trend_risk_guard_close_enabled"],
+        "TREND_RISK_FREEZE_ADDON_ENABLED": row["trend_risk_freeze_addon_enabled"],
         "TREND_RISK_SCORE_THRESHOLD": row["trend_risk_score_threshold"],
         "TREND_RISK_HEAD_ADVERSE_PCT": row["trend_risk_head_adverse_pct"],
         "TREND_RISK_WIDTH_EXPAND": row["trend_risk_width_expand"],
         "ADDON_DYNAMIC_GAP_MAX_USD": row["addon_dynamic_gap_max_usd"],
     }
-    bool_keys = {"TREND_RISK_GUARD_ENABLED"}
+    bool_keys = {
+        "ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED",
+        "TREND_RISK_GUARD_ENABLED",
+        "TREND_RISK_GUARD_CLOSE_ENABLED",
+        "TREND_RISK_FREEZE_ADDON_ENABLED",
+    }
     text = config_path.read_text(encoding="utf-8")
     backup_path = config_path.with_suffix(".py.bak")
     backup_path.write_text(text, encoding="utf-8")
@@ -2636,6 +2720,7 @@ def print_rankings(rows: list[dict], baseline_row: dict, top_n: int = 10) -> Non
         )
         trend_risk = (
             f"{row['trend_risk_guard_enabled']}/"
+            f"{row['trend_risk_guard_close_enabled']}/"
             f"{row['trend_risk_score_threshold']}/"
             f"{row['trend_risk_head_adverse_pct']:g}/"
             f"{row['trend_risk_width_expand']:g}"
@@ -2743,6 +2828,7 @@ def main() -> None:
     parser.add_argument("--disaster-head-drop-pct", default="0.05")
     parser.add_argument("--disaster-loss-ratio", default="0.70")
     parser.add_argument("--trend-risk-guard-enabled", default="0,1")
+    parser.add_argument("--trend-risk-guard-close-enabled", default=str(int(TREND_RISK_GUARD_CLOSE_ENABLED)))
     parser.add_argument("--trend-risk-score-threshold", default="4,5")
     parser.add_argument("--trend-risk-head-adverse-pct", default="0.03,0.04,0.05")
     parser.add_argument("--trend-risk-width-expand", default="1.8,2.0,2.5")

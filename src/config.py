@@ -88,7 +88,7 @@ MIN_BOLL_WIDTH_USD = 15
 
 # Minimum Bollinger width as current-price percentage.
 # 最小布林带宽度百分比：0.008=0.8%。
-MIN_BOLL_WIDTH_PCT = 0.008
+MIN_BOLL_WIDTH_PCT = 0.015
 
 # Dynamic Bollinger-width reference.
 # 动态布林宽度基准：价格在2000附近时，参考宽度为15U。
@@ -105,7 +105,7 @@ BOLL_WIDTH_GAP_MULT = 2.5
 
 # Require enough Bollinger width to cover the configured take-profit target.
 # 例如 25% 保证金收益 / 50x = 0.5% 价格波动；乘以 2.0 后，要求布林宽度至少覆盖约 1.0% 的价格空间。
-BOLL_WIDTH_TP_SPACE_ENABLED = True
+BOLL_WIDTH_TP_SPACE_ENABLED = False
 BOLL_WIDTH_TP_SPACE_MULT = 1.5
 
 # Head-entry maximum Bollinger width filter.
@@ -113,7 +113,7 @@ BOLL_WIDTH_TP_SPACE_MULT = 1.5
 # If either threshold is hit, the strategy skips/cancels the first batch.
 # 任一阈值触发时，跳过或撤销未成交头仓。
 ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED = True
-ENTRY_MAX_BOLL_WIDTH_PCT = 0.04
+ENTRY_MAX_BOLL_WIDTH_PCT = 0.028
 ENTRY_MAX_BOLL_WIDTH_USD = 80.0
 
 # Recent-price count for no-new-extreme filter.
@@ -197,7 +197,7 @@ MIN_ENTRY_GAP_USD = 6
 
 # Required first-entry liquidation buffer after a full ladder.
 # 头仓强平缓冲：按最小补仓一路补到上限后，头仓到预估强平至少保留该比例。
-MIN_HEAD_LIQ_BUFFER_PCT = 0.03
+MIN_HEAD_LIQ_BUFFER_PCT = 0.05
 
 # Enlarge entry gap when liquidation buffer would be too small.
 # 动态强平缓冲间距：如果基础间距不足以保持强平缓冲，会自动提高有效间距。
@@ -217,6 +217,12 @@ ADDON_DYNAMIC_GAP_HEAD_STRONG_PCT = 0.03
 ADDON_DYNAMIC_GAP_HEAD_MAX_MULT = 1.2
 ADDON_DYNAMIC_GAP_TREND_KLINES = 3
 ADDON_DYNAMIC_GAP_TREND_MULT = 1.25
+
+# Maximum Bollinger width for add-on orders.
+# 补仓最大布林宽度：持仓后布林带过宽时停止新增补仓，并撤销未成交补仓单。
+ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED = False
+ADDON_MAX_BOLL_WIDTH_PCT = 0.04
+ADDON_MAX_BOLL_WIDTH_USD = 80.0
 
 # Completed-candle extreme guard for add-on orders.
 # 补仓K线极值确认：头仓成交后记录已完成K线极值。
@@ -288,22 +294,28 @@ FIXED_LOSS_HEAD_BUFFER_ENABLED = True
 FIXED_LOSS_HEAD_BUFFER_PCT = 0.05
 
 # Disaster stop for one strategy cycle.
-# 灾难止损：头仓逆向达到阈值且浮亏达到策略资金比例时，平仓并停机。
+# 灾难止损：头仓逆向达到阈值且浮亏达到策略资金比例时，平掉当前仓位并继续运行。
 DISASTER_STOP_ENABLED = True
 DISASTER_HEAD_DROP_PCT = 0.05
 DISASTER_LOSS_RATIO = 0.7
 
 # Trend risk guard.
-# 趋势风险守卫：默认关闭。开启后满足多项趋势恶化条件时平掉当前仓位，但程序继续运行。
-TREND_RISK_GUARD_ENABLED = False
-TREND_RISK_SCORE_THRESHOLD = 4
-TREND_RISK_HEAD_ADVERSE_PCT = 0.03
+# 趋势风险守卫：开启后进行趋势恶化评分，达到阈值会打印日志并发送微信通知。
+TREND_RISK_GUARD_ENABLED = True
+
+# 趋势风险守卫市价平仓开关：False=只提醒不平仓，True=触发后市价平当前仓位。
+TREND_RISK_GUARD_CLOSE_ENABLED = False
+
+# 趋势风险守卫冻结补仓：触发后不再新增补仓，并撤销未成交补仓单；头仓和止盈/止损不受影响。
+TREND_RISK_FREEZE_ADDON_ENABLED = True
+TREND_RISK_SCORE_THRESHOLD = 5
+TREND_RISK_HEAD_ADVERSE_PCT = 0.04
 TREND_RISK_KLINE_COUNT = 3
 TREND_RISK_MIN_HOLD_MIN = 30
 TREND_RISK_SLOPE_WINDOW_MIN = 45
 TREND_RISK_MID_SLOPE_PCT_PER_HOUR = 0.2
 TREND_RISK_EDGE_SLOPE_PCT_PER_HOUR = 0.8
-TREND_RISK_WIDTH_EXPAND = 2.0
+TREND_RISK_WIDTH_EXPAND = 2.5
 TREND_RISK_NOTIFY_INTERVAL_SEC = 3600
 
 # Reserved planned risk controls; not wired into src.risk.build_batch_plan.
@@ -319,7 +331,7 @@ TREND_RISK_NOTIFY_INTERVAL_SEC = 3600
 
 # Strategy target capital.
 # 策略目标资金：开仓/补仓按这个目标资金计算；平仓后利润划走，亏损从资金账户补回。
-TRADING_ACCOUNT_TARGET = 100
+TRADING_ACCOUNT_TARGET = 50
 
 # Cross-margin copy-protection mode.
 # 全仓带单保护：保护固定账户权益，策略只使用可用策略资金部分。

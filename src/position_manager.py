@@ -45,6 +45,8 @@ class PositionState:
         total_sz: Latest position size in contracts.
         remaining_batches_placed: Whether no more batch entries should be
             placed for the current plan.
+        cycle_start_account_value: Trading-account equity before this cycle.
+        cycle_start_ts: Timestamp when the cycle baseline was recorded.
     """
 
     direction: str
@@ -57,6 +59,8 @@ class PositionState:
     avg_entry: float = 0.0
     total_sz: float = 0.0
     remaining_batches_placed: bool = False
+    cycle_start_account_value: float = 0.0
+    cycle_start_ts: str = ""
 
     def is_active(self) -> bool:
         """Return whether the local state has an active position."""
@@ -141,4 +145,6 @@ class PositionState:
         self.avg_entry = 0.0
         self.total_sz = 0.0
         self.remaining_batches_placed = False
+        self.cycle_start_account_value = 0.0
+        self.cycle_start_ts = ""
         logger.info("持仓状态已重置")

@@ -138,9 +138,10 @@ async def notify_trend_risk_guard(
     mid_slope: float,
     lower_slope: float,
     upper_slope: float,
+    close_enabled: bool,
 ) -> None:
-    """Notify when the trend-risk guard closes a position."""
-    title = "ETH trend risk guard close"
+    """Notify when the trend-risk guard reaches its score threshold."""
+    title = "ETH trend risk guard signal"
     content = (
         f"**Direction**: {direction.upper()}\n\n"
         f"**Mark price**: {mark_price:.2f}\n\n"
@@ -153,7 +154,7 @@ async def notify_trend_risk_guard(
         f"**Mid slope**: {mid_slope:.3f}%/h\n\n"
         f"**Lower slope**: {lower_slope:.3f}%/h\n\n"
         f"**Upper slope**: {upper_slope:.3f}%/h\n\n"
-        "**Action**: close current position and keep strategy running"
+        f"**Action**: {'close current position and keep strategy running' if close_enabled else 'notify only; position remains open'}"
     )
     await wx_push(title, content)
 

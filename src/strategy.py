@@ -39,6 +39,8 @@ from src.config import (
     ADDON_DYNAMIC_GAP_HEAD_START_PCT, ADDON_DYNAMIC_GAP_HEAD_STRONG_PCT,
     ADDON_DYNAMIC_GAP_HEAD_MAX_MULT,
     ADDON_DYNAMIC_GAP_TREND_KLINES, ADDON_DYNAMIC_GAP_TREND_MULT,
+    ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED, ADDON_MAX_BOLL_WIDTH_PCT,
+    ADDON_MAX_BOLL_WIDTH_USD,
     ADDON_EXTREME_GUARD_ENABLED,
     ENTRY_EXTREME_GAP_ADJUST_ENABLED, ENTRY_EXTREME_GAP_BASE_PCT,
     ENTRY_EXTREME_GAP_FULL_PCT, ENTRY_EXTREME_GAP_MAX_MULT,
@@ -57,7 +59,9 @@ from src.config import (
     COPY_FIXED_LOSS_STOP_RATIO,
     FIXED_LOSS_HEAD_BUFFER_ENABLED, FIXED_LOSS_HEAD_BUFFER_PCT,
     DISASTER_STOP_ENABLED, DISASTER_HEAD_DROP_PCT, DISASTER_LOSS_RATIO,
-    TREND_RISK_GUARD_ENABLED, TREND_RISK_SCORE_THRESHOLD,
+    TREND_RISK_GUARD_ENABLED, TREND_RISK_GUARD_CLOSE_ENABLED,
+    TREND_RISK_FREEZE_ADDON_ENABLED,
+    TREND_RISK_SCORE_THRESHOLD,
     TREND_RISK_HEAD_ADVERSE_PCT, TREND_RISK_KLINE_COUNT,
     TREND_RISK_MIN_HOLD_MIN, TREND_RISK_SLOPE_WINDOW_MIN,
     TREND_RISK_MID_SLOPE_PCT_PER_HOUR, TREND_RISK_EDGE_SLOPE_PCT_PER_HOUR,
@@ -133,6 +137,7 @@ class BollPinStrategy:
         self._trend_entry_width_pct = 0.0
         self._trend_entry_time = None
         self._trend_last_notify_ts = 0.0
+        self._trend_risk_guard_active = False
 
     async def run(self):
         """Run the strategy loop until stopped."""
@@ -430,10 +435,18 @@ class BollPinStrategy:
         }
 
     async def _check_trend_risk_guard(self, client: OKXClient, row, mark_price: float) -> bool:
-        """Close the current position when stacked trend-risk signals trigger."""
+        """Handle stacked trend-risk signals for the current position."""
         signal = self._trend_risk_signal(row, mark_price)
         if signal is None:
             return False
+
+        if not self._trend_risk_guard_active:
+            self._trend_risk_guard_active = True
+            log_check(
+                "Trend risk guard active; freeze add-on orders "
+                f"direction={self._state.direction} score={signal['score']}"
+            )
+            self._save_runtime_state()
 
         now = time.time()
         should_notify = now - self._trend_last_notify_ts >= TREND_RISK_NOTIFY_INTERVAL_SEC
@@ -463,7 +476,11 @@ class BollPinStrategy:
                 signal["mid_slope"],
                 signal["lower_slope"],
                 signal["upper_slope"],
+                TREND_RISK_GUARD_CLOSE_ENABLED,
             )
+
+        if not TREND_RISK_GUARD_CLOSE_ENABLED:
+            return False
 
         log_action("Trend risk guard close; strategy keeps running")
         await self._emergency_close(client, reason="trend_risk_guard")
@@ -480,7 +497,7 @@ class BollPinStrategy:
         return 0.0
 
     async def _check_disaster_stop(self, client: OKXClient, mark_price: float) -> bool:
-        """Close and stop when one strategy cycle reaches disaster risk limits."""
+        """Close the current cycle when disaster risk limits are reached."""
         if not DISASTER_STOP_ENABLED:
             return False
         if not self._state.is_active():
@@ -507,7 +524,6 @@ class BollPinStrategy:
             f"threshold={loss_threshold:.4f} USDT"
         )
         await self._emergency_close(client, reason="disaster_stop")
-        self._running = False
         return True
 
     def _floor_contract_size(self, raw_sz: float) -> float:
@@ -791,6 +807,8 @@ class BollPinStrategy:
                 "avg_entry": self._state.avg_entry,
                 "total_sz": self._state.total_sz,
                 "remaining_batches_placed": self._state.remaining_batches_placed,
+                "cycle_start_account_value": self._state.cycle_start_account_value,
+                "cycle_start_ts": self._state.cycle_start_ts,
             },
             "strategy": {
                 "peak_eq": self._peak_eq,
@@ -827,6 +845,9 @@ class BollPinStrategy:
                 "trend_entry_width_pct": self._trend_entry_width_pct if self._state.is_active() else 0.0,
                 "trend_entry_time": self._ts_to_str(self._trend_entry_time) if self._state.is_active() else None,
                 "trend_last_notify_ts": self._trend_last_notify_ts if self._state.is_active() else 0.0,
+                "trend_risk_guard_active": (
+                    self._trend_risk_guard_active if self._state.is_active() else False
+                ),
             },
         }
 
@@ -872,6 +893,7 @@ class BollPinStrategy:
         self._trend_entry_width_pct = 0.0
         self._trend_entry_time = None
         self._trend_last_notify_ts = 0.0
+        self._trend_risk_guard_active = False
         try:
             if STATE_FILE.exists():
                 STATE_FILE.unlink()
@@ -951,6 +973,8 @@ class BollPinStrategy:
             self._state.avg_entry = float(state.get("avg_entry", 0) or 0)
             self._state.total_sz = float(state.get("total_sz", 0) or 0)
             self._state.remaining_batches_placed = bool(state.get("remaining_batches_placed", False))
+            self._state.cycle_start_account_value = float(state.get("cycle_start_account_value", 0) or 0)
+            self._state.cycle_start_ts = str(state.get("cycle_start_ts", "") or "")
 
             strategy = payload.get("strategy", {})
             self._peak_eq = float(strategy.get("peak_eq", 0) or 0)
@@ -986,6 +1010,7 @@ class BollPinStrategy:
             self._trend_last_notify_ts = float(
                 strategy.get("trend_last_notify_ts", strategy.get("btg_last_notify_ts", 0)) or 0
             )
+            self._trend_risk_guard_active = bool(strategy.get("trend_risk_guard_active", False))
             self._sanitize_runtime_state()
             if self._sync_known_batch_sizes():
                 self._save_runtime_state()
@@ -1175,6 +1200,26 @@ class BollPinStrategy:
             f"width_pct={width_pct:.2%} max_pct={ENTRY_MAX_BOLL_WIDTH_PCT:.2%}"
         )
 
+    def _addon_max_boll_width_ok(self, last, mark_price: float) -> bool:
+        """Return whether Bollinger width still allows add-on orders."""
+        if not ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED:
+            return True
+        width = float(last["boll_width"])
+        width_pct = width / mark_price if mark_price > 0 else 0.0
+        pct_hit = ADDON_MAX_BOLL_WIDTH_PCT > 0 and width_pct >= ADDON_MAX_BOLL_WIDTH_PCT
+        usd_hit = ADDON_MAX_BOLL_WIDTH_USD > 0 and width >= ADDON_MAX_BOLL_WIDTH_USD
+        return not (pct_hit or usd_hit)
+
+    def _log_addon_max_boll_width_skip(self, reason: str, last, mark_price: float) -> None:
+        """Log why the maximum-width filter blocked an add-on action."""
+        width = float(last["boll_width"])
+        width_pct = width / mark_price if mark_price > 0 else 0.0
+        log_check(
+            f"{reason}: Bollinger width too wide for add-on "
+            f"width={width:.2f} max={ADDON_MAX_BOLL_WIDTH_USD:.2f} "
+            f"width_pct={width_pct:.2%} max_pct={ADDON_MAX_BOLL_WIDTH_PCT:.2%}"
+        )
+
     def _effective_boll_width_pct(self) -> float:
         """Return the active percentage width threshold."""
         base_pct = BOLL_WIDTH_BASE_USD / BOLL_WIDTH_BASE_PRICE if BOLL_WIDTH_BASE_PRICE > 0 else 0.0
@@ -1315,11 +1360,10 @@ class BollPinStrategy:
         return 1.0
 
     def _effective_min_boll_width(self, mark_price: float) -> float:
-        """Return TP-space Bollinger-width threshold."""
-        tp_space_rule = self._tp_space_width_rule(mark_price)
-        if BOLL_WIDTH_TP_SPACE_ENABLED:
-            return max(MIN_BOLL_WIDTH_FLOOR_USD, tp_space_rule)
-        return MIN_BOLL_WIDTH_USD
+        """Return the fixed-percent Bollinger-width threshold."""
+        if mark_price <= 0:
+            return MIN_BOLL_WIDTH_USD
+        return max(MIN_BOLL_WIDTH_FLOOR_USD, mark_price * MIN_BOLL_WIDTH_PCT)
 
     def _tp_space_width_rule(self, mark_price: float) -> float:
         """Return the minimum Bollinger width implied by the take-profit target."""
@@ -1473,6 +1517,48 @@ class BollPinStrategy:
             await self._cancel_pending_batch_due_to_guard(client, pending_batch, "fixed-loss head buffer failed")
             return True
         return False
+
+    async def _cancel_pending_if_addon_width_too_wide(
+        self,
+        client: OKXClient,
+        last,
+        mark_price: float,
+        pending_batch,
+    ) -> bool:
+        """Cancel pending add-on orders when Bollinger width becomes too wide."""
+        if pending_batch.batch_idx <= 0:
+            return False
+        if self._addon_max_boll_width_ok(last, mark_price):
+            return False
+        self._log_addon_max_boll_width_skip(
+            f"cancel_pending_batch_{pending_batch.batch_idx + 1}",
+            last,
+            mark_price,
+        )
+        await self._cancel_pending_batch_due_to_guard(
+            client,
+            pending_batch,
+            "add-on Bollinger width too wide",
+        )
+        return True
+
+    async def _cancel_pending_if_trend_risk_freeze(self, client: OKXClient, pending_batch) -> bool:
+        """Cancel pending add-on orders after the trend-risk guard freezes adds."""
+        if not TREND_RISK_FREEZE_ADDON_ENABLED:
+            return False
+        if not self._trend_risk_guard_active:
+            return False
+        if pending_batch.batch_idx <= 0:
+            return False
+        log_check(
+            f"Trend risk guard freeze; cancel pending add-on batch {pending_batch.batch_idx + 1}"
+        )
+        await self._cancel_pending_batch_due_to_guard(
+            client,
+            pending_batch,
+            "trend risk freeze",
+        )
+        return True
 
     def _entry_extreme_multiplier(self, gap_pct: float) -> float:
         """Return entry-gap multiplier from first-entry 24h extreme distance."""
@@ -1865,9 +1951,13 @@ class BollPinStrategy:
 
         pending_batch = self._state.pending_batch()
         if pending_batch is not None:
+            if await self._cancel_pending_if_trend_risk_freeze(client, pending_batch):
+                return
             if self._last_batch_kline_ts is not None and last["ts"] == self._last_batch_kline_ts:
                 return
             if await self._cancel_pending_if_width_too_narrow(client, last, mark_price):
+                return
+            if await self._cancel_pending_if_addon_width_too_wide(client, last, mark_price, pending_batch):
                 return
             if await self._cancel_pending_if_inside_too_long(client, last, mark_price):
                 return
@@ -1878,6 +1968,10 @@ class BollPinStrategy:
 
         if not self._boll_width_ok(last, mark_price):
             self._log_boll_width_skip("addon_skip", last, mark_price)
+            return
+
+        if TREND_RISK_FREEZE_ADDON_ENABLED and self._trend_risk_guard_active:
+            log_check("Trend risk guard freeze; skip new add-on batch")
             return
 
         trigger_direction = self._intrabar_probe_direction(df, last, mark_price)
@@ -1894,6 +1988,10 @@ class BollPinStrategy:
         next_idx = self._state.next_batch_idx()
         if next_idx >= MAX_ENTRY_BATCHES:
             self._state.remaining_batches_placed = True
+            return
+
+        if not self._addon_max_boll_width_ok(last, mark_price):
+            self._log_addon_max_boll_width_skip(f"addon_skip_batch_{next_idx + 1}", last, mark_price)
             return
 
         kline_ts = last["ts"]
@@ -1975,6 +2073,14 @@ class BollPinStrategy:
 
         if not self._boll_width_ok(last, mark_price):
             self._log_boll_width_skip("reprice_skip", last, mark_price)
+            self._save_runtime_state()
+            return
+        if pending_batch.batch_idx > 0 and not self._addon_max_boll_width_ok(last, mark_price):
+            self._log_addon_max_boll_width_skip(
+                f"reprice_skip_batch_{pending_batch.batch_idx + 1}",
+                last,
+                mark_price,
+            )
             self._save_runtime_state()
             return
 
@@ -2173,6 +2279,10 @@ class BollPinStrategy:
 
     async def _place_batch_orders(self, client: OKXClient, plan, remaining_batches_placed: bool = True) -> bool:
         """Submit all entry orders in a batch plan."""
+        had_batches = bool(self._state.batches)
+        if not had_batches and any(bo.batch_idx == 0 for bo in plan.orders):
+            await self._record_cycle_start_account_value(client, reason="before_head_order")
+
         self._state.direction      = plan.direction
         self._state.plan_liq_price = plan.liq_price
         self._state.plan_sl_price  = plan.sl_price
@@ -2180,7 +2290,6 @@ class BollPinStrategy:
 
         side     = "buy"  if plan.direction == "long"  else "sell"
         pos_side = plan.direction
-        had_batches = bool(self._state.batches)
         placed_any = False
 
         for bo in plan.orders:
@@ -2217,6 +2326,8 @@ class BollPinStrategy:
                 return False
             logger.warning("No batch order placed; reset strategy state")
             self._state.reset()
+            self._last_batch_kline_ts = None
+            self._last_entry_check_kline_ts = None
             self._clear_runtime_state()
             return False
 
@@ -2726,7 +2837,9 @@ class BollPinStrategy:
                 avg_entry      = sum(b.price * b.sz for b in filled) / total_sz
             close_ord_id = self._state.tp_ord_id or ""
             actual_close = await self._fetch_actual_close_pnl(client, direction, total_sz, close_ord_id)
-            actual_pnl = actual_close["pnl"] if actual_close else None
+            equity_close = await self._fetch_account_equity_close_pnl(client)
+            actual_pnl = equity_close["pnl"] if equity_close else (actual_close["pnl"] if actual_close else None)
+            pnl_source = "account_equity_diff" if equity_close else ("fills" if actual_close else "estimate")
             if total_sz > 0 and avg_entry > 0:
                 if actual_close:
                     display_close_price = actual_close["avg_price"] or close_price
@@ -2736,7 +2849,16 @@ class BollPinStrategy:
                         f"Position closed {direction} avg_entry={avg_entry:.2f} "
                         f"close_avg={display_close_price:.2f} sz={display_sz:.2f} "
                         f"actual_pnl={pnl:+.4f} USDT fills={actual_close['fills']} "
-                        f"fee={actual_close['fee']:+.4f}"
+                        f"fee={actual_close['fee']:+.4f} source={pnl_source}"
+                    )
+                elif equity_close:
+                    display_close_price = close_price
+                    display_sz = total_sz
+                    pnl = actual_pnl
+                    log_action(
+                        f"Position closed {direction} avg_entry={avg_entry:.2f} "
+                        f"close_ref={close_price:.2f} sz={total_sz:.2f} "
+                        f"actual_pnl={pnl:+.4f} USDT source={pnl_source}"
                     )
                 else:
                     from src.config import CT_VAL
@@ -2790,6 +2912,8 @@ class BollPinStrategy:
             self._repair_filled_batches_after_restart()
             if self._sync_known_batch_sizes():
                 self._save_runtime_state()
+            if self._state.cycle_start_account_value <= 0:
+                await self._record_cycle_start_account_value(client, reason="restart_existing_position")
             await self._reconcile_entry_orders_after_restart(client)
             await self._replace_exit_orders(client)
         else:
@@ -2819,15 +2943,28 @@ class BollPinStrategy:
                 await self._cancel_exchange_exit_orders(client)
                 await self._cancel_exit_orders(client)
                 await client.close_position(INST_ID, direction)
+                await asyncio.sleep(1)
+                equity_close = await self._fetch_account_equity_close_pnl(client)
+                actual_pnl = equity_close["pnl"] if equity_close else None
                 if avg_entry > 0 and total_sz > 0:
                     if direction == "long":
                         pnl = (close_price - avg_entry) * total_sz * CT_VAL
                     else:
                         pnl = (avg_entry - close_price) * total_sz * CT_VAL
+                    if actual_pnl is not None:
+                        pnl = actual_pnl
+                        log_action(
+                            f"Emergency close actual_pnl={pnl:+.4f} USDT "
+                            f"source=account_equity_diff reason={reason}"
+                        )
                     await notify_close(direction, avg_entry, close_price, pnl, total_sz)
                 self._reset_probe_state()
                 self._state.reset()
                 self._clear_runtime_state()
+                actual_profit = await self._rebalance_accounts(client, actual_pnl=actual_pnl)
+                if actual_profit:
+                    log_action(f"Capital actual PnL confirmed {actual_profit:+.4f} USDT")
+                await self._calibrate_capital_after_close(client)
                 await self._init_fixed_batch_sizes(client)
             except Exception as e:
                 logger.error(f"Emergency close failed: {e}")
@@ -3254,6 +3391,56 @@ class BollPinStrategy:
         if CROSS_COPY_PROTECT_ENABLED:
             return await client.get_equity("USDT")
         return await client.get_balance("USDT")
+
+    async def _cycle_account_value(self, client: OKXClient) -> float:
+        """Return account equity used as the per-cycle PnL baseline."""
+        return await client.get_equity("USDT")
+
+    async def _record_cycle_start_account_value(
+        self,
+        client: OKXClient,
+        reason: str,
+        force: bool = False,
+    ) -> float:
+        """Persist the trading-account equity baseline for the current cycle."""
+        if not force and self._state.cycle_start_account_value > 0:
+            return self._state.cycle_start_account_value
+        try:
+            account_value = await self._cycle_account_value(client)
+        except Exception as e:
+            logger.warning(f"Record cycle start account value failed reason={reason}: {e}")
+            return 0.0
+
+        self._state.cycle_start_account_value = round(account_value, 4)
+        self._state.cycle_start_ts = pd.Timestamp.utcnow().isoformat()
+        log_check(
+            f"Cycle start account value recorded value={self._state.cycle_start_account_value:.4f} "
+            f"reason={reason}"
+        )
+        self._save_runtime_state()
+        return self._state.cycle_start_account_value
+
+    async def _fetch_account_equity_close_pnl(self, client: OKXClient) -> dict | None:
+        """Return realized cycle PnL from start/end account equity when available."""
+        start_value = self._state.cycle_start_account_value
+        if start_value <= 0:
+            return None
+        try:
+            end_value = await self._cycle_account_value(client)
+        except Exception as e:
+            logger.warning(f"Fetch account-equity close PnL failed; fallback to fills: {e}")
+            return None
+
+        pnl = round(end_value - start_value, 4)
+        log_action(
+            f"Actual close PnL from account equity diff actual_pnl={pnl:+.4f} USDT "
+            f"start={start_value:.4f} end={end_value:.4f}"
+        )
+        return {
+            "pnl": pnl,
+            "start": round(start_value, 4),
+            "end": round(end_value, 4),
+        }
 
     async def _calibrate_capital_after_close(self, client: OKXClient) -> float:
         """Align trading account capital after realized-PnL transfer."""

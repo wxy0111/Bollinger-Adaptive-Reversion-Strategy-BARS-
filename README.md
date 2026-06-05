@@ -305,13 +305,14 @@ DISASTER_LOSS_RATIO = 0.7
 趋势风险守卫：
 
 ```python
-TREND_RISK_GUARD_ENABLED = False
+TREND_RISK_GUARD_ENABLED = True
+TREND_RISK_GUARD_CLOSE_ENABLED = False
 TREND_RISK_SCORE_THRESHOLD = 4
 TREND_RISK_HEAD_ADVERSE_PCT = 0.03
 TREND_RISK_WIDTH_EXPAND = 2.0
 ```
 
-默认关闭。开启后，程序会在头仓逆向幅度、布林中轨/边轨斜率、连续 K 线极值恶化、价格相对中轨位置、布林宽度扩张等条件同时恶化时平掉当前仓位，但不会停机，后续仍按策略继续运行。
+默认开启评分和提醒，默认关闭市价平仓。程序会在头仓逆向幅度、布林中轨/边轨斜率、连续 K 线极值恶化、价格相对中轨位置、布林宽度扩张等条件同时恶化并达到评分阈值时打印日志并发送微信通知。只有 `TREND_RISK_GUARD_CLOSE_ENABLED=True` 时，才会市价平掉当前仓位；平仓后程序继续运行。
 
 ## 固本资金和全仓带单保护
 
@@ -421,6 +422,7 @@ FIXED_LOSS_HEAD_BUFFER_PCT
 DISASTER_HEAD_DROP_PCT
 DISASTER_LOSS_RATIO
 TREND_RISK_GUARD_ENABLED
+TREND_RISK_GUARD_CLOSE_ENABLED
 TREND_RISK_SCORE_THRESHOLD
 TREND_RISK_HEAD_ADVERSE_PCT
 TREND_RISK_WIDTH_EXPAND
