@@ -116,6 +116,15 @@ ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED = True
 ENTRY_MAX_BOLL_WIDTH_PCT = 0.028
 ENTRY_MAX_BOLL_WIDTH_USD = 80.0
 
+# Entry disaster score filter, stacked after the max-width filter.
+# 入场灾难评分过滤：在最大布林宽度过滤之后叠加，用于拦截单边趋势破轨。
+ENTRY_DISASTER_FILTER_ENABLED = True
+ENTRY_DISASTER_SCORE_THRESHOLD = 4
+ENTRY_DISASTER_KLINE_COUNT = 3
+ENTRY_DISASTER_WIDTH_EXPAND = 1.5
+ENTRY_DISASTER_TP_DISTANCE_MULT = 4.0
+ENTRY_DISASTER_EXPECTED_RETURN = 0.25
+
 # Recent-price count for no-new-extreme filter.
 # 创新高/创新低观察点数：2表示用最近3个价格点判断是否还在继续创新极值。
 NO_NEW_EXTREME_TICKS = 2
@@ -224,6 +233,22 @@ ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED = False
 ADDON_MAX_BOLL_WIDTH_PCT = 0.04
 ADDON_MAX_BOLL_WIDTH_USD = 80.0
 
+# Add-on take-profit improvement guard.
+# 补仓止盈改善守卫：补仓后，目标止盈价必须明显变得更容易触达才允许补仓。
+ADDON_TP_IMPROVE_GUARD_ENABLED = True
+
+# Expected take-profit return used by the add-on guard.
+# 守卫使用的预期止盈收益：按 25% 保证金收益计算，不跟随当前真实止盈目标 28%。
+ADDON_TP_IMPROVE_EXPECTED_RETURN = 0.25
+
+# Required improvement as a fraction of the expected take-profit distance.
+# 止盈价改善比例：1.0 表示至少改善一个完整预期止盈距离。
+ADDON_TP_IMPROVE_RATIO = 1.0
+
+# Minimum absolute improvement in USDT.
+# 最小绝对改善值：防止低价时阈值过小。
+ADDON_TP_IMPROVE_MIN_USD = 1.0
+
 # Completed-candle extreme guard for add-on orders.
 # 补仓K线极值确认：头仓成交后记录已完成K线极值。
 # 多单补仓价必须低于记录低点；空单补仓价必须高于记录高点。
@@ -248,13 +273,13 @@ TP_PROFIT_USD = 10.0
 
 # Target margin return for default take profit.
 # 默认止盈收益率：0.25=保证金收益25%。
-TP_TARGET_MARGIN_RETURN = 0.25
+TP_TARGET_MARGIN_RETURN = 0.28
 
 # Dynamic take-profit lock.
 # 动态锁盈：达到启动收益后，如价格不再创新高/低，则按实时价格附近止盈。
 DYNAMIC_TP_ENABLED = True
-DYNAMIC_TP_ARM_RETURN = 0.23
-DYNAMIC_TP_RESTORE_RETURN = 0.21
+DYNAMIC_TP_ARM_RETURN = 0.22
+DYNAMIC_TP_RESTORE_RETURN = 0.18
 DYNAMIC_TP_REPRICE_GAP_USD = 0.5
 
 # Bollinger take-profit compression exit.

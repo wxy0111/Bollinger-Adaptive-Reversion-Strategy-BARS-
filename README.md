@@ -110,13 +110,22 @@ MIN_BOLL_WIDTH_FLOOR_USD = 10.0
 BOLL_WIDTH_GAP_MULT = 2.5
 
 ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED = True
-ENTRY_MAX_BOLL_WIDTH_PCT = 0.025
+ENTRY_MAX_BOLL_WIDTH_PCT = 0.028
 ENTRY_MAX_BOLL_WIDTH_USD = 80.0
+
+ENTRY_DISASTER_FILTER_ENABLED = True
+ENTRY_DISASTER_SCORE_THRESHOLD = 4
+ENTRY_DISASTER_KLINE_COUNT = 3
+ENTRY_DISASTER_WIDTH_EXPAND = 1.5
+ENTRY_DISASTER_TP_DISTANCE_MULT = 4.0
+ENTRY_DISASTER_EXPECTED_RETURN = 0.25
 ```
 
 `BOLL_INCLUDE_CURRENT=True` 表示布林带包含当前未收盘 K 线，布林带会随盘中价格实时变化。
 
-最低布林宽度用于避免窄幅低波动行情开仓；最大布林宽度只限制新开头仓，用来避免在极端扩张或趋势加速阶段开第一单。当前最大宽度过滤为：布林宽度达到价格的 `2.5%` 或绝对宽度达到 `80U` 时，不开新头仓。该规则不影响已有持仓后的补仓。
+最低布林宽度用于避免窄幅低波动行情开仓；最大布林宽度只限制新开头仓，用来避免在极端扩张或趋势加速阶段开第一单。当前最大宽度过滤为：布林宽度达到价格的 `2.8%` 或绝对宽度达到 `80U` 时，不开新头仓。该规则不影响已有持仓后的补仓。
+
+入场灾难评分是叠加在最大宽度之后的第二层头仓过滤。它会观察最近 `3` 根 15m K 线的高低点、布林中轨/边轨方向、布林宽度扩张，以及价格距离中轨是否过远；评分达到 `4` 时跳过头仓。最大宽度过滤和灾难评分是 `OR` 关系：任意一层触发，都会跳过头仓。
 
 ## 开仓逻辑
 
@@ -126,6 +135,7 @@ ENTRY_MAX_BOLL_WIDTH_USD = 80.0
 价格突破布林带外侧
 + 布林宽度不低于最低阈值
 + 布林宽度不高于头仓最大阈值
++ 入场灾难评分未达到阈值
 + 价格不再继续创新高/新低
 + 当前 K 线没有开过新计划
 + 入场价和上一套计划价格距离足够
@@ -141,7 +151,7 @@ ENTRY_MAX_BOLL_WIDTH_USD = 80.0
 
 同一根 15m K 线最多新增一笔入场批次。头仓成交后，本根 K 线不继续补仓，等待下一根 K 线重新判断。平仓完成后，平仓所在的这根 15m K 线不再开新头仓。
 
-如果未成交头仓挂单后，下一根 K 线判断时布林宽度低于最低阈值，或高于头仓最大宽度阈值，程序会撤销该未成交头仓。
+如果未成交头仓挂单后，下一根 K 线判断时布林宽度低于最低阈值、高于头仓最大宽度阈值，或入场灾难评分达到阈值，程序会撤销该未成交头仓。
 
 ## 补仓逻辑
 
@@ -182,11 +192,18 @@ ADDON_DYNAMIC_GAP_TREND_MULT = 1.25
 ADDON_EXTREME_GUARD_ENABLED = True
 FIXED_LOSS_HEAD_BUFFER_ENABLED = True
 FIXED_LOSS_HEAD_BUFFER_PCT = 0.05
+
+ADDON_TP_IMPROVE_GUARD_ENABLED = True
+ADDON_TP_IMPROVE_EXPECTED_RETURN = 0.25
+ADDON_TP_IMPROVE_RATIO = 1.0
+ADDON_TP_IMPROVE_MIN_USD = 1.0
 ```
 
 有效补仓间距会根据强平缓冲、布林扩张、头仓逆向波动和连续 K 线趋势自动放大，但不会低于 `MIN_ENTRY_GAP_USD`。
 
 补仓 K 线极值 guard 的逻辑是：从头仓成交后开始记录已完成 15m K 线的极值。多单补仓价必须低于记录低点；空单补仓价必须高于记录高点。
+
+补仓止盈改善守卫会模拟补仓后的新均价和预期止盈价。只有当补仓能让预期止盈价明显更容易触达时，才允许补仓；当前按 `25%` 保证金收益作为预期止盈基准，要求至少改善 `1U` 或一个完整预期止盈距离。
 
 ## 动态分批张数
 
@@ -194,7 +211,10 @@ FIXED_LOSS_HEAD_BUFFER_PCT = 0.05
 
 ```python
 FIRST_BATCH_RATIO = 0.1
-SECOND_BATCH_RATIO = 0.15
+SECOND_BATCH_DYNAMIC_BASE_RATIO = 0.14
+SECOND_BATCH_DYNAMIC_MIN_RATIO = 0.05
+SECOND_BATCH_DYNAMIC_MAX_RATIO = 0.18
+SECOND_BATCH_DYNAMIC_FULL_GAP_USD = 10.0
 DYNAMIC_BASE_ENTRY_RATIO = 0.08
 DYNAMIC_MIN_ENTRY_RATIO = 0.05
 DYNAMIC_MAX_ENTRY_RATIO = 0.15
@@ -203,7 +223,7 @@ MAX_ENTRY_BATCHES = 12
 ```
 
 - 第 1 批头仓使用目标策略资金的 `10%` 保证金。
-- 第 2 批补仓使用目标策略资金的 `15%` 保证金。
+- 第 2 批补仓也使用动态比例，当前基准 `14%`，范围 `5%` 到 `18%`，满额参考价差 `10U`。
 - 第 3 批及之后，根据前后价差动态调整比例。
 - 动态补仓比例限制在 `5%` 到 `15%` 之间。
 - 全部入场批次占用保证金最多不超过目标策略资金的 `80%`。
@@ -235,7 +255,7 @@ REPRICE_GAP_USD = 0.5
 当前默认止盈不是固定 `10U`，而是按保证金收益率计算：
 
 ```python
-TP_TARGET_MARGIN_RETURN = 0.25
+TP_TARGET_MARGIN_RETURN = 0.28
 ```
 
 止盈距离：
@@ -244,28 +264,28 @@ TP_TARGET_MARGIN_RETURN = 0.25
 止盈距离 = 平均成本 * TP_TARGET_MARGIN_RETURN / LEVER
 ```
 
-在 ETH 价格约 `2000`、杠杆 `50x` 时，`25%` 保证金收益约等于 `10U` 价格距离。
+在 ETH 价格约 `2000`、杠杆 `50x` 时，`28%` 保证金收益约等于 `11.2U` 价格距离。
 
 动态锁盈参数：
 
 ```python
 DYNAMIC_TP_ENABLED = True
-DYNAMIC_TP_ARM_RETURN = 0.23
-DYNAMIC_TP_RESTORE_RETURN = 0.21
+DYNAMIC_TP_ARM_RETURN = 0.22
+DYNAMIC_TP_RESTORE_RETURN = 0.18
 DYNAMIC_TP_REPRICE_GAP_USD = 0.5
 ```
 
 逻辑：
 
 ```text
-默认挂 25% 动态止盈
-浮盈达到 23% 后开始观察
+默认挂 28% 动态止盈
+浮盈达到 22% 后开始观察
 如果多单不再创新高，或空单不再创新低：
     撤原止盈单
     按当前实时价格附近挂 reduce-only 止盈单
-如果实时价止盈未成交，且浮盈回落到 21% 以下：
+如果实时价止盈未成交，且浮盈回落到 18% 以下：
     撤实时价止盈
-    恢复 25% 动态止盈
+    恢复 28% 动态止盈
 ```
 
 每次有新批次成交后，程序会退出动态锁盈状态，按交易所真实持仓均价重新计算默认止盈，并重挂 reduce-only 止盈单。
@@ -307,9 +327,9 @@ DISASTER_LOSS_RATIO = 0.7
 ```python
 TREND_RISK_GUARD_ENABLED = True
 TREND_RISK_GUARD_CLOSE_ENABLED = False
-TREND_RISK_SCORE_THRESHOLD = 4
-TREND_RISK_HEAD_ADVERSE_PCT = 0.03
-TREND_RISK_WIDTH_EXPAND = 2.0
+TREND_RISK_SCORE_THRESHOLD = 5
+TREND_RISK_HEAD_ADVERSE_PCT = 0.04
+TREND_RISK_WIDTH_EXPAND = 2.5
 ```
 
 默认开启评分和提醒，默认关闭市价平仓。程序会在头仓逆向幅度、布林中轨/边轨斜率、连续 K 线极值恶化、价格相对中轨位置、布林宽度扩张等条件同时恶化并达到评分阈值时打印日志并发送微信通知。只有 `TREND_RISK_GUARD_CLOSE_ENABLED=True` 时，才会市价平掉当前仓位；平仓后程序继续运行。
@@ -401,11 +421,15 @@ logs/boll_pin_*.log
 - 灾难止损
 - 动态补仓间距
 - 头仓最大布林宽度过滤
+- 入场灾难评分过滤
+- 补仓止盈改善守卫
 
 当前优化器默认只搜索核心风险/收益参数，其他配置固定为实盘当前值参与回放：
 
 ```text
 ENTRY_MAX_BOLL_WIDTH_PCT
+ENTRY_DISASTER_SCORE_THRESHOLD
+ENTRY_DISASTER_TP_DISTANCE_MULT
 MIN_ENTRY_GAP_USD
 BOLL_WIDTH_TP_SPACE_MULT
 FIRST_BATCH_RATIO
@@ -460,22 +484,28 @@ BOLL_INCLUDE_CURRENT = True
 MIN_BOLL_WIDTH_USD = 15
 MIN_BOLL_WIDTH_PCT = 0.008
 ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED = True
-ENTRY_MAX_BOLL_WIDTH_PCT = 0.025
+ENTRY_MAX_BOLL_WIDTH_PCT = 0.028
 ENTRY_MAX_BOLL_WIDTH_USD = 80.0
+ENTRY_DISASTER_FILTER_ENABLED = True
+ENTRY_DISASTER_SCORE_THRESHOLD = 4
+ENTRY_DISASTER_TP_DISTANCE_MULT = 4.0
 
 MIN_ENTRY_GAP_USD = 6
 REPRICE_GAP_USD = 0.5
 
 FIRST_BATCH_RATIO = 0.1
-SECOND_BATCH_RATIO = 0.15
+SECOND_BATCH_DYNAMIC_BASE_RATIO = 0.14
+SECOND_BATCH_DYNAMIC_MIN_RATIO = 0.05
+SECOND_BATCH_DYNAMIC_MAX_RATIO = 0.18
+SECOND_BATCH_DYNAMIC_FULL_GAP_USD = 10.0
 DYNAMIC_BASE_ENTRY_RATIO = 0.08
 DYNAMIC_MIN_ENTRY_RATIO = 0.05
 DYNAMIC_MAX_ENTRY_RATIO = 0.15
 MAX_TOTAL_ENTRY_RATIO = 0.8
 
-TP_TARGET_MARGIN_RETURN = 0.25
-DYNAMIC_TP_ARM_RETURN = 0.23
-DYNAMIC_TP_RESTORE_RETURN = 0.21
+TP_TARGET_MARGIN_RETURN = 0.28
+DYNAMIC_TP_ARM_RETURN = 0.22
+DYNAMIC_TP_RESTORE_RETURN = 0.18
 
 COPY_FIXED_LOSS_STOP_RATIO = 0.95
 DISASTER_HEAD_DROP_PCT = 0.05

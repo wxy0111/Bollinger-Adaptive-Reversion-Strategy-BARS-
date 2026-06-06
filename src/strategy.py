@@ -25,6 +25,9 @@ from src.config import (
     BOLL_WIDTH_TP_SPACE_ENABLED, BOLL_WIDTH_TP_SPACE_MULT,
     ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED, ENTRY_MAX_BOLL_WIDTH_PCT,
     ENTRY_MAX_BOLL_WIDTH_USD,
+    ENTRY_DISASTER_FILTER_ENABLED, ENTRY_DISASTER_SCORE_THRESHOLD,
+    ENTRY_DISASTER_KLINE_COUNT, ENTRY_DISASTER_WIDTH_EXPAND,
+    ENTRY_DISASTER_TP_DISTANCE_MULT, ENTRY_DISASTER_EXPECTED_RETURN,
     TP_TARGET_MARGIN_RETURN, DYNAMIC_TP_ENABLED,
     DYNAMIC_TP_ARM_RETURN, DYNAMIC_TP_RESTORE_RETURN,
     DYNAMIC_TP_REPRICE_GAP_USD,
@@ -41,6 +44,8 @@ from src.config import (
     ADDON_DYNAMIC_GAP_TREND_KLINES, ADDON_DYNAMIC_GAP_TREND_MULT,
     ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED, ADDON_MAX_BOLL_WIDTH_PCT,
     ADDON_MAX_BOLL_WIDTH_USD,
+    ADDON_TP_IMPROVE_GUARD_ENABLED, ADDON_TP_IMPROVE_EXPECTED_RETURN,
+    ADDON_TP_IMPROVE_RATIO, ADDON_TP_IMPROVE_MIN_USD,
     ADDON_EXTREME_GUARD_ENABLED,
     ENTRY_EXTREME_GAP_ADJUST_ENABLED, ENTRY_EXTREME_GAP_BASE_PCT,
     ENTRY_EXTREME_GAP_FULL_PCT, ENTRY_EXTREME_GAP_MAX_MULT,
@@ -614,6 +619,9 @@ class BollPinStrategy:
         if not self._fixed_loss_head_buffer_allows(batch_idx, candidate_price, sz):
             return False
 
+        if not self._addon_tp_improve_allows(batch_idx, candidate_price, sz):
+            return False
+
         self._set_fixed_batch_size(batch_idx, sz)
         log_check(
             f"Dynamic batch prepared: batch={batch_idx + 1} "
@@ -694,6 +702,51 @@ class BollPinStrategy:
             f"Fixed-loss head buffer skipped: batch={batch_idx + 1} "
             f"stop={stop_price:.2f} must>= {required_stop:.2f} "
             f"head={head_price:.2f} buffer={FIXED_LOSS_HEAD_BUFFER_PCT:.2%}"
+        )
+        return False
+
+    def _addon_expected_tp_price(self, direction: str, avg_entry: float) -> float:
+        """Return the guard's expected take-profit price for an average entry."""
+        if avg_entry <= 0 or LEVER <= 0 or ADDON_TP_IMPROVE_EXPECTED_RETURN <= 0:
+            return 0.0
+        distance = avg_entry * ADDON_TP_IMPROVE_EXPECTED_RETURN / LEVER
+        if direction == "long":
+            return avg_entry + distance
+        if direction == "short":
+            return avg_entry - distance
+        return 0.0
+
+    def _addon_tp_improve_allows(self, batch_idx: int, candidate_price: float, candidate_sz: float) -> bool:
+        """Return whether an add-on meaningfully improves the expected TP price."""
+        if not ADDON_TP_IMPROVE_GUARD_ENABLED or batch_idx <= 0:
+            return True
+        if self._state.direction not in ("long", "short") or not self._state.is_active():
+            return True
+        if self._state.avg_entry <= 0 or self._state.total_sz <= 0 or candidate_sz <= 0:
+            return True
+
+        old_avg = self._state.avg_entry
+        old_tp = self._addon_expected_tp_price(self._state.direction, old_avg)
+        new_avg, _ = self._simulated_entry_totals(batch_idx, candidate_price, candidate_sz)
+        new_tp = self._addon_expected_tp_price(self._state.direction, new_avg)
+        if old_tp <= 0 or new_tp <= 0:
+            return True
+
+        if self._state.direction == "long":
+            improve = old_tp - new_tp
+        else:
+            improve = new_tp - old_tp
+        expected_distance = abs(old_tp - old_avg)
+        required = max(ADDON_TP_IMPROVE_MIN_USD, expected_distance * ADDON_TP_IMPROVE_RATIO)
+        if improve + 1e-9 >= required:
+            return True
+
+        log_check(
+            f"Add-on skipped: TP improvement too small batch={batch_idx + 1} "
+            f"old_tp={old_tp:.2f} new_tp={new_tp:.2f} "
+            f"improve={improve:.2f} required={required:.2f} "
+            f"avg={old_avg:.2f} new_avg={new_avg:.2f} "
+            f"price={candidate_price:.2f} sz={candidate_sz}"
         )
         return False
 
@@ -1151,6 +1204,8 @@ class BollPinStrategy:
                 self._log_boll_width_skip("entry_skip", last, mark_price)
             elif not self._entry_max_boll_width_ok(last, mark_price):
                 self._log_entry_max_boll_width_skip("entry_skip", last, mark_price)
+            elif not self._entry_disaster_filter_ok(last, mark_price):
+                pass
             else:
                 await self._maybe_place_probe_batch(client, df, last, mark_price, self._sizing_equity)
 
@@ -1199,6 +1254,86 @@ class BollPinStrategy:
             f"width={width:.2f} max={ENTRY_MAX_BOLL_WIDTH_USD:.2f} "
             f"width_pct={width_pct:.2%} max_pct={ENTRY_MAX_BOLL_WIDTH_PCT:.2%}"
         )
+
+    def _entry_disaster_filter_ok(self, last, mark_price: float) -> bool:
+        """Return whether stacked entry-trend risk still allows a first batch."""
+        if not ENTRY_DISASTER_FILTER_ENABLED:
+            return True
+        lower = float(last["boll_lower"])
+        upper = float(last["boll_upper"])
+        if mark_price < lower:
+            direction = "long"
+        elif mark_price > upper:
+            direction = "short"
+        else:
+            return True
+        signal = self._entry_disaster_signal(last, mark_price, direction)
+        if signal is None:
+            return True
+        log_check(
+            "Entry disaster filter blocked first batch "
+            f"direction={direction} score={signal['score']} "
+            f"reasons={','.join(signal['reasons'])} "
+            f"width_expand={signal['width_expand']:.3f} "
+            f"tp_distance_mult={signal['tp_distance_mult']:.3f}"
+        )
+        return False
+
+    def _entry_disaster_signal(self, last, mark_price: float, direction: str) -> dict | None:
+        """Return a disaster-style entry score when a fresh signal is too trend-like."""
+        recent = self._recent_unique_boll_history(max(ENTRY_DISASTER_KLINE_COUNT, 2))
+        if len(recent) < ENTRY_DISASTER_KLINE_COUNT:
+            return None
+
+        lows = [item["low"] for item in recent]
+        highs = [item["high"] for item in recent]
+        lowers = [item["lower"] for item in recent]
+        uppers = [item["upper"] for item in recent]
+        mids = [item["mid"] for item in recent]
+        widths = [item["width"] for item in recent]
+        mid = float(last["boll_mid"])
+        reasons = []
+
+        if direction == "long":
+            if all(lows[i] < lows[i - 1] for i in range(1, len(lows))):
+                reasons.append("lower_lows")
+            if all(lowers[i] < lowers[i - 1] for i in range(1, len(lowers))):
+                reasons.append("lower_band_down")
+            if mids[-1] < mids[0]:
+                reasons.append("mid_down")
+            if mark_price < mid:
+                reasons.append("below_mid")
+        elif direction == "short":
+            if all(highs[i] > highs[i - 1] for i in range(1, len(highs))):
+                reasons.append("higher_highs")
+            if all(uppers[i] > uppers[i - 1] for i in range(1, len(uppers))):
+                reasons.append("upper_band_up")
+            if mids[-1] > mids[0]:
+                reasons.append("mid_up")
+            if mark_price > mid:
+                reasons.append("above_mid")
+        else:
+            return None
+
+        width_expand = widths[-1] / widths[0] if widths and widths[0] > 0 else 0.0
+        if width_expand >= ENTRY_DISASTER_WIDTH_EXPAND:
+            reasons.append("width_expand")
+
+        expected_tp_distance = mark_price * (ENTRY_DISASTER_EXPECTED_RETURN / LEVER)
+        mid_distance = abs(mark_price - mid)
+        tp_distance_mult = mid_distance / expected_tp_distance if expected_tp_distance > 0 else 0.0
+        if tp_distance_mult >= ENTRY_DISASTER_TP_DISTANCE_MULT:
+            reasons.append("far_from_mid")
+
+        score = len(reasons)
+        if score < ENTRY_DISASTER_SCORE_THRESHOLD:
+            return None
+        return {
+            "score": score,
+            "reasons": reasons,
+            "width_expand": width_expand,
+            "tp_distance_mult": tp_distance_mult,
+        }
 
     def _addon_max_boll_width_ok(self, last, mark_price: float) -> bool:
         """Return whether Bollinger width still allows add-on orders."""
@@ -1758,6 +1893,9 @@ class BollPinStrategy:
             self._log_entry_max_boll_width_skip("probe_skip", last, mark_price)
             return
 
+        if not self._entry_disaster_filter_ok(last, mark_price):
+            return
+
         if direction == "long" and self._still_making_new_low():
             logger.info("Price is still making new lows; skip first long batch")
             return
@@ -1886,14 +2024,16 @@ class BollPinStrategy:
         return True
 
     async def _cancel_probe_if_width_too_wide(self, client: OKXClient, last, mark_price: float) -> bool:
-        """Cancel an unfilled first batch when Bollinger width becomes too wide."""
+        """Cancel an unfilled first batch when first-entry risk becomes too high."""
         pending_batch = self._state.pending_batch()
         if pending_batch is None or pending_batch.batch_idx != 0 or self._state.is_active():
             return False
-        if self._entry_max_boll_width_ok(last, mark_price):
+        width_ok = self._entry_max_boll_width_ok(last, mark_price)
+        if not width_ok:
+            self._log_entry_max_boll_width_skip("cancel_pending_first_batch", last, mark_price)
+        elif self._entry_disaster_filter_ok(last, mark_price):
             return False
 
-        self._log_entry_max_boll_width_skip("cancel_pending_first_batch", last, mark_price)
         await self._cancel_entry_orders(client)
         self._inside_band_kline_count = 0
         self._last_inside_band_kline_ts = None

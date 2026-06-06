@@ -80,6 +80,10 @@ from src.config import (
     ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED,
     ADDON_MAX_BOLL_WIDTH_PCT,
     ADDON_MAX_BOLL_WIDTH_USD,
+    ADDON_TP_IMPROVE_GUARD_ENABLED,
+    ADDON_TP_IMPROVE_EXPECTED_RETURN,
+    ADDON_TP_IMPROVE_RATIO,
+    ADDON_TP_IMPROVE_MIN_USD,
     ENTRY_EXTREME_GAP_ADJUST_ENABLED,
     ENTRY_EXTREME_GAP_BASE_PCT,
     ENTRY_EXTREME_GAP_FULL_PCT,
@@ -93,6 +97,12 @@ from src.config import (
     ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED,
     ENTRY_MAX_BOLL_WIDTH_PCT,
     ENTRY_MAX_BOLL_WIDTH_USD,
+    ENTRY_DISASTER_FILTER_ENABLED,
+    ENTRY_DISASTER_SCORE_THRESHOLD,
+    ENTRY_DISASTER_KLINE_COUNT,
+    ENTRY_DISASTER_WIDTH_EXPAND,
+    ENTRY_DISASTER_TP_DISTANCE_MULT,
+    ENTRY_DISASTER_EXPECTED_RETURN,
     MIN_ENTRY_GAP_USD,
     MIN_BOLL_WIDTH_FLOOR_USD,
     MIN_HEAD_LIQ_BUFFER_PCT,
@@ -129,6 +139,8 @@ _WORKER_TICKS: pd.DataFrame | None = None
 # aligned with the real strategy instead of drifting into stale knobs.
 CORE_OPTIMIZED_FIELDS = (
     "entry_max_width_pct",
+    "entry_disaster_score_threshold",
+    "entry_disaster_tp_distance_mult",
     "min_entry_gap_usd",
     "boll_width_tp_space_mult",
     "first_batch_ratio",
@@ -172,9 +184,19 @@ class Params:
     entry_max_width_enabled: int = int(ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED)
     entry_max_width_pct: float = ENTRY_MAX_BOLL_WIDTH_PCT
     entry_max_width_usd: float = ENTRY_MAX_BOLL_WIDTH_USD
+    entry_disaster_filter_enabled: int = int(ENTRY_DISASTER_FILTER_ENABLED)
+    entry_disaster_score_threshold: int = ENTRY_DISASTER_SCORE_THRESHOLD
+    entry_disaster_kline_count: int = ENTRY_DISASTER_KLINE_COUNT
+    entry_disaster_width_expand: float = ENTRY_DISASTER_WIDTH_EXPAND
+    entry_disaster_tp_distance_mult: float = ENTRY_DISASTER_TP_DISTANCE_MULT
+    entry_disaster_expected_return: float = ENTRY_DISASTER_EXPECTED_RETURN
     addon_max_width_enabled: int = int(ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED)
     addon_max_width_pct: float = ADDON_MAX_BOLL_WIDTH_PCT
     addon_max_width_usd: float = ADDON_MAX_BOLL_WIDTH_USD
+    addon_tp_improve_guard_enabled: int = int(ADDON_TP_IMPROVE_GUARD_ENABLED)
+    addon_tp_improve_expected_return: float = ADDON_TP_IMPROVE_EXPECTED_RETURN
+    addon_tp_improve_ratio: float = ADDON_TP_IMPROVE_RATIO
+    addon_tp_improve_min_usd: float = ADDON_TP_IMPROVE_MIN_USD
     first_batch_ratio: float = FIRST_BATCH_RATIO
     second_batch_dynamic_base_ratio: float = SECOND_BATCH_DYNAMIC_BASE_RATIO
     second_batch_dynamic_min_ratio: float = SECOND_BATCH_DYNAMIC_MIN_RATIO
@@ -337,6 +359,7 @@ class LogReplay:
         self.skipped_funds = 0
         self.blocked_width = 0
         self.blocked_entry_max_width = 0
+        self.blocked_entry_disaster = 0
         self.blocked_addon_max_width = 0
         self.blocked_gap = 0
         self.blocked_extreme = 0
@@ -377,6 +400,7 @@ class LogReplay:
         self.dynamic_gap_mult_total = 0.0
         self.dynamic_gap_mult_max = 1.0
         self.fixed_loss_head_buffer_block = 0
+        self.tp_improve_block = 0
 
     def run(self) -> "LogReplay":
         """Run the replay and return self."""
@@ -540,6 +564,72 @@ class LogReplay:
         pct_hit = self.params.entry_max_width_pct > 0 and width_pct >= self.params.entry_max_width_pct
         usd_hit = self.params.entry_max_width_usd > 0 and width >= self.params.entry_max_width_usd
         return not (pct_hit or usd_hit)
+
+    def _entry_disaster_filter_ok(self, row, direction: str) -> bool:
+        """Return whether stacked entry-trend risk still allows a first batch."""
+        if not self.params.entry_disaster_filter_enabled:
+            return True
+        signal = self._entry_disaster_signal(row, direction)
+        return signal is None
+
+    def _entry_disaster_signal(self, row, direction: str) -> dict | None:
+        """Return a disaster-style entry score when a fresh signal is too trend-like."""
+        recent = self._recent_unique_boll_history(
+            max(int(self.params.entry_disaster_kline_count), 2)
+        )
+        if len(recent) < int(self.params.entry_disaster_kline_count):
+            return None
+
+        price = float(row.price)
+        _, mid, _, _ = self._bands(row)
+        lows = [item["low"] for item in recent]
+        highs = [item["high"] for item in recent]
+        lowers = [item["lower"] for item in recent]
+        uppers = [item["upper"] for item in recent]
+        mids = [item["mid"] for item in recent]
+        widths = [item["width"] for item in recent]
+        reasons = []
+
+        if direction == "long":
+            if all(lows[i] < lows[i - 1] for i in range(1, len(lows))):
+                reasons.append("lower_lows")
+            if all(lowers[i] < lowers[i - 1] for i in range(1, len(lowers))):
+                reasons.append("lower_band_down")
+            if mids[-1] < mids[0]:
+                reasons.append("mid_down")
+            if price < mid:
+                reasons.append("below_mid")
+        elif direction == "short":
+            if all(highs[i] > highs[i - 1] for i in range(1, len(highs))):
+                reasons.append("higher_highs")
+            if all(uppers[i] > uppers[i - 1] for i in range(1, len(uppers))):
+                reasons.append("upper_band_up")
+            if mids[-1] > mids[0]:
+                reasons.append("mid_up")
+            if price > mid:
+                reasons.append("above_mid")
+        else:
+            return None
+
+        width_expand = widths[-1] / widths[0] if widths and widths[0] > 0 else 0.0
+        if width_expand >= self.params.entry_disaster_width_expand:
+            reasons.append("width_expand")
+
+        expected_tp_distance = price * (self.params.entry_disaster_expected_return / LEVER)
+        mid_distance = abs(price - mid)
+        tp_distance_mult = mid_distance / expected_tp_distance if expected_tp_distance > 0 else 0.0
+        if tp_distance_mult >= self.params.entry_disaster_tp_distance_mult:
+            reasons.append("far_from_mid")
+
+        score = len(reasons)
+        if score < self.params.entry_disaster_score_threshold:
+            return None
+        return {
+            "score": score,
+            "reasons": reasons,
+            "width_expand": width_expand,
+            "tp_distance_mult": tp_distance_mult,
+        }
 
     def _addon_max_width_ok(self, row) -> bool:
         """Return whether Bollinger width is not too wide for add-on batches."""
@@ -888,6 +978,9 @@ class LogReplay:
         if not self.pos.has_plan() and not self._entry_max_width_ok(row):
             self.blocked_entry_max_width += 1
             return "none"
+        if not self.pos.has_plan() and not self._entry_disaster_filter_ok(row, direction):
+            self.blocked_entry_disaster += 1
+            return "none"
         self.signal_count += 1
         if direction == "long" and self._still_making_new_low():
             self.blocked_extreme += 1
@@ -1001,6 +1094,46 @@ class LogReplay:
         if not allowed:
             self.fixed_loss_head_buffer_block += 1
         return allowed
+
+    def _addon_expected_tp_price(self, direction: str, avg_entry: float) -> float:
+        """Return the add-on guard's expected take-profit price."""
+        expected_return = self.params.addon_tp_improve_expected_return
+        if avg_entry <= 0 or LEVER <= 0 or expected_return <= 0:
+            return 0.0
+        distance = avg_entry * expected_return / LEVER
+        if direction == "long":
+            return avg_entry + distance
+        if direction == "short":
+            return avg_entry - distance
+        return 0.0
+
+    def _addon_tp_improve_allows(self, idx: int, price: float, sz: float) -> bool:
+        """Return whether a candidate add-on meaningfully improves expected TP."""
+        if not self.params.addon_tp_improve_guard_enabled or idx <= 0:
+            return True
+        if self.pos.direction not in ("long", "short") or not self.pos.is_active():
+            return True
+        if self.pos.avg_entry <= 0 or self.pos.total_sz <= 0 or sz <= 0:
+            return True
+
+        old_avg = self.pos.avg_entry
+        old_tp = self._addon_expected_tp_price(self.pos.direction, old_avg)
+        new_avg, _ = self._candidate_entry_totals(idx, price, sz)
+        new_tp = self._addon_expected_tp_price(self.pos.direction, new_avg)
+        if old_tp <= 0 or new_tp <= 0:
+            return True
+
+        improve = old_tp - new_tp if self.pos.direction == "long" else new_tp - old_tp
+        expected_distance = abs(old_tp - old_avg)
+        required = max(
+            self.params.addon_tp_improve_min_usd,
+            expected_distance * self.params.addon_tp_improve_ratio,
+        )
+        if improve + 1e-9 >= required:
+            return True
+
+        self.tp_improve_block += 1
+        return False
 
     def _head_adverse_move_pct(self, mark_price: float) -> float:
         """Return adverse move from the first filled batch as a ratio."""
@@ -1231,6 +1364,15 @@ class LogReplay:
                 self.pos.pending = None
                 self.pos.reset()
                 return
+            if (
+                self.pos.pending.idx == 0
+                and not self.pos.is_active()
+                and not self._entry_disaster_filter_ok(row, self.pos.direction)
+            ):
+                self.blocked_entry_disaster += 1
+                self.pos.pending = None
+                self.pos.reset()
+                return
             if self.pos.pending.idx > 0 and not self._addon_max_width_ok(row):
                 self.blocked_addon_max_width += 1
                 self.pos.pending = None
@@ -1429,6 +1571,8 @@ class LogReplay:
             self.skipped_entry_cap += 1
             return None
         if not self._fixed_loss_head_buffer_allows(idx, round(price, 2), sz):
+            return None
+        if not self._addon_tp_improve_allows(idx, round(price, 2), sz):
             return None
         return Batch(idx=idx, price=round(price, 2), sz=sz)
 
@@ -1640,9 +1784,19 @@ class LogReplay:
             "entry_max_width_enabled": self.params.entry_max_width_enabled,
             "entry_max_width_pct": self.params.entry_max_width_pct,
             "entry_max_width_usd": self.params.entry_max_width_usd,
+            "entry_disaster_filter_enabled": self.params.entry_disaster_filter_enabled,
+            "entry_disaster_score_threshold": self.params.entry_disaster_score_threshold,
+            "entry_disaster_kline_count": self.params.entry_disaster_kline_count,
+            "entry_disaster_width_expand": self.params.entry_disaster_width_expand,
+            "entry_disaster_tp_distance_mult": self.params.entry_disaster_tp_distance_mult,
+            "entry_disaster_expected_return": self.params.entry_disaster_expected_return,
             "addon_max_width_enabled": self.params.addon_max_width_enabled,
             "addon_max_width_pct": self.params.addon_max_width_pct,
             "addon_max_width_usd": self.params.addon_max_width_usd,
+            "addon_tp_improve_guard_enabled": self.params.addon_tp_improve_guard_enabled,
+            "addon_tp_improve_expected_return": self.params.addon_tp_improve_expected_return,
+            "addon_tp_improve_ratio": self.params.addon_tp_improve_ratio,
+            "addon_tp_improve_min_usd": self.params.addon_tp_improve_min_usd,
             "min_entry_gap_usd": self.params.min_entry_gap_usd,
             "reprice_gap_usd": self.params.reprice_gap_usd,
             "first_batch_ratio": self.params.first_batch_ratio,
@@ -1736,11 +1890,13 @@ class LogReplay:
             "boll_tp_compression_activated": self.boll_tp_compression_activated,
             "blocked_width": self.blocked_width,
             "blocked_entry_max_width": self.blocked_entry_max_width,
+            "blocked_entry_disaster": self.blocked_entry_disaster,
             "blocked_addon_max_width": self.blocked_addon_max_width,
             "blocked_gap": self.blocked_gap,
             "blocked_extreme": self.blocked_extreme,
             "blocked_addon_guard": self.blocked_addon_guard,
             "fixed_loss_head_buffer_block": self.fixed_loss_head_buffer_block,
+            "tp_improve_block": self.tp_improve_block,
             "cross_copy_stop": self.cross_copy_stop,
             "fixed_loss_stop": self.fixed_loss_stop,
             "disaster_stop": self.disaster_stop,
@@ -1866,9 +2022,19 @@ def _param_value_lists(args) -> list[list[float] | list[int]]:
         [int(ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED)],
         parse_float_list(args.entry_max_width_pct),
         [ENTRY_MAX_BOLL_WIDTH_USD],
+        [int(ENTRY_DISASTER_FILTER_ENABLED)],
+        parse_int_list(args.entry_disaster_score_threshold),
+        [ENTRY_DISASTER_KLINE_COUNT],
+        [ENTRY_DISASTER_WIDTH_EXPAND],
+        parse_float_list(args.entry_disaster_tp_distance_mult),
+        [ENTRY_DISASTER_EXPECTED_RETURN],
         [int(ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED)],
         [ADDON_MAX_BOLL_WIDTH_PCT],
         [ADDON_MAX_BOLL_WIDTH_USD],
+        [int(ADDON_TP_IMPROVE_GUARD_ENABLED)],
+        [ADDON_TP_IMPROVE_EXPECTED_RETURN],
+        [ADDON_TP_IMPROVE_RATIO],
+        [ADDON_TP_IMPROVE_MIN_USD],
         parse_float_list(args.first_batch_ratio),
         parse_float_list(args.second_batch_dynamic_base_ratio),
         parse_float_list(args.second_batch_dynamic_min_ratio),
@@ -2042,9 +2208,19 @@ def current_config_params(args) -> Params:
         entry_max_width_enabled=int(ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED),
         entry_max_width_pct=ENTRY_MAX_BOLL_WIDTH_PCT,
         entry_max_width_usd=ENTRY_MAX_BOLL_WIDTH_USD,
+        entry_disaster_filter_enabled=int(ENTRY_DISASTER_FILTER_ENABLED),
+        entry_disaster_score_threshold=ENTRY_DISASTER_SCORE_THRESHOLD,
+        entry_disaster_kline_count=ENTRY_DISASTER_KLINE_COUNT,
+        entry_disaster_width_expand=ENTRY_DISASTER_WIDTH_EXPAND,
+        entry_disaster_tp_distance_mult=ENTRY_DISASTER_TP_DISTANCE_MULT,
+        entry_disaster_expected_return=ENTRY_DISASTER_EXPECTED_RETURN,
         addon_max_width_enabled=int(ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED),
         addon_max_width_pct=ADDON_MAX_BOLL_WIDTH_PCT,
         addon_max_width_usd=ADDON_MAX_BOLL_WIDTH_USD,
+        addon_tp_improve_guard_enabled=int(ADDON_TP_IMPROVE_GUARD_ENABLED),
+        addon_tp_improve_expected_return=ADDON_TP_IMPROVE_EXPECTED_RETURN,
+        addon_tp_improve_ratio=ADDON_TP_IMPROVE_RATIO,
+        addon_tp_improve_min_usd=ADDON_TP_IMPROVE_MIN_USD,
         first_batch_ratio=FIRST_BATCH_RATIO,
         second_batch_dynamic_base_ratio=SECOND_BATCH_DYNAMIC_BASE_RATIO,
         second_batch_dynamic_min_ratio=SECOND_BATCH_DYNAMIC_MIN_RATIO,
@@ -2175,6 +2351,22 @@ def params_from_report_row(row: dict) -> Params:
         entry_max_width_enabled=row["entry_max_width_enabled"],
         entry_max_width_pct=row["entry_max_width_pct"],
         entry_max_width_usd=row["entry_max_width_usd"],
+        entry_disaster_filter_enabled=row.get(
+            "entry_disaster_filter_enabled", int(ENTRY_DISASTER_FILTER_ENABLED)
+        ),
+        entry_disaster_score_threshold=row.get(
+            "entry_disaster_score_threshold", ENTRY_DISASTER_SCORE_THRESHOLD
+        ),
+        entry_disaster_kline_count=row.get("entry_disaster_kline_count", ENTRY_DISASTER_KLINE_COUNT),
+        entry_disaster_width_expand=row.get(
+            "entry_disaster_width_expand", ENTRY_DISASTER_WIDTH_EXPAND
+        ),
+        entry_disaster_tp_distance_mult=row.get(
+            "entry_disaster_tp_distance_mult", ENTRY_DISASTER_TP_DISTANCE_MULT
+        ),
+        entry_disaster_expected_return=row.get(
+            "entry_disaster_expected_return", ENTRY_DISASTER_EXPECTED_RETURN
+        ),
         addon_max_width_enabled=row.get("addon_max_width_enabled", int(ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED)),
         addon_max_width_pct=row.get("addon_max_width_pct", ADDON_MAX_BOLL_WIDTH_PCT),
         addon_max_width_usd=row.get("addon_max_width_usd", ADDON_MAX_BOLL_WIDTH_USD),
@@ -2812,6 +3004,8 @@ def main() -> None:
     parser.add_argument("--min-boll-width-pct", default=str(MIN_BOLL_WIDTH_PCT), help="Kept for compatibility; no longer optimized when TP-space width is enabled.")
     parser.add_argument("--min-entry-gap-usd", default="4,5,6")
     parser.add_argument("--entry-max-width-pct", default="0.03,0.04,0.05")
+    parser.add_argument("--entry-disaster-score-threshold", default=str(ENTRY_DISASTER_SCORE_THRESHOLD))
+    parser.add_argument("--entry-disaster-tp-distance-mult", default="3.5,4.0")
     parser.add_argument("--first-batch-ratio", default="0.08,0.10,0.12")
     parser.add_argument("--second-batch-dynamic-base-ratio", default="0.10,0.12,0.14")
     parser.add_argument("--second-batch-dynamic-min-ratio", default=str(SECOND_BATCH_DYNAMIC_MIN_RATIO))
