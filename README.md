@@ -22,6 +22,245 @@ adaptive staged entries, capital-lock profit handling, and risk guards.
 
 不要把 `.env`、真实 API 密钥、运行日志、历史数据、压缩包、优化结果、极端行情模拟文件提交到 GitHub。
 
+## English Version
+
+### Overview
+
+**Bollinger Adaptive Reversion Strategy (BARS)** is a local OKX perpetual-swap trading system for `ETH-USDT-SWAP`. It uses 15-minute Bollinger Bands, real-time mark prices, adaptive staged entries, dynamic take profit, capital-lock profit transfers, and several risk guards.
+
+The strategy is designed around mean reversion after price moves outside the Bollinger Bands. When price breaks below the lower band, the strategy prepares a long entry; when price breaks above the upper band, it prepares a short entry. It does not enter immediately while price is still making new extremes. Instead, it waits until the short-term move pauses, then places a limit order.
+
+This project includes:
+
+- Live/simulated OKX strategy runner.
+- Local dashboard at `http://localhost:8080`.
+- ServerChan WeChat notifications.
+- Capital-lock profit management.
+- Position, order, take-profit, stop-loss, and liquidation-risk handling.
+- Log-based parameter optimizer and replay tools.
+
+### Risk Warning
+
+This strategy uses leveraged futures. It can lose money quickly and may be liquidated in extreme market conditions. The default environment should be OKX demo trading (`OKX_FLAG=1`). Before using real funds, verify order placement, cancellation, fills, take profit, stop loss, capital transfers, recovery after restart, and notifications in demo mode.
+
+Do not commit `.env`, real API keys, runtime logs, historical data, archives, optimizer outputs, or extreme-market simulation files to GitHub.
+
+### Project Structure
+
+```text
+C:\okx
+├── main.py                         # App entrypoint, starts dashboard and strategy
+├── start.bat                       # Windows one-click startup script
+├── optimize_report.bat             # Manual log-parameter optimization report
+├── requirements.txt                # Python dependencies
+├── .env.example                    # Environment variable example
+├── src
+│   ├── config.py                   # Main strategy configuration
+│   ├── strategy.py                 # Core strategy logic
+│   ├── okx_client.py               # OKX REST API wrapper
+│   ├── risk.py                     # Batch sizing, take-profit, and liquidation estimates
+│   ├── position_manager.py         # Local position, batch, and order state
+│   ├── indicators.py               # K-line and Bollinger calculations
+│   ├── notify.py                   # ServerChan notification helper
+│   ├── logging_utils.py            # Terminal log categories and colors
+│   └── dashboard.py                # Local web dashboard
+├── backtest
+│   ├── log_parameter_optimizer.py  # Log-based parameter optimizer
+│   └── clean_strategy_logs.py      # Log cleanup utility
+└── logs                            # Runtime logs and local state, not committed by default
+```
+
+### Quick Start
+
+1. Copy `.env.example` to `.env`.
+2. Fill in your OKX API credentials and optional `SERVERCHAN_KEY`.
+3. Review strategy parameters in [src/config.py](src/config.py).
+4. Start the program:
+
+```powershell
+start.bat
+```
+
+The local dashboard runs at:
+
+```text
+http://localhost:8080
+```
+
+### Market Sampling
+
+Current rhythm:
+
+```python
+PRICE_LOG_INTERVAL = 1
+POLL_INTERVAL = 3
+```
+
+- Market price and Bollinger snapshots are written to logs every `1s`.
+- Trading decisions run every `3s`.
+- Terminal market display follows the trading loop to avoid excessive output.
+
+### Entry Logic
+
+The first entry is allowed only when all major filters pass:
+
+```text
+price outside Bollinger Band
++ Bollinger width is wide enough
++ Bollinger width is not extremely wide
++ entry disaster score is below threshold
++ price is no longer making new extremes
++ this 15m candle has not opened a new plan
++ entry price is far enough from the previous plan price
+=> place first batch limit order
+```
+
+Direction:
+
+```text
+price < lower band => long
+price > upper band => short
+```
+
+Only one new entry/add-on batch is allowed per 15-minute candle. After a position closes, the closing candle is locked and cannot open a new first batch.
+
+### Add-On Logic
+
+Add-ons no longer depend on legacy fixed `BATCH_SPACING`. The current add-on decision uses the previous real fill price, dynamic entry gap, completed-candle extreme guard, fixed-loss buffer, and take-profit improvement guard.
+
+Main checks:
+
+```text
+position exists
++ no working add-on order
++ same-direction Bollinger signal appears again
++ price is no longer making new extremes
++ current candle has not added a batch
++ distance from previous real fill >= effective add-on gap
++ completed-candle extreme guard passes
++ fixed-loss stop remains far enough from first entry
++ add-on improves expected take-profit distance
+=> place next add-on limit order
+```
+
+The total entry margin is capped by `MAX_TOTAL_ENTRY_RATIO`, and the program does not shrink an order just to force an add-on when the cap, funds, or risk buffers are not satisfied.
+
+### Take Profit
+
+Default take profit is based on margin return, not a fixed USDT distance:
+
+```python
+TP_TARGET_MARGIN_RETURN = 0.28
+```
+
+Approximate take-profit distance:
+
+```text
+avg_entry * TP_TARGET_MARGIN_RETURN / LEVER
+```
+
+Dynamic take-profit lock:
+
+```python
+DYNAMIC_TP_ENABLED = True
+DYNAMIC_TP_ARM_RETURN = 0.22
+DYNAMIC_TP_RESTORE_RETURN = 0.18
+DYNAMIC_TP_REPRICE_GAP_USD = 0.5
+```
+
+When floating profit reaches the arm threshold, the strategy watches whether price continues to make favorable new extremes. If momentum pauses, it can replace the default take-profit order with a closer reduce-only order. If profit falls below the restore threshold before closing, it restores the default take-profit target.
+
+### Stop Loss And Risk Guards
+
+The strategy always treats the exchange liquidation price as the final risk boundary.
+
+```python
+LIQ_STOP_OFFSET_USD = 0.1
+LIQ_STOP_REPRICE_GAP_USD = 0.2
+LIQ_WARNING_DISTANCE_USD = 10.0
+LIQ_WARNING_REPEAT_SEC = 3600
+```
+
+During an active position, the program keeps syncing OKX's real `liqPx`. If funding fees, account equity, or exchange margin calculations move the liquidation price, and the desired stop trigger differs from local `plan_sl_price` by at least `LIQ_STOP_REPRICE_GAP_USD`, the program cancels the old conditional stop and places a new one using the latest liquidation/fixed-loss rule. `plan_sl_price` records the actual stop trigger, not the raw liquidation price.
+
+Fixed-loss stop:
+
+```python
+COPY_FIXED_LOSS_STOP_ENABLED = True
+COPY_FIXED_LOSS_STOP_USDT = 0.0
+COPY_FIXED_LOSS_STOP_RATIO = 0.95
+```
+
+When `COPY_FIXED_LOSS_STOP_USDT = 0`, the fixed-loss amount is calculated as:
+
+```text
+TRADING_ACCOUNT_TARGET * COPY_FIXED_LOSS_STOP_RATIO
+```
+
+Disaster stop:
+
+```python
+DISASTER_STOP_ENABLED = True
+DISASTER_HEAD_DROP_PCT = 0.05
+DISASTER_LOSS_RATIO = 0.7
+```
+
+It closes the current position and keeps the program running only when both conditions are met:
+
+- The first entry moves adversely by at least `5%`.
+- The cycle unrealized loss reaches `TRADING_ACCOUNT_TARGET * 70%`.
+
+Trend risk guard:
+
+```python
+TREND_RISK_GUARD_ENABLED = True
+TREND_RISK_GUARD_CLOSE_ENABLED = False
+TREND_RISK_SCORE_THRESHOLD = 5
+```
+
+By default, it scores and notifies but does not market-close the position. It can freeze add-ons when trend deterioration is detected. Market close is only enabled when `TREND_RISK_GUARD_CLOSE_ENABLED=True`.
+
+### Capital Management
+
+The strategy uses a capital-lock model. After a profitable close, the realized profit is transferred out to the funding account. After a losing close, the program tries to replenish the trading account from the funding account.
+
+If capital is insufficient, the strategy pauses new entries and add-ons, continues logging market data, and keeps managing existing positions and orders.
+
+### Parameter Optimization
+
+Run:
+
+```powershell
+optimize_report.bat
+```
+
+or:
+
+```powershell
+python backtest\log_parameter_optimizer.py --sample-sec 3
+```
+
+The optimizer replays local `logs/boll_pin_*.log` and compares risk/reward across core parameters. It does not automatically change live settings unless you choose a result in the prompt.
+
+### GitHub Hygiene
+
+Recommended files to commit:
+
+- Source code under `src/`.
+- README and documentation.
+- Startup scripts and example config files.
+- Dashboard/static assets needed by the app.
+
+Do not commit:
+
+- `.env`
+- API keys
+- `logs/`
+- Runtime state
+- Historical market data
+- Optimizer caches/results
+- Extreme-market simulation output
+
 ## 程序结构
 
 ```text
