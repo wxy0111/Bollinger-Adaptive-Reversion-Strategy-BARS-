@@ -50,7 +50,7 @@ from src.config import (
     ENTRY_EXTREME_GAP_ADJUST_ENABLED, ENTRY_EXTREME_GAP_BASE_PCT,
     ENTRY_EXTREME_GAP_FULL_PCT, ENTRY_EXTREME_GAP_MAX_MULT,
     ENTRY_24H_TICKER_CACHE_SEC,
-    LIQ_STOP_OFFSET_USD, LIQ_WARNING_DISTANCE_USD,
+    LIQ_STOP_OFFSET_USD, LIQ_STOP_REPRICE_GAP_USD, LIQ_WARNING_DISTANCE_USD,
     LIQ_WARNING_REPEAT_SEC,
     NO_NEW_EXTREME_TICKS,
     REPRICE_GAP_USD, INSIDE_BAND_CANCEL_KLINES,
@@ -1159,6 +1159,8 @@ class BollPinStrategy:
         # 4. 濠电姷鏁告慨鐑藉极閸涘﹥鍙忛柣鎴ｆ閺嬩線鏌涘☉姗堟敾闁告瑥绻橀弻锝夊箣濠垫劖缍楅梺閫炲苯澧柛濠傛健楠炴劖绻濋崘顏嗗骄闂佸啿鎼鍥╃矓椤旈敮鍋撶憴鍕８闁告梹鍨甸锝夊醇閺囩偟顓洪梺缁樼懃閹虫劙鐛姀锛勭瘈闁汇垽娼ф禒锕傛煙缁嬫鐓肩€规洘妞藉畷姗€顢欓懖鈺嬬幢闂備浇顫夐崕鎶芥倶閸儱纾婚柟鎹愬煐閸犲棝鏌涢弴銊ュ妞わ富鍙冨铏规兜閸涱喚褰ч梺瑙勬倐缁犳牕鐣烽敐澶婂窛妞ゆ挆鍕槣闂備線娼ч悧鍡涘箠閹邦喚涓嶅ù鐓庣摠閻撴瑩鏌涢幇顓炵祷妞ゆ帇鍨荤槐鎺楀磼濮樻瘷銏ゆ懚閺嶎厽鐓曟繛鎴濆船閺嬫捇鏌熼柨瀣仢闁哄矉缍侀幃鈺呭礂閸涙澘鐒婚梻浣告啞閺屻劑鎯岄崒姘煎殨闁归棿绀佸Λ姗€骞栫€涙ɑ灏伴柡鍌楀亾濠碉紕鍋戦崐鏍ь潖婵犳艾鐓曢柛顐犲劚閸氬綊鏌ｉ弮鍥仩缁炬儳鍚嬮妵鍕籍閸屾瀚涢梺缁樻崄閸嬫劙鍩€椤掍緡鍟忛柛鐘崇☉閳绘柨鈽夊鍛綍闂傚倸鍊搁崐鎼佹偋婵犲嫮鐭欓柟鎯у閻挻绻涘顔荤凹闁绘挻绋戦湁闁挎繂娲﹂崵鈧繝娈垮枛閻楀繘鍩€椤掆偓閻忔艾顭垮Ο灏栧亾濮樼厧澧查柣蹇斿笒閳规垿鎮欑捄铏规缂備緡鍣崹鎯版＂濠电偞鍨惰彜闁衡偓娴犲鐓熸俊顖濇娴犳盯鏌￠崱蹇旀珚闁哄本绋撻埀顒婄秵閸嬪棗煤閹绢喗瀵犳繝闈涙储娴滄粓鏌熼幆褍鑸归柣蹇婃櫊閺屾盯濡搁妷銉㈠亾閹间焦绠掗梻浣虹帛閿氭俊顖氾躬瀹曟洝绠涘☉娆戝弮闂佸憡鍔︽禍婊堝几濞戙垺鐓涢悘鐐额嚙婵倿鏌熼鍝勭伈鐎规洦鍋婂畷鐔煎箣濞嗗繒浼勭紓浣介哺鐢繝宕洪埀顒併亜閹烘垵鈧敻宕戦幘缁樻櫜閹肩补鍓濋悘宥夋⒑閹惰姤鏁遍悽顖ょ節瀵鈽夐姀鈺傛櫇闂侀潧鐗嗛幊蹇涙倶娓氣偓濮婃椽妫冨☉娆樻！闁汇埄鍨辩敮鈥筹耿娓氣偓濮婅櫣绱掑鍫滅返闂佺顑呴幊搴ㄥ煝瀹ュ棛绡€闁告劏鏅涘鎸庣節閻㈤潧孝闁瑰啿绻橀、鏃堟偐缂佹鍘垫俊鐐差儏妤犳悂鍩㈤崼銉︾厱闁靛绠戦崝銈夋煟閿濆洤鍘寸€规洖鐖奸弫鍌炴寠婢跺苯骞堢紓鍌氬€搁崐鎼佸磹閹间礁纾瑰瀣婵ジ鏌＄仦璇插姎缁炬儳顭烽弻鐔煎礈瑜嶆禒娲煃瑜滈崜姘辨暜閹烘缍栨繝闈涱儐閺呮煡鏌涘☉鍗炲妞ゃ儲鑹鹃埞鎴︽晬閸曨偂鏉梺绋匡攻閸ㄥ灝鐣烽悷鎳婃椽顢旈崨顓濈敾闂備線娼ц噹闁告侗鍓涢悷婵囩節閻㈤潧浠﹂柛銊﹀劶瑜版粌鈹戦埄鍐ㄧ祷闁绘锕ョ粚杈ㄧ節閸ヨ埖鏅┑鐘欏懎浜鹃悗姘洴濮婃椽宕妷銉ょ钵缂備緡鍠楅悷銉╋綖韫囨洜纾兼俊顖濐嚙椤庢捇姊洪崨濠勨槈闁挎洏鍔庡☉鐢稿焵椤掑嫭鈷掑ù锝勮閻掑墽绱掗妸锔姐仢鐎规洘鍔曢埞鎴犫偓锝庘偓顓滃劦閺屾盯骞囬棃娑欑亪濡ょ姷鍋戦崹铏规崲濞戙垹骞㈡俊銈勭劍瀹曟娊姊洪崨濠冨蔼闁告柨鐭傞崺鐐哄箣閿旇棄鈧兘鏌涘▎蹇ｆ▓婵☆偓绻濆娲捶椤撗呭姼濡炪値鍘鹃崗妯虹暦閸濆嫧妲堥柕蹇曞Х椤撴椽姊洪幐搴⑩拻闁哄拋鍋婂畷銏ゆ偨閻㈢數锛濇繛杈剧到婢瑰﹪宕曢幇鐗堝€电紒妤佺☉濞层倗绮婚弻銉︾叆婵犻潧妫Σ褰掓煟閹惧啿鏆ｉ柡宀嬬畱铻ｅ〒姘煎灡閳绘挸鈹戦埥鍡楃仚闁稿鎹囧缁樻媴閸涘﹥鍎撻柣鐐村嚬閸嬪﹤鐣烽幇鏉垮嵆闁绘ɑ褰冮悿楣冩⒒娴ｈ棄鍚瑰┑顔芥綑鐓ら柍鍝勫暕閻掑﹥绻涢崱妯哄妞も晝鍏橀弻鐔兼⒒鐎电濡介梺鎶芥敱閸ㄥ潡寮婚敐澶嬪亜缂佸顑欏Λ鍡涙⒑閹稿海鈽夌紒澶婄秺瀵鈽夐姀鈥充汗閻庤娲栧ú銈夊煕鐏炶娇鏃堟偐闂堟稐绮堕梺鍝ュ枎閻°劑骞堥妸鈺佺劦妞ゆ帒瀚悡蹇涙煕椤愶絿绠栨い銉︾矊闇夋繝濠傚濞堟粓鏌″畝鈧崰鏍箠濠靛鍋嬮柛顐ｇ箖闁款厾绱撻崒娆戝妽鐟滄澘鍟…鍥灳閹颁礁娈ㄩ梺瑙勫劶濡嫰锝為崨瀛樼厪闁割偅绻冮ˉ鎴︽煙妞嬪海甯涚紒缁樼洴楠炴﹢寮堕幋鐘插Р闂備胶顭堥鍡涘箰閼姐倖宕叉繛鎴炵懄婵挳鏌涢幇顒€绾ч柛锝堟閳ь剝顫夊ú姗€鎮￠敓鐘茶摕闁绘柨鍚嬮崐缁樹繆椤栨繍鍤欑痪鏉跨Ч濮婃椽骞栭悙鎻掝瀴濠殿喖锕ょ紞濠冧繆閻㈢绀嬫い鏍ㄦ皑椤旀帡鏌ｉ悩鑽ょ窗闁靛棌鍋撻梺绋款儐閹瑰洭寮幇顓炵窞閻庯綆鍋呴悵鎶芥⒒娴ｈ櫣銆婇柛鎾寸箞閹柉顦归柟顖欑窔瀹曠厧鈹戦崘鈺傛澑婵＄偑鍊栧褰掑几缂佹鐟规繛鎴欏灪閻撴洘鎱ㄥ璇蹭壕缂備胶濮甸悧鏇㈡偩閻戣棄顫呴柕鍫濇噽椤旀劖绻涙潏鍓у埌闁告ɑ绮撻獮蹇撁洪鍛嫼闂佸憡绋戦敃锕傚煡婢舵劖鐓ラ柡鍥埀顒佺墵楠炲牓濡搁埡浣哄€炲銈嗗笂缁€渚€鍩€椤掆偓閻忔岸骞堥妸銉庣喖鎮℃惔鈥茬帛濠电姭鎷冮崘鎯ф闂侀€炲苯澧叉い顐㈩槸鐓ゆ慨妞诲亾鐎规洘绻傝灃闁告侗鍘鹃鍡涙⒑缂佹﹩鐒炬い銉ユ瀹曠兘顢樺☉妯瑰闂佹寧绻傛鍛婄閻愯鐟邦煥閸曨厽鍣板┑顔硷功缁垳绮悢鐓庣劦妞ゆ巻鍋撴い顓炴穿椤︽挳鏌熼獮鍨伈妤犵偞甯￠獮姗€鎳犻鍌滄毎缂傚倷鑳堕崑鎾诲磿閹剁瓔鏁勯柛鎰ㄦ櫇椤╄尙鎲搁悧鍫濈瑲闁绘挻鐟╅弻锝夊箣閻愬棙鍨规禍鎼佹偋閸垻顔曢梺鍛婁緱閸犳岸鎯岄幒鎾村弿濠电姴鍟妵婵堚偓瑙勬磸閸斿秶鎹㈠┑鍥ㄥ闁惧繐婀遍悾鎶芥⒒閸屾瑧鍔嶉柟顔肩埣瀹曟繂鐣濋埀顒傚垝閺冨倹鍠嗛柛鏇ㄤ簽缁犳岸姊洪崜鎻掍簼婵炲弶鐗犻幃娆愮節閸ャ劎鍙嗗┑鐘绘涧濡瑩宕崇粙娆剧唵閻熸瑥瀚粈瀣煛瀹€瀣М闁诡喓鍨藉畷顐﹀Ψ閿曗偓濞呮垿姊虹拠鎻掝劉闁告垵缍婂畷鎶芥晲婢跺苯绁﹀┑掳鍊曢幊搴ｇ矆閸愨斂浜滄い鎾跺枎閻忥箓鎮楅棃娑氱劯闁哄矉绲鹃幆鏃堝Ω閿斾粙鏁┑鐘灮閹虫捇鏁冮鍫濈畺闁绘劗鍎ら崐閿嬨亜閹存繂缍栫紒銊ヮ煼濮婃椽宕崟顒€顦╅梺鎸庡哺閺屾盯寮幘鎰佹喘闂侀€炲苯澧叉い顐㈩槸鐓ゆ繝濠傜墕缁愭鏌″搴″箲闁逞屽厸缁€浣界亙婵炶揪绲块幊鎾活敁閹剧粯鈷戦柟顖嗗懐顔囨繝鈷€宥囩М濠德ゅ煐瀵板嫮鈧急鍕伜婵犵數鍋犻幓顏嗗緤閸фせ鈧箓宕奸妷銉﹁緢闂備緡鍓欑粔鐢告偂濞嗘垹妫柡澶婄仢閼哥懓霉濠婂嫬顥嬮柍褜鍓濋～澶娒哄鈧畷婵嬪冀椤愶絽搴婂┑鐘绘涧濡厼顭囬埡鍌樹簻闁瑰搫绉电粊鎵磼闊彃鐏叉慨濠勭帛閹峰懘鎼归悷鎵偧婵＄偑鍊ら崢鐓幟洪妸鈺佺闁圭儤顨忛弫宥夋煟閹邦厽缍戝ù婊勵殜濮婅櫣绱掑Ο鑽ゅ弳闂佸憡鑹鹃澶愬箖閿熺姵鍋勯柛蹇氬亹閸樼敻姊绘笟鍥у伎缂佺姵鍨堕弲鑸电節濮橆厾鍘遍梺闈涚墕濞层倝寮稿☉銏＄厸閻忕偟鏅倴缂備緡鍣崣鍐ㄧ暦椤愶箑绀嬮柕濞垮劙婢规洖鈹戦悩缁樻锭妞ゆ垵鎳橀幏鎴︽偄閸濄儳顔曢梺鐟邦嚟閸嬬喖骞婇崟顖涚厱閹艰揪绲介弸娑㈡煛鐏炵偓绀夌紒鐘崇洴瀵挳鎮滈崱蹇撲壕閻忕偛褰炵换鍡樸亜閹扳晛鐏い銉ｅ灪閹便劍绻濋崘鈹夸虎閻庤娲忛崝宥囨崲濠靛纾兼繝濠傛噺閸ゅ啴姊绘担鍦菇闁糕晛瀚板畷褰掝敂閸繄顦┑鐘绘涧濞层劑鍩炲鍛斀闁绘ê寮堕幖鎰磼閻樺灚鍤€闂囧鏌ㄥ┑鍡樺櫤闁瑰弶鎮傞弻娑樜熼悜妯烘殘缂備胶绮粙鎺戭焽韫囨稑绀堢憸宥夘敋闁秵鐓熼柣姗嗗亜娴滈箖姊洪幐搴㈢闁稿﹤鎽滅槐?
         if self._state.is_active():
             await self._check_position_closed(client, mark_price, last["ts"])
+        if self._state.is_active():
+            await self._maybe_refresh_stop_after_liq_change(client)
         if self._state.is_active():
             self._record_trend_entry_reference(last, mark_price)
         if self._state.is_active() and self._update_addon_extreme_guard_from_completed_kline(df, last):
@@ -2735,6 +2737,90 @@ class BollPinStrategy:
         self._log_runtime_state_summary("Post-exchange sync state")
         return avg_entry
 
+    def _desired_stop_loss_order(self) -> tuple[float, str, float, float]:
+        """Return desired stop trigger, mode, target loss, and estimated loss."""
+        pos_side = self._state.direction
+        if self._state.total_sz <= 0 or pos_side not in ("long", "short"):
+            return 0.0, "", 0.0, 0.0
+
+        sl_price = 0.0
+        stop_mode = "liquidation_guard"
+        target_loss = 0.0
+
+        if COPY_FIXED_LOSS_STOP_ENABLED and self._state.avg_entry > 0:
+            target_loss = self._fixed_loss_target_usdt()
+            if target_loss > 0:
+                sl_price = self._fixed_loss_stop_price(
+                    pos_side,
+                    self._state.avg_entry,
+                    self._state.total_sz,
+                )
+                stop_mode = "fixed_loss"
+
+        liq_guard_price = 0.0
+        if self._state.plan_liq_price > 0:
+            if pos_side == "long":
+                liq_guard_price = self._state.plan_liq_price + LIQ_STOP_OFFSET_USD
+            else:
+                liq_guard_price = self._state.plan_liq_price - LIQ_STOP_OFFSET_USD
+
+        if sl_price <= 0 and liq_guard_price > 0:
+            sl_price = liq_guard_price
+
+        if liq_guard_price > 0:
+            if pos_side == "long" and sl_price < liq_guard_price:
+                sl_price = liq_guard_price
+                stop_mode = "fixed_loss_clamped_to_liq_guard"
+            elif pos_side == "short" and sl_price > liq_guard_price:
+                sl_price = liq_guard_price
+                stop_mode = "fixed_loss_clamped_to_liq_guard"
+
+        sl_price = round(sl_price, 2) if sl_price > 0 else 0.0
+        if sl_price <= 0:
+            return 0.0, stop_mode, target_loss, 0.0
+
+        if pos_side == "long":
+            estimated_loss = max((self._state.avg_entry - sl_price) * self._state.total_sz * CT_VAL, 0.0)
+        else:
+            estimated_loss = max((sl_price - self._state.avg_entry) * self._state.total_sz * CT_VAL, 0.0)
+
+        return sl_price, stop_mode, target_loss, estimated_loss
+
+    async def _maybe_refresh_stop_after_liq_change(self, client: OKXClient) -> None:
+        """Refresh the stop order when exchange liquidation price changes."""
+        pos = await client.get_position(INST_ID)
+        if pos is None or float(pos.get("pos", 0) or 0) == 0:
+            return
+
+        old_liq = self._state.plan_liq_price
+        old_sl = self._state.plan_sl_price
+        avg_entry = float(pos.get("avgPx") or 0)
+        liq_price = float(pos.get("liqPx") or 0)
+        total_sz = float(pos.get("pos", 0) or 0)
+        pos_side = pos.get("posSide") or self._state.direction
+
+        self._state.direction = pos_side
+        self._state.update_position(total_sz, avg_entry, liq_price)
+        self._seed_existing_position_batch()
+
+        desired_sl, _, _, _ = self._desired_stop_loss_order()
+        if desired_sl <= 0:
+            return
+
+        sl_missing = not self._state.sl_ord_id
+        sl_changed = old_sl <= 0 or abs(desired_sl - old_sl) >= LIQ_STOP_REPRICE_GAP_USD
+        liq_changed = old_liq > 0 and abs(liq_price - old_liq) >= LIQ_STOP_REPRICE_GAP_USD
+
+        if sl_missing or sl_changed:
+            log_action(
+                f"Refresh stop after liquidation update "
+                f"liq={old_liq:.2f}->{liq_price:.2f} sl={old_sl:.2f}->{desired_sl:.2f}"
+            )
+            await self._update_sl(client)
+            self._save_runtime_state()
+        elif liq_changed:
+            self._save_runtime_state()
+
     def _seed_existing_position_batch(self):
         """Create a synthetic filled batch for a pre-existing position."""
         if not self._state.is_active():
@@ -2797,51 +2883,10 @@ class BollPinStrategy:
             return
 
         close_side = "sell" if pos_side == "long" else "buy"
-        sl_price = 0.0
-        stop_mode = "liquidation_guard"
-        target_loss = 0.0
-
-        if COPY_FIXED_LOSS_STOP_ENABLED and self._state.avg_entry > 0:
-            target_loss = self._fixed_loss_target_usdt()
-            if target_loss > 0:
-                sl_price = self._fixed_loss_stop_price(
-                    pos_side,
-                    self._state.avg_entry,
-                    self._state.total_sz,
-                )
-                stop_mode = "fixed_loss"
-
-        liq_guard_price = 0.0
-        if self._state.plan_liq_price > 0:
-            if pos_side == "long":
-                liq_guard_price = self._state.plan_liq_price + LIQ_STOP_OFFSET_USD
-            else:
-                liq_guard_price = self._state.plan_liq_price - LIQ_STOP_OFFSET_USD
-
-        if sl_price <= 0 and liq_guard_price > 0:
-            sl_price = liq_guard_price
-
-        if sl_price <= 0:
-            logger.warning("Invalid stop-loss price; skip stop order")
-            return
-
-        if liq_guard_price > 0:
-            if pos_side == "long" and sl_price < liq_guard_price:
-                sl_price = liq_guard_price
-                stop_mode = "fixed_loss_clamped_to_liq_guard"
-            elif pos_side == "short" and sl_price > liq_guard_price:
-                sl_price = liq_guard_price
-                stop_mode = "fixed_loss_clamped_to_liq_guard"
-
-        sl_price = round(sl_price, 2)
+        sl_price, stop_mode, target_loss, estimated_loss = self._desired_stop_loss_order()
         if sl_price <= 0:
             logger.warning(f"Invalid stop-loss price; skip sl={sl_price}")
             return
-
-        if pos_side == "long":
-            estimated_loss = max((self._state.avg_entry - sl_price) * self._state.total_sz * CT_VAL, 0.0)
-        else:
-            estimated_loss = max((sl_price - self._state.avg_entry) * self._state.total_sz * CT_VAL, 0.0)
 
         if self._state.sl_ord_id:
             await client.cancel_algo_order(INST_ID, self._state.sl_ord_id)

@@ -131,7 +131,6 @@ class PositionState:
         self.avg_entry = avg_entry
         if liq_price > 0:
             self.plan_liq_price = liq_price
-            self.plan_sl_price = liq_price
 
     def reset(self):
         """Clear all local position and order state."""

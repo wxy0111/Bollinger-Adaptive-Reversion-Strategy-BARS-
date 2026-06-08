@@ -298,9 +298,12 @@ DYNAMIC_TP_REPRICE_GAP_USD = 0.5
 
 ```python
 LIQ_STOP_OFFSET_USD = 0.1
+LIQ_STOP_REPRICE_GAP_USD = 0.2
 LIQ_WARNING_DISTANCE_USD = 10.0
 LIQ_WARNING_REPEAT_SEC = 3600
 ```
+
+持仓运行中，程序会持续同步 OKX 真实持仓的 `liqPx`。如果资金费、权益变化或交易所保证金计算导致强平价变化，并且新的止损触发价和本地记录的 `plan_sl_price` 差距达到 `LIQ_STOP_REPRICE_GAP_USD`，程序会撤销旧条件止损单，并按最新强平价/固定亏损规则重新挂止损。`plan_sl_price` 记录的是实际条件止损触发价，不再直接等同于强平价。
 
 固定亏损止损：
 

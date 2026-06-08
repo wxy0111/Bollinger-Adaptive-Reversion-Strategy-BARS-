@@ -301,6 +301,7 @@ OKX_LIQ_FEE_RATE = 0.0005
 # Stop trigger offset from liquidation price.
 # 强平线止损触发偏移。
 LIQ_STOP_OFFSET_USD = 0.1
+LIQ_STOP_REPRICE_GAP_USD = 0.2
 
 # Liquidation warning.
 # 强平预警：距离强平价10U以内提醒，同一持仓每小时最多一次。
