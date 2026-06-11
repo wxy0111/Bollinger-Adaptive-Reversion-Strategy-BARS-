@@ -3460,6 +3460,215 @@ class BollPinStrategy:
             s.unrealized_pnl = 0.0
         s.update_time()
 
+    async def _cancel_exchange_exit_orders(self, client: OKXClient) -> None:
+        """Cancel exchange take-profit and stop-loss orders for the position."""
+        try:
+            orders = await client.get_open_orders(INST_ID)
+        except Exception as e:
+            logger.warning(f"Fetch open close orders failed: {e}")
+            orders = []
+
+        close_side = "sell" if self._state.direction == "long" else "buy"
+        for order in orders:
+            if order.get("reduceOnly") != "true":
+                continue
+            if order.get("side") != close_side:
+                continue
+            ord_id = order.get("ordId")
+            if ord_id:
+                await client.cancel_order(INST_ID, ord_id)
+
+        try:
+            algos = await client.get_open_algo_orders(INST_ID)
+        except Exception as e:
+            logger.warning(f"Fetch open algo orders failed: {e}")
+            return
+
+        for algo in algos:
+            algo_id = algo.get("algoId")
+            if algo_id:
+                await client.cancel_algo_order(INST_ID, algo_id)
+
+    async def _cancel_exit_orders(self, client: OKXClient) -> None:
+        """Cancel locally tracked exit orders."""
+        if self._state.tp_ord_id:
+            await client.cancel_order(INST_ID, self._state.tp_ord_id)
+            self._state.tp_ord_id = None
+        if self._state.sl_ord_id:
+            await client.cancel_algo_order(INST_ID, self._state.sl_ord_id)
+            self._state.sl_ord_id = None
+
+    async def _reset_if_plan_has_no_live_orders(self, client: OKXClient) -> None:
+        """Reset local plan state when no live position or entry order exists."""
+        if self._state.is_active() or not self._state.batches:
+            return
+
+        try:
+            orders = await client.get_open_orders(INST_ID)
+        except Exception as e:
+            logger.warning(f"Fetch open orders for dashboard failed: {e}")
+            return
+
+        live_ids = {order.get("ordId") for order in orders}
+        has_live_entry = any(
+            (not batch.filled) and batch.ord_id in live_ids
+            for batch in self._state.batches
+        )
+        if not has_live_entry:
+            self._last_plan_kline_ts = None
+            self._last_batch_kline_ts = None
+            self._last_plan_entry_price = 0.0
+            logger.info("No position or pending entry orders; reset strategy state")
+            self._reset_probe_state()
+            self._state.reset()
+            self._clear_runtime_state()
+
+    def _log_plan(self, plan, mark_price: float) -> None:
+        """Log a human-readable batch-entry plan."""
+        log_check("=" * 60)
+        log_check(f"Entry plan direction={plan.direction} mark_price={mark_price:.2f}")
+        log_check(f"  tp={plan.tp_price} estimated_liq={plan.liq_price}")
+        log_check(f"  total_margin={plan.total_margin:.2f} USDT")
+        for batch_order in plan.orders:
+            log_check(
+                f"  batch={batch_order.batch_idx + 1} price={batch_order.price} sz={batch_order.sz}"
+                f" notional={batch_order.notional:.2f} margin={batch_order.margin:.2f}"
+            )
+        log_check("=" * 60)
+
+    def _capital_target_equity(self) -> float:
+        """Return the trading-account equity target after a flat position."""
+        if TRADING_ACCOUNT_TARGET <= 0:
+            return 0.0
+        if CROSS_COPY_PROTECT_ENABLED:
+            return TRADING_ACCOUNT_TARGET + max(CROSS_COPY_PROTECT_EQUITY_USDT, 0.0)
+        return TRADING_ACCOUNT_TARGET
+
+    async def _capital_account_value(self, client: OKXClient) -> float:
+        """Return the value used for capital restoration checks."""
+        if CROSS_COPY_PROTECT_ENABLED:
+            return await client.get_equity("USDT")
+        return await client.get_balance("USDT")
+
+    async def _cycle_account_value(self, client: OKXClient) -> float:
+        """Return account equity used as the per-cycle PnL baseline."""
+        return await client.get_equity("USDT")
+
+    async def _record_cycle_start_account_value(
+        self,
+        client: OKXClient,
+        reason: str,
+        force: bool = False,
+    ) -> float:
+        """Persist the trading-account equity baseline for the current cycle."""
+        if not force and self._state.cycle_start_account_value > 0:
+            return self._state.cycle_start_account_value
+        try:
+            account_value = await self._cycle_account_value(client)
+        except Exception as e:
+            logger.warning(f"Record cycle start account value failed reason={reason}: {e}")
+            return 0.0
+
+        self._state.cycle_start_account_value = round(account_value, 4)
+        self._state.cycle_start_ts = pd.Timestamp.utcnow().isoformat()
+        log_check(
+            f"Cycle start account value recorded value={self._state.cycle_start_account_value:.4f} "
+            f"reason={reason}"
+        )
+        self._save_runtime_state()
+        return self._state.cycle_start_account_value
+
+    async def _fetch_account_equity_close_pnl(self, client: OKXClient) -> dict | None:
+        """Return realized cycle PnL from start/end account equity when available."""
+        start_value = self._state.cycle_start_account_value
+        if start_value <= 0:
+            return None
+        try:
+            end_value = await self._cycle_account_value(client)
+        except Exception as e:
+            logger.warning(f"Fetch account-equity close PnL failed; fallback to fills: {e}")
+            return None
+
+        pnl = round(end_value - start_value, 4)
+        log_action(
+            f"Actual close PnL from account equity diff actual_pnl={pnl:+.4f} USDT "
+            f"start={start_value:.4f} end={end_value:.4f}"
+        )
+        return {
+            "pnl": pnl,
+            "start": round(start_value, 4),
+            "end": round(end_value, 4),
+        }
+
+    async def _calibrate_capital_after_close(self, client: OKXClient) -> float:
+        """Align trading account capital after realized-PnL transfer."""
+        target = self._capital_target_equity()
+        if target <= 0:
+            return 0.0
+        if self._state.is_active():
+            logger.debug("[Capital] Skip post-close calibration while state is active")
+            return 0.0
+
+        if CAPITAL_REBALANCE_DELAY_SEC > 0:
+            await asyncio.sleep(CAPITAL_REBALANCE_DELAY_SEC)
+
+        try:
+            account_value = await self._capital_account_value(client)
+            diff = round(account_value - target, 4)
+            tolerance = max(CAPITAL_REBALANCE_TOLERANCE_USDT, 0.0)
+            if abs(diff) <= tolerance:
+                logger.info(
+                    f"[Capital] Trading account aligned value={account_value:.4f} "
+                    f"target={target:.4f} tolerance={tolerance:.4f}"
+                )
+                if self._capital_shortage_active:
+                    self._capital_shortage_active = False
+                    self._save_runtime_state()
+                    await notify_capital_restored(account_value, target)
+                return 0.0
+
+            if diff > tolerance:
+                trading_balance = await client.get_balance("USDT")
+                transfer_amt = round(min(diff, trading_balance), 4)
+                if transfer_amt < 0.01:
+                    logger.warning(
+                        f"[Capital] Equity above target but no transferable balance "
+                        f"value={account_value:.4f} target={target:.4f} avail={trading_balance:.4f}"
+                    )
+                    return 0.0
+                logger.info(
+                    f"[Capital] Post-close excess value={account_value:.4f} "
+                    f"target={target:.4f}; transfer {transfer_amt:.4f} USDT to funding"
+                )
+                await client.transfer(amt=transfer_amt, from_acct="18", to_acct="6")
+                return transfer_amt
+
+            needed = round(abs(diff), 4)
+            funding_balance = await client.get_funding_balance("USDT")
+            top_up = round(min(needed, funding_balance), 4)
+            shortage = top_up + 0.0001 < needed
+            if top_up >= 0.01:
+                partial = " (partial top-up; funding insufficient)" if shortage else ""
+                logger.info(
+                    f"[Capital] Post-close below target value={account_value:.4f} "
+                    f"target={target:.4f}; top up {top_up:.4f} USDT{partial}"
+                )
+                await client.transfer(amt=top_up, from_acct="6", to_acct="18")
+
+            if shortage:
+                if not self._capital_shortage_active:
+                    self._capital_shortage_active = True
+                    self._save_runtime_state()
+                await notify_capital_shortage(account_value + top_up, target, funding_balance, top_up)
+            elif self._capital_shortage_active:
+                self._capital_shortage_active = False
+                self._save_runtime_state()
+                await notify_capital_restored(account_value + top_up, target)
+            return -top_up
+        except Exception as e:
+            logger.warning(f"[Capital] Post-close calibration failed; strategy continues: {e}")
+            return 0.0
+
     async def _rebalance_accounts(self, client: OKXClient, actual_pnl: float | None = None) -> float:
         """Keep capital by transferring the latest realized PnL when known."""
         if ROLLING_COMPOUND_ENABLED:
