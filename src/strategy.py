@@ -1045,6 +1045,12 @@ class BollPinStrategy:
             self._reset_probe_state()
             self._state.reset()
 
+    def _reset_probe_state(self) -> None:
+        """Clear first-batch probe metadata."""
+        self._probe_kline_ts = None
+        self._probe_direction = "none"
+        self._probe_entry_price = 0.0
+
     def _load_runtime_state(self):
         """Load local strategy state from disk when available."""
         if not STATE_FILE.exists():
