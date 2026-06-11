@@ -3425,6 +3425,41 @@ class BollPinStrategy:
         """
         return
 
+    def _update_dashboard(self, mark_price: float, last, equity: float) -> None:
+        """Copy the latest strategy snapshot into dashboard state."""
+        s = dashboard.state
+        s.mark_price = mark_price
+        s.boll_lower = float(last["boll_lower"])
+        s.boll_mid = float(last["boll_mid"])
+        s.boll_upper = float(last["boll_upper"])
+        s.equity = equity
+        s.peak_equity = self._peak_eq
+        s.direction = self._state.direction
+        s.avg_entry = self._state.avg_entry if self._state.total_sz > 0 else 0.0
+        s.total_sz = self._state.total_sz
+        s.tp_price = self._state.plan_tp_price
+        s.liq_price = self._state.plan_liq_price
+        s.batches = [
+            {
+                "batch_idx": batch.batch_idx,
+                "price": batch.price,
+                "sz": batch.sz,
+                "filled": batch.filled,
+            }
+            for batch in self._state.batches
+        ]
+
+        if self._state.avg_entry > 0 and self._state.total_sz > 0 and mark_price > 0:
+            if self._state.direction == "long":
+                s.unrealized_pnl = (mark_price - self._state.avg_entry) * self._state.total_sz * CT_VAL
+            elif self._state.direction == "short":
+                s.unrealized_pnl = (self._state.avg_entry - mark_price) * self._state.total_sz * CT_VAL
+            else:
+                s.unrealized_pnl = 0.0
+        else:
+            s.unrealized_pnl = 0.0
+        s.update_time()
+
     async def _rebalance_accounts(self, client: OKXClient, actual_pnl: float | None = None) -> float:
         """Keep capital by transferring the latest realized PnL when known."""
         if ROLLING_COMPOUND_ENABLED:
