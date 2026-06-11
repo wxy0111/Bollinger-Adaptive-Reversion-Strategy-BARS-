@@ -1,452 +1,149 @@
 # Bollinger Adaptive Reversion Strategy (BARS)
 
 <p align="center">
-  <img src="assets/bars-logo-dark.png" alt="BARS Logo" width="420">
+  <img src="assets/bars-logo-dark.png" alt="BARS logo" width="420">
 </p>
 
-**BARS** stands for **Bollinger Adaptive Reversion Strategy**. It is an
-OKX `ETH-USDT-SWAP` strategy built around Bollinger-band mean reversion,
-adaptive staged entries, capital-lock profit handling, and risk guards.
+BARS is a local OKX futures strategy for `ETH-USDT-SWAP`. It trades Bollinger-band mean reversion with staged entries, dynamic add-ons, fixed-risk exits, capital-locking, dashboard review, and log-based parameter optimization.
 
-中文名：**布林自适应回归策略**。核心逻辑是布林带极值入场、动态补仓摊平、
-按目标保证金收益止盈、盈利固本划转，并通过固定亏损止损、强平缓冲和趋势
-风险观察来限制极端行情风险。
+This repository is for research and personal automation only. Futures trading with leverage can lose money quickly. Review every parameter before live use.
 
-这是一个运行在 OKX `ETH-USDT-SWAP` 永续合约上的 15 分钟布林带均值回归策略。程序读取 OKX 15m K 线和实时标记价格，当价格突破布林带外侧并停止继续创新极值时，按动态分批方式建立仓位，并用交易所真实持仓均价管理止盈、止损、补仓、资金固本和微信通知。
+## English
 
-项目包含实盘/模拟盘主程序、本地网页看板、ServerChan 微信推送、固本资金管理、风险保护、日志清理工具，以及基于运行日志的参数优化报告工具。
+### What It Does
 
-## 重要提醒
+- Reads OKX 15-minute candles and calculates Bollinger bands locally.
+- Logs market snapshots every `PRICE_LOG_INTERVAL` seconds and runs strategy decisions every `POLL_INTERVAL` seconds.
+- Enters when price breaks the Bollinger boundary and passes width, trend, and disaster filters.
+- Adds to a position only when the new price improves the average entry and the risk guards allow it.
+- Places take-profit and stop orders after position sync.
+- Rebalances capital after realized PnL unless rolling compound mode is enabled.
+- Provides a local dashboard at `http://localhost:8080`.
+- Runs offline log replay and parameter optimization with `optimize_report.bat`.
 
-本程序涉及高杠杆合约交易，可能快速亏损或强平。默认配置使用 `OKX_FLAG=1`，也就是 OKX 模拟盘。正式使用前，请先在模拟盘确认下单、撤单、止盈、止损、资金划转和通知都符合预期。
-
-不要把 `.env`、真实 API 密钥、运行日志、历史数据、压缩包、优化结果、极端行情模拟文件提交到 GitHub。
-
-## English Version
-
-### Overview
-
-**Bollinger Adaptive Reversion Strategy (BARS)** is a local OKX perpetual-swap trading system for `ETH-USDT-SWAP`. It uses 15-minute Bollinger Bands, real-time mark prices, adaptive staged entries, dynamic take profit, capital-lock profit transfers, and several risk guards.
-
-The strategy is designed around mean reversion after price moves outside the Bollinger Bands. When price breaks below the lower band, the strategy prepares a long entry; when price breaks above the upper band, it prepares a short entry. It does not enter immediately while price is still making new extremes. Instead, it waits until the short-term move pauses, then places a limit order.
-
-This project includes:
-
-- Live/simulated OKX strategy runner.
-- Local dashboard at `http://localhost:8080`.
-- ServerChan WeChat notifications.
-- Capital-lock profit management.
-- Position, order, take-profit, stop-loss, and liquidation-risk handling.
-- Log-based parameter optimizer and replay tools.
-
-### Risk Warning
-
-This strategy uses leveraged futures. It can lose money quickly and may be liquidated in extreme market conditions. The default environment should be OKX demo trading (`OKX_FLAG=1`). Before using real funds, verify order placement, cancellation, fills, take profit, stop loss, capital transfers, recovery after restart, and notifications in demo mode.
-
-Do not commit `.env`, real API keys, runtime logs, historical data, archives, optimizer outputs, or extreme-market simulation files to GitHub.
-
-### Project Structure
+### Project Layout
 
 ```text
 C:\okx
-├── main.py                         # App entrypoint, starts dashboard and strategy
-├── start.bat                       # Windows one-click startup script
-├── optimize_report.bat             # Manual log-parameter optimization report
-├── requirements.txt                # Python dependencies
-├── .env.example                    # Environment variable example
-├── src
-│   ├── config.py                   # Main strategy configuration
-│   ├── strategy.py                 # Core strategy logic
-│   ├── okx_client.py               # OKX REST API wrapper
-│   ├── risk.py                     # Batch sizing, take-profit, and liquidation estimates
-│   ├── position_manager.py         # Local position, batch, and order state
-│   ├── indicators.py               # K-line and Bollinger calculations
-│   ├── notify.py                   # ServerChan notification helper
-│   ├── logging_utils.py            # Terminal log categories and colors
-│   └── dashboard.py                # Local web dashboard
-├── backtest
-│   ├── log_parameter_optimizer.py  # Log-based parameter optimizer
-│   └── clean_strategy_logs.py      # Log cleanup utility
-└── logs                            # Runtime logs and local state, not committed by default
+├── main.py                         # Live strategy entry point
+├── start.bat                       # Start live strategy
+├── optimize_report.bat             # Run log parameter optimizer
+├── README.md
+├── assets\                         # Logo and favicon assets
+├── src\
+│   ├── config.py                   # Main parameter control panel
+│   ├── strategy.py                 # BARS live strategy
+│   ├── okx_client.py               # OKX REST client wrapper
+│   ├── dashboard.py                # Local dashboard server
+│   ├── logger.py                   # Terminal and file logging
+│   ├── notifier.py                 # ServerChan notifications
+│   └── state_store.py              # Runtime state persistence
+├── backtest\
+│   └── log_parameter_optimizer.py  # Log replay and parameter optimization
+└── logs\ / logs_cleaned\           # Runtime logs used for replay
 ```
 
-### Quick Start
+Temporary research outputs, downloaded data, cache files, IDE files, secrets, and local logs should stay out of GitHub.
 
-1. Copy `.env.example` to `.env`.
-2. Fill in your OKX API credentials and optional `SERVERCHAN_KEY`.
-3. Review strategy parameters in [src/config.py](src/config.py).
-4. Start the program:
+### Setup
+
+1. Create `.env` in the project root:
+
+```env
+OKX_API_KEY=your_key
+OKX_SECRET_KEY=your_secret
+OKX_PASSPHRASE=your_passphrase
+OKX_FLAG=1
+SERVERCHAN_KEY=your_serverchan_send_key
+```
+
+2. Install dependencies in the existing virtual environment or create one:
 
 ```powershell
-start.bat
+python -m venv .venv
+.\.venv\Scripts\pip install -r requirements.txt
 ```
 
-The local dashboard runs at:
+3. Start the strategy:
+
+```powershell
+.\start.bat
+```
+
+4. Open the dashboard:
 
 ```text
 http://localhost:8080
 ```
 
-### Market Sampling
+### ServerChan Key
 
-Current rhythm:
+`SERVERCHAN_KEY` is used for WeChat notifications.
+
+1. Open [ServerChan](https://sct.ftqq.com/).
+2. Log in with WeChat.
+3. Copy your `SendKey`.
+4. Put it into `.env` as `SERVERCHAN_KEY=...`.
+
+The strategy sends notifications for program-driven entries, add-ons, closes, capital shortage/restoration, liquidation warnings, and trend-risk alerts.
+
+### Runtime Rhythm
 
 ```python
 PRICE_LOG_INTERVAL = 1
 POLL_INTERVAL = 3
-```
-
-- Market price and Bollinger snapshots are written to logs every `1s`.
-- Trading decisions run every `3s`.
-- Terminal market display follows the trading loop to avoid excessive output.
-
-### Entry Logic
-
-The first entry is allowed only when all major filters pass:
-
-```text
-price outside Bollinger Band
-+ Bollinger width is wide enough
-+ Bollinger width is not extremely wide
-+ entry disaster score is below threshold
-+ price is no longer making new extremes
-+ this 15m candle has not opened a new plan
-+ entry price is far enough from the previous plan price
-=> place first batch limit order
-```
-
-Direction:
-
-```text
-price < lower band => long
-price > upper band => short
-```
-
-Only one new entry/add-on batch is allowed per 15-minute candle. After a position closes, the closing candle is locked and cannot open a new first batch.
-
-### Add-On Logic
-
-Add-ons no longer depend on legacy fixed `BATCH_SPACING`. The current add-on decision uses the previous real fill price, dynamic entry gap, completed-candle extreme guard, fixed-loss buffer, and take-profit improvement guard.
-
-Main checks:
-
-```text
-position exists
-+ no working add-on order
-+ same-direction Bollinger signal appears again
-+ price is no longer making new extremes
-+ current candle has not added a batch
-+ distance from previous real fill >= effective add-on gap
-+ completed-candle extreme guard passes
-+ fixed-loss stop remains far enough from first entry
-+ add-on improves expected take-profit distance
-=> place next add-on limit order
-```
-
-The total entry margin is capped by `MAX_TOTAL_ENTRY_RATIO`, and the program does not shrink an order just to force an add-on when the cap, funds, or risk buffers are not satisfied.
-
-### Take Profit
-
-Default take profit is based on margin return, not a fixed USDT distance:
-
-```python
-TP_TARGET_MARGIN_RETURN = 0.28
-```
-
-Approximate take-profit distance:
-
-```text
-avg_entry * TP_TARGET_MARGIN_RETURN / LEVER
-```
-
-Dynamic take-profit lock:
-
-```python
-DYNAMIC_TP_ENABLED = True
-DYNAMIC_TP_ARM_RETURN = 0.22
-DYNAMIC_TP_RESTORE_RETURN = 0.18
-DYNAMIC_TP_REPRICE_GAP_USD = 0.5
-```
-
-When floating profit reaches the arm threshold, the strategy watches whether price continues to make favorable new extremes. If momentum pauses, it can replace the default take-profit order with a closer reduce-only order. If profit falls below the restore threshold before closing, it restores the default take-profit target.
-
-### Stop Loss And Risk Guards
-
-The strategy always treats the exchange liquidation price as the final risk boundary.
-
-```python
-LIQ_STOP_OFFSET_USD = 0.1
-LIQ_STOP_REPRICE_GAP_USD = 0.2
-LIQ_WARNING_DISTANCE_USD = 10.0
-LIQ_WARNING_REPEAT_SEC = 3600
-```
-
-During an active position, the program keeps syncing OKX's real `liqPx`. If funding fees, account equity, or exchange margin calculations move the liquidation price, and the desired stop trigger differs from local `plan_sl_price` by at least `LIQ_STOP_REPRICE_GAP_USD`, the program cancels the old conditional stop and places a new one using the latest liquidation/fixed-loss rule. `plan_sl_price` records the actual stop trigger, not the raw liquidation price.
-
-Fixed-loss stop:
-
-```python
-COPY_FIXED_LOSS_STOP_ENABLED = True
-COPY_FIXED_LOSS_STOP_USDT = 0.0
-COPY_FIXED_LOSS_STOP_RATIO = 0.95
-```
-
-When `COPY_FIXED_LOSS_STOP_USDT = 0`, the fixed-loss amount is calculated as:
-
-```text
-TRADING_ACCOUNT_TARGET * COPY_FIXED_LOSS_STOP_RATIO
-```
-
-Disaster stop:
-
-```python
-DISASTER_STOP_ENABLED = True
-DISASTER_HEAD_DROP_PCT = 0.05
-DISASTER_LOSS_RATIO = 0.7
-```
-
-It closes the current position and keeps the program running only when both conditions are met:
-
-- The first entry moves adversely by at least `5%`.
-- The cycle unrealized loss reaches `TRADING_ACCOUNT_TARGET * 70%`.
-
-Trend risk guard:
-
-```python
-TREND_RISK_GUARD_ENABLED = True
-TREND_RISK_GUARD_CLOSE_ENABLED = False
-TREND_RISK_SCORE_THRESHOLD = 5
-```
-
-By default, it scores and notifies but does not market-close the position. It can freeze add-ons when trend deterioration is detected. Market close is only enabled when `TREND_RISK_GUARD_CLOSE_ENABLED=True`.
-
-### Capital Management
-
-The strategy uses a capital-lock model. After a profitable close, the realized profit is transferred out to the funding account. After a losing close, the program tries to replenish the trading account from the funding account.
-
-If capital is insufficient, the strategy pauses new entries and add-ons, continues logging market data, and keeps managing existing positions and orders.
-
-### Parameter Optimization
-
-Run:
-
-```powershell
-optimize_report.bat
-```
-
-or:
-
-```powershell
-python backtest\log_parameter_optimizer.py --sample-sec 3
-```
-
-The optimizer replays local `logs/boll_pin_*.log` and compares risk/reward across core parameters. It does not automatically change live settings unless you choose a result in the prompt.
-
-### GitHub Hygiene
-
-Recommended files to commit:
-
-- Source code under `src/`.
-- README and documentation.
-- Startup scripts and example config files.
-- Dashboard/static assets needed by the app.
-
-Do not commit:
-
-- `.env`
-- API keys
-- `logs/`
-- Runtime state
-- Historical market data
-- Optimizer caches/results
-- Extreme-market simulation output
-
-## 程序结构
-
-```text
-C:\okx
-├── main.py                         # 程序入口，启动看板和策略
-├── start.bat                       # Windows 一键启动脚本
-├── optimize_report.bat             # 手动生成日志参数优化报告
-├── requirements.txt                # Python 依赖
-├── .env.example                    # 环境变量示例
-├── src
-│   ├── config.py                   # 策略参数控制面板
-│   ├── strategy.py                 # 核心交易策略
-│   ├── okx_client.py               # OKX REST API 封装
-│   ├── risk.py                     # 批次计划、张数、止盈和强平估算
-│   ├── position_manager.py         # 本地持仓、批次和订单状态
-│   ├── indicators.py               # K 线整理和布林带指标
-│   ├── notify.py                   # ServerChan 微信推送
-│   ├── logging_utils.py            # 终端日志分类和颜色
-│   └── dashboard.py                # 本地网页看板
-├── backtest
-│   ├── log_parameter_optimizer.py  # 基于运行日志的参数优化器
-│   └── clean_strategy_logs.py      # 日志清理工具
-└── logs                            # 运行日志和本地状态，默认不提交
-```
-
-## 运行方式
-
-1. 复制 `.env.example` 为 `.env`，填写 OKX API 和 ServerChan 配置。
-2. 检查 [src/config.py](src/config.py) 中的策略参数。
-3. 运行：
-
-```powershell
-start.bat
-```
-
-程序启动后会同时运行交易策略和本地看板。看板默认地址：
-
-```text
-http://localhost:8080
-```
-
-## 微信推送
-
-项目使用 ServerChan 发送微信通知。需要在 `.env` 中配置：
-
-```text
-SERVERCHAN_KEY=你的SendKey
-```
-
-获取方式：
-
-1. 打开 [ServerChan](https://sct.ftqq.com/)。
-2. 使用微信扫码登录。
-3. 在 SendKey 页面复制自己的 SendKey。
-4. 写入 `.env` 的 `SERVERCHAN_KEY`。
-
-程序会在策略触发的开仓挂单、开仓成交、补仓挂单、补仓成交、平仓、资金不足、资金恢复、趋势风险守卫、带单保护和强平风险事件中发送通知。强平预警只在距离强平价 `10U` 内提醒，并且同一持仓最多每 1 小时提醒一次。
-
-## 行情采样和交易节奏
-
-当前设置：
-
-```python
-PRICE_LOG_INTERVAL = 1
-POLL_INTERVAL = 3
-```
-
-- 每 `1s` 记录一次价格和布林带快照到日志，用于后续更高精度评估。
-- 每 `3s` 执行一次交易主逻辑，包括余额检查、成交同步、开仓、补仓、撤单、止盈、止损和资金管理。
-- 终端行情显示仍按主逻辑节奏刷新，避免 1s 行情刷屏。
-
-## 布林带和头仓过滤
-
-当前核心参数：
-
-```python
+BAR_15M = "15m"
 BOLL_PERIOD = 20
 BOLL_STD = 2.0
 BOLL_INCLUDE_CURRENT = True
+```
 
+Price and Bollinger snapshots can be logged at 1-second precision, while order decisions still run every 3 seconds by default. Bollinger bands are computed from OKX candles, not directly returned by OKX as Bollinger values.
+
+### Entry Logic
+
+A first batch is considered only when:
+
+- There is no active position or working plan.
+- Price breaks below the lower band for long, or above the upper band for short.
+- Bollinger width passes the minimum-width rule.
+- First-batch Bollinger width is not too wide.
+- Entry disaster score does not block the signal.
+- The current candle has not already created a plan.
+- The price is not still making a fresh extreme according to the no-new-extreme rule.
+
+Important entry parameters:
+
+```python
 MIN_BOLL_WIDTH_USD = 15
-MIN_BOLL_WIDTH_PCT = 0.008
-BOLL_WIDTH_BASE_PRICE = 2000.0
-BOLL_WIDTH_BASE_USD = 15.0
+MIN_BOLL_WIDTH_PCT = 0.015
 MIN_BOLL_WIDTH_FLOOR_USD = 10.0
-BOLL_WIDTH_GAP_MULT = 2.5
-
 ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED = True
 ENTRY_MAX_BOLL_WIDTH_PCT = 0.028
 ENTRY_MAX_BOLL_WIDTH_USD = 80.0
-
 ENTRY_DISASTER_FILTER_ENABLED = True
 ENTRY_DISASTER_SCORE_THRESHOLD = 4
-ENTRY_DISASTER_KLINE_COUNT = 3
-ENTRY_DISASTER_WIDTH_EXPAND = 1.5
-ENTRY_DISASTER_TP_DISTANCE_MULT = 4.0
-ENTRY_DISASTER_EXPECTED_RETURN = 0.25
+NO_NEW_EXTREME_TICKS = 2
+REPRICE_GAP_USD = 0.5
 ```
 
-`BOLL_INCLUDE_CURRENT=True` 表示布林带包含当前未收盘 K 线，布林带会随盘中价格实时变化。
+The effective minimum Bollinger width is calculated by the live strategy from the configured width rules. `BOLL_WIDTH_TP_SPACE_ENABLED` is currently available but disabled by default.
 
-最低布林宽度用于避免窄幅低波动行情开仓；最大布林宽度只限制新开头仓，用来避免在极端扩张或趋势加速阶段开第一单。当前最大宽度过滤为：布林宽度达到价格的 `2.8%` 或绝对宽度达到 `80U` 时，不开新头仓。该规则不影响已有持仓后的补仓。
+### Add-on Logic
 
-入场灾难评分是叠加在最大宽度之后的第二层头仓过滤。它会观察最近 `3` 根 15m K 线的高低点、布林中轨/边轨方向、布林宽度扩张，以及价格距离中轨是否过远；评分达到 `4` 时跳过头仓。最大宽度过滤和灾难评分是 `OR` 关系：任意一层触发，都会跳过头仓。
+Add-ons are considered only after a real position exists. The strategy checks:
 
-## 开仓逻辑
+- No pending entry order is still working.
+- The current 15-minute candle has not already added a batch.
+- Bollinger width is wide enough but does not violate optional add-on max-width rules.
+- Trend-risk freeze has not blocked add-ons.
+- The new candidate price is far enough from the last real fill price.
+- The completed-candle extreme guard allows the add-on.
+- The add-on improves the target take-profit position enough.
+- Total margin stays below `MAX_TOTAL_ENTRY_RATIO`.
+- Fixed-loss stop remains far enough from the first entry.
 
-没有持仓、也没有正在工作的入场挂单时，程序按下面顺序判断头仓：
-
-```text
-价格突破布林带外侧
-+ 布林宽度不低于最低阈值
-+ 布林宽度不高于头仓最大阈值
-+ 入场灾难评分未达到阈值
-+ 价格不再继续创新高/新低
-+ 当前 K 线没有开过新计划
-+ 入场价和上一套计划价格距离足够
-=> 挂第 1 批头仓限价单
-```
-
-方向判断：
-
-```text
-价格 < 布林下轨 => 做多
-价格 > 布林上轨 => 做空
-```
-
-同一根 15m K 线最多新增一笔入场批次。头仓成交后，本根 K 线不继续补仓，等待下一根 K 线重新判断。平仓完成后，平仓所在的这根 15m K 线不再开新头仓。
-
-如果未成交头仓挂单后，下一根 K 线判断时布林宽度低于最低阈值、高于头仓最大宽度阈值，或入场灾难评分达到阈值，程序会撤销该未成交头仓。
-
-## 补仓逻辑
-
-补仓不再依赖旧的 `BATCH_SPACING` 固定间距，而是根据当前触发价、上一批真实成交价、动态间距和 K 线 guard 判断。
-
-```text
-已有持仓
-+ 当前没有未成交补仓单
-+ 再次触发同方向布林带外侧
-+ 布林宽度满足动态阈值
-+ 价格不再继续创新高/新低
-+ 当前 K 线没有新增过入场批次
-+ 补仓价和上一批真实成交价距离 >= 有效补仓间距
-+ 补仓价突破头仓后记录的已完成 K 线极值
-+ 固定亏损止损不会被推到头仓 5% 以内
-=> 按当前 mark_price 挂下一批限价单
-```
-
-当前补仓相关参数：
-
-```python
-MIN_ENTRY_GAP_USD = 6
-MIN_HEAD_LIQ_BUFFER_PCT = 0.03
-DYNAMIC_ENTRY_GAP_ENABLED = True
-DYNAMIC_ENTRY_GAP_MAX_USD = 40.0
-
-ADDON_DYNAMIC_GAP_ENABLED = True
-ADDON_DYNAMIC_GAP_MAX_USD = 20.0
-ADDON_DYNAMIC_GAP_BOLL_START = 1.2
-ADDON_DYNAMIC_GAP_BOLL_STRONG = 1.8
-ADDON_DYNAMIC_GAP_BOLL_MAX_MULT = 1.5
-ADDON_DYNAMIC_GAP_HEAD_START_PCT = 0.015
-ADDON_DYNAMIC_GAP_HEAD_STRONG_PCT = 0.03
-ADDON_DYNAMIC_GAP_HEAD_MAX_MULT = 1.2
-ADDON_DYNAMIC_GAP_TREND_KLINES = 3
-ADDON_DYNAMIC_GAP_TREND_MULT = 1.25
-
-ADDON_EXTREME_GUARD_ENABLED = True
-FIXED_LOSS_HEAD_BUFFER_ENABLED = True
-FIXED_LOSS_HEAD_BUFFER_PCT = 0.05
-
-ADDON_TP_IMPROVE_GUARD_ENABLED = True
-ADDON_TP_IMPROVE_EXPECTED_RETURN = 0.25
-ADDON_TP_IMPROVE_RATIO = 1.0
-ADDON_TP_IMPROVE_MIN_USD = 1.0
-```
-
-有效补仓间距会根据强平缓冲、布林扩张、头仓逆向波动和连续 K 线趋势自动放大，但不会低于 `MIN_ENTRY_GAP_USD`。
-
-补仓 K 线极值 guard 的逻辑是：从头仓成交后开始记录已完成 15m K 线的极值。多单补仓价必须低于记录低点；空单补仓价必须高于记录高点。
-
-补仓止盈改善守卫会模拟补仓后的新均价和预期止盈价。只有当补仓能让预期止盈价明显更容易触达时，才允许补仓；当前按 `25%` 保证金收益作为预期止盈基准，要求至少改善 `1U` 或一个完整预期止盈距离。
-
-## 动态分批张数
-
-当前策略使用动态补仓比例：
+Sizing is dynamic:
 
 ```python
 FIRST_BATCH_RATIO = 0.1
@@ -461,51 +158,23 @@ MAX_TOTAL_ENTRY_RATIO = 0.8
 MAX_ENTRY_BATCHES = 12
 ```
 
-- 第 1 批头仓使用目标策略资金的 `10%` 保证金。
-- 第 2 批补仓也使用动态比例，当前基准 `14%`，范围 `5%` 到 `18%`，满额参考价差 `10U`。
-- 第 3 批及之后，根据前后价差动态调整比例。
-- 动态补仓比例限制在 `5%` 到 `15%` 之间。
-- 全部入场批次占用保证金最多不超过目标策略资金的 `80%`。
-- 如果超过 `80%` 上限、有效可用资金不足，或固定止损缓冲不满足，程序会放弃本次补仓，不会缩小比例强行补仓。
+The first add-on is now dynamic too. Later add-ons use the later dynamic ratio band. Legacy fixed-batch fields remain in `config.py` only for compatibility.
 
-旧参数 `BATCH_COUNT`、`BATCH_SIZE_RATIO` 和 `BATCH_SPACING` 仅作为历史兼容保留，不再作为当前实盘补仓模型的核心依据。
+### Take Profit
 
-## 挂单维护
-
-未成交头仓或补仓单由 K 线更新和价格阈值维护：
-
-```text
-K 线更新
-+ 仍满足同方向轨外条件
-+ 新挂单价和旧挂单价差 >= REPRICE_GAP_USD
-=> 撤旧单，按新价格重挂
-```
-
-当前重挂阈值：
-
-```python
-REPRICE_GAP_USD = 0.5
-```
-
-程序不再使用 45 秒未成交自动撤单逻辑。挂单是否撤销主要由 K 线更新、价格阈值、布林宽度阈值和方向条件决定。
-
-## 止盈和动态锁盈
-
-当前默认止盈不是固定 `10U`，而是按保证金收益率计算：
+Default take-profit is margin-return based:
 
 ```python
 TP_TARGET_MARGIN_RETURN = 0.28
 ```
 
-止盈距离：
+Approximate price distance:
 
 ```text
-止盈距离 = 平均成本 * TP_TARGET_MARGIN_RETURN / LEVER
+average entry price * TP_TARGET_MARGIN_RETURN / LEVER
 ```
 
-在 ETH 价格约 `2000`、杠杆 `50x` 时，`28%` 保证金收益约等于 `11.2U` 价格距离。
-
-动态锁盈参数：
+Dynamic take-profit can lock profit before the default target:
 
 ```python
 DYNAMIC_TP_ENABLED = True
@@ -514,271 +183,391 @@ DYNAMIC_TP_RESTORE_RETURN = 0.18
 DYNAMIC_TP_REPRICE_GAP_USD = 0.5
 ```
 
-逻辑：
+If floating profit reaches the arm threshold and price stops making favorable extremes, the strategy can reprice the take-profit order near the current price. If profit falls below the restore threshold, it restores the normal target.
 
-```text
-默认挂 28% 动态止盈
-浮盈达到 22% 后开始观察
-如果多单不再创新高，或空单不再创新低：
-    撤原止盈单
-    按当前实时价格附近挂 reduce-only 止盈单
-如果实时价止盈未成交，且浮盈回落到 18% 以下：
-    撤实时价止盈
-    恢复 28% 动态止盈
-```
+### Stop Loss And Risk Guards
 
-每次有新批次成交后，程序会退出动态锁盈状态，按交易所真实持仓均价重新计算默认止盈，并重挂 reduce-only 止盈单。
+Current stop and risk modules:
 
-`BOLL_TP_COMPRESSION_ENABLED` 当前默认关闭。
+- Liquidation guard stop: keeps a conditional stop near the real liquidation price.
+- Fixed-loss stop: places a stop based on strategy risk equity and `COPY_FIXED_LOSS_STOP_RATIO`.
+- Fixed-loss head buffer: blocks add-ons if the fixed-loss stop would move too close to the first entry.
+- Disaster stop: closes the current position when head adverse move and loss ratio both hit the configured threshold, then keeps the program running.
+- Bollinger-mid cost stop: market-closes when Bollinger midline crosses the position cost.
+- Trend risk guard: scores trend deterioration, sends alerts, and can freeze add-ons; market close is disabled by default.
 
-## 止损和风险守卫
-
-强平线作为最终风险边界，程序会挂条件止损单：
-
-```python
-LIQ_STOP_OFFSET_USD = 0.1
-LIQ_STOP_REPRICE_GAP_USD = 0.2
-LIQ_WARNING_DISTANCE_USD = 10.0
-LIQ_WARNING_REPEAT_SEC = 3600
-```
-
-持仓运行中，程序会持续同步 OKX 真实持仓的 `liqPx`。如果资金费、权益变化或交易所保证金计算导致强平价变化，并且新的止损触发价和本地记录的 `plan_sl_price` 差距达到 `LIQ_STOP_REPRICE_GAP_USD`，程序会撤销旧条件止损单，并按最新强平价/固定亏损规则重新挂止损。`plan_sl_price` 记录的是实际条件止损触发价，不再直接等同于强平价。
-
-固定亏损止损：
+Key parameters:
 
 ```python
 COPY_FIXED_LOSS_STOP_ENABLED = True
-COPY_FIXED_LOSS_STOP_USDT = 0.0
 COPY_FIXED_LOSS_STOP_RATIO = 0.95
-```
-
-当 `COPY_FIXED_LOSS_STOP_USDT = 0` 时，本轮固定亏损止损按 `TRADING_ACCOUNT_TARGET * COPY_FIXED_LOSS_STOP_RATIO` 计算。
-
-灾难止损：
-
-```python
+FIXED_LOSS_HEAD_BUFFER_ENABLED = True
+FIXED_LOSS_HEAD_BUFFER_PCT = 0.05
 DISASTER_STOP_ENABLED = True
 DISASTER_HEAD_DROP_PCT = 0.05
 DISASTER_LOSS_RATIO = 0.7
-```
-
-只有同时满足头仓逆向达到 `5%`，并且本轮浮亏达到 `TRADING_ACCOUNT_TARGET * 70%`，才触发灾难止损。
-
-趋势风险守卫：
-
-```python
+BOLL_MID_COST_STOP_ENABLED = True
 TREND_RISK_GUARD_ENABLED = True
 TREND_RISK_GUARD_CLOSE_ENABLED = False
+TREND_RISK_FREEZE_ADDON_ENABLED = True
 TREND_RISK_SCORE_THRESHOLD = 5
-TREND_RISK_HEAD_ADVERSE_PCT = 0.04
-TREND_RISK_WIDTH_EXPAND = 2.5
 ```
 
-默认开启评分和提醒，默认关闭市价平仓。程序会在头仓逆向幅度、布林中轨/边轨斜率、连续 K 线极值恶化、价格相对中轨位置、布林宽度扩张等条件同时恶化并达到评分阈值时打印日志并发送微信通知。只有 `TREND_RISK_GUARD_CLOSE_ENABLED=True` 时，才会市价平掉当前仓位；平仓后程序继续运行。
+### Capital Modes
 
-## 固本资金和全仓带单保护
-
-当前资金参数：
+Default fixed-capital mode:
 
 ```python
-TRADING_ACCOUNT_TARGET = 200
-CROSS_COPY_PROTECT_ENABLED = True
-CROSS_COPY_PROTECT_EQUITY_USDT = 500.0
-CROSS_COPY_DYNAMIC_SIZING_ENABLED = True
+TRADING_ACCOUNT_TARGET = 50
+ROLLING_COMPOUND_ENABLED = False
+```
+In this mode, entries and add-ons size from `TRADING_ACCOUNT_TARGET`. After a realized profit, the strategy transfers the realized profit from trading to funding. After a realized loss, it attempts to refill the trading account. If capital is insufficient, it pauses new entries but continues logging market data.
+
+Rolling compound mode:
+
+```python
+ROLLING_COMPOUND_ENABLED = True
 ```
 
-全仓带单保护 sizing：
+In rolling mode, realized profit stays in the trading account. Entry sizing, add-on sizing, fixed-loss stop, and disaster-stop risk use live effective equity instead of the fixed target.
+
+Cross-copy protection can be combined with either mode:
+
+```python
+CROSS_COPY_PROTECT_ENABLED = False
+CROSS_COPY_PROTECT_EQUITY_USDT = 500.0
+CROSS_COPY_DYNAMIC_SIZING_ENABLED = False
+```
+
+When protection is enabled, the protected equity is reserved. Rolling mode uses:
 
 ```text
-strategy sizing equity = min(TRADING_ACCOUNT_TARGET, account equity - CROSS_COPY_PROTECT_EQUITY_USDT)
+effective equity = account equity - CROSS_COPY_PROTECT_EQUITY_USDT
 ```
 
-如果账户权益小于或等于 `CROSS_COPY_PROTECT_EQUITY_USDT`，程序会撤销订单、发送通知并停止新开仓；不会再主动市价平仓。
+### Dashboard
 
-平仓后程序优先读取真实成交收益：
+The local dashboard shows:
 
-- 盈利：只把真实利润划转到资金账户。
-- 亏损：按真实亏损从资金账户补回。
-- 如果资金账户不足以补回目标，程序会发送通知，并暂停新开仓和新补仓，但继续记录行情、同步持仓和管理已有订单。
-- 后续你补充资金后，账户恢复到目标以上，程序会发送恢复通知；超过目标的部分会按规则划回资金账户。
+- Live price and Bollinger state.
+- Runtime strategy state.
+- Historical log files.
+- Daily trades and realized profit from logs.
+- Chart markers for first entry, add-ons, exits, and risk events.
 
-## 本地看板
+The dashboard is local-only by default and runs from the strategy process.
 
-看板地址：
+### Log Optimizer
+
+Run:
+
+```powershell
+.\optimize_report.bat
+```
+
+The optimizer replays local logs with live-like sizing and current risk guards. It uses a slim core parameter set:
+
+- `FIRST_BATCH_RATIO`
+- `MAX_TOTAL_ENTRY_RATIO`
+- `MIN_ENTRY_GAP_USD`
+- `MIN_BOLL_WIDTH_PCT`
+- `ENTRY_MAX_BOLL_WIDTH_PCT`
+- `ENTRY_DISASTER_SCORE_THRESHOLD`
+- `SECOND_BATCH_DYNAMIC_*`
+- `DYNAMIC_*_RATIO`
+- `TP_TARGET_MARGIN_RETURN`
+- `DYNAMIC_TP_ARM_RETURN`
+- `DYNAMIC_TP_RESTORE_RETURN`
+- `BOLL_MID_COST_STOP_ENABLED`
+
+The report compares the current config with optimized candidates and includes PnL, drawdown, liquidation buffer, wipeout flags, trades, and signal counts. It is a log replay, not an order-book fill simulator.
+
+## 中文
+
+### 项目简介
+
+BARS 是一个运行在本地的 OKX ETH 永续合约布林带均值回归策略。它的核心不是固定马丁，而是“布林破轨入场 + 动态分批 + 风险过滤 + 固本/滚仓资金管理”。
+
+当前策略重点：
+
+- 用 OKX 15m K 线本地计算布林带。
+- 行情可 1 秒记录，策略默认 3 秒判断一次。
+- 头仓只在破轨且通过布林宽度、趋势和灾难过滤后挂单。
+- 补仓按真实成交价、动态间距、动态比例和风险守卫执行。
+- 止盈按保证金收益率计算，支持动态锁盈。
+- 止损包含固定亏损条件单、强平保护、灾难止损、布林中轨成本止损、趋势风险冻结补仓。
+- 平仓后可选择固本划转，或开启滚仓让利润留在交易账户。
+- 本地网页看板展示行情、日志、交易点位和收益。
+- 优化器只优化核心收益/风险参数。
+
+### 快速启动
+
+1. 在项目根目录创建 `.env`：
+
+```env
+OKX_API_KEY=你的OKX_KEY
+OKX_SECRET_KEY=你的OKX_SECRET
+OKX_PASSPHRASE=你的OKX密码短语
+OKX_FLAG=1
+SERVERCHAN_KEY=你的ServerChan_SendKey
+```
+
+2. 安装依赖：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\pip install -r requirements.txt
+```
+
+3. 启动策略：
+
+```powershell
+.\start.bat
+```
+
+4. 打开看板：
 
 ```text
 http://localhost:8080
 ```
 
-看板只读取本地运行状态和日志，不负责下单。页面采用深色交易终端风格，左侧导航分为实时看板和历史日志。
+### ServerChan 获取方法
 
-实时看板显示：
+`SERVERCHAN_KEY` 用于微信推送。
 
-- 当前标记价格、布林带位置和布林宽度。
-- 账户权益、峰值、回撤和今日收益。
-- 当前持仓方向、均价、张数、浮盈亏、止盈价和强平价。
-- 批次状态和最近成交流水。
+1. 打开 [ServerChan](https://sct.ftqq.com/)。
+2. 用微信登录。
+3. 复制页面里的 `SendKey`。
+4. 写入 `.env`：
 
-历史日志页支持读取 `logs/boll_pin_*.log`，显示价格、布林带、关键交易点、单日开单情况和实际固本收益。历史复盘图会标注：
-
-- 价格线和布林上轨/中轨/下轨。
-- 布林带上下轨之间的波动区域。
-- 头仓点、补仓点和平仓/固本划转点。
-- 鼠标悬停时显示时间、价格、布林宽度和交易事件。
-
-历史实际收益优先来自固本划转日志，例如：
-
-```text
-[Capital] Profit +13.1408 USDT
+```env
+SERVERCHAN_KEY=你的SendKey
 ```
 
-如果没有固本划转记录，才回退使用成交批次、止盈挂单价格和 `Position closed` 记录估算收益。
+程序调用的开仓、补仓、平仓、资金不足、资金恢复、强平预警、趋势风险提醒都会走推送。
 
-## 日志清理和参数优化
+### 策略主流程
 
-手动运行参数优化：
-
-```powershell
-optimize_report.bat
+```mermaid
+flowchart TD
+    A["拉取价格和15m K线"] --> B["计算布林带"]
+    B --> C["同步成交和真实持仓"]
+    C --> D["刷新止盈/止损/强平保护"]
+    D --> E{"已有持仓?"}
+    E -- "否" --> F["检查头仓过滤"]
+    F --> G["挂头仓或跳过"]
+    E -- "是" --> H["检查趋势风险/灾难止损/中轨止损"]
+    H --> I["检查补仓条件"]
+    I --> J["挂补仓或冻结"]
+    J --> K["更新看板和日志"]
 ```
 
-或直接运行：
+### 开头仓规则
 
-```powershell
-python backtest\log_parameter_optimizer.py --sample-sec 3
-```
+头仓不是单纯“碰到上下轨就进”。它会依次检查：
 
-优化器默认读取：
+- 是否无持仓、无工作计划。
+- 当前价格是否破下轨或上轨。
+- 布林带最小宽度是否满足。
+- 头仓最大布林宽度是否未超限。
+- 入场灾难评分是否未拦截。
+- 当前 K 线是否已经挂过计划。
+- 价格是否还在继续创新低/新高。
 
-```text
-logs/boll_pin_*.log
-```
-
-当前优化器会回放实盘保护模型，包括：
-
-- 固本和全仓带单 sizing
-- 最大总入场比例限制
-- 补仓 K 线极值 guard
-- 固定亏损止损
-- 灾难止损
-- 动态补仓间距
-- 头仓最大布林宽度过滤
-- 入场灾难评分过滤
-- 补仓止盈改善守卫
-
-当前优化器默认只搜索核心风险/收益参数，其他配置固定为实盘当前值参与回放：
-
-```text
-ENTRY_MAX_BOLL_WIDTH_PCT
-ENTRY_DISASTER_SCORE_THRESHOLD
-ENTRY_DISASTER_TP_DISTANCE_MULT
-MIN_ENTRY_GAP_USD
-BOLL_WIDTH_TP_SPACE_MULT
-FIRST_BATCH_RATIO
-SECOND_BATCH_DYNAMIC_BASE_RATIO
-SECOND_BATCH_DYNAMIC_MIN_RATIO
-SECOND_BATCH_DYNAMIC_MAX_RATIO
-SECOND_BATCH_DYNAMIC_FULL_GAP_USD
-DYNAMIC_BASE_ENTRY_RATIO
-DYNAMIC_MIN_ENTRY_RATIO
-DYNAMIC_MAX_ENTRY_RATIO
-MAX_TOTAL_ENTRY_RATIO
-COPY_FIXED_LOSS_STOP_RATIO
-FIXED_LOSS_HEAD_BUFFER_PCT
-DISASTER_HEAD_DROP_PCT
-DISASTER_LOSS_RATIO
-TREND_RISK_GUARD_ENABLED
-TREND_RISK_GUARD_CLOSE_ENABLED
-TREND_RISK_SCORE_THRESHOLD
-TREND_RISK_HEAD_ADVERSE_PCT
-TREND_RISK_WIDTH_EXPAND
-ADDON_DYNAMIC_GAP_MAX_USD
-```
-
-行情日志会额外记录 `kline`、`width`、`width_pct` 和 `trading_balance`，用于后续检查回测和实盘状态是否对齐；旧的 `price=... Boll[...]` 格式仍然保留，现有回放脚本可以继续解析。
-
-报告跑完后，终端会显示参数同步菜单。同步前需要再次输入确认，脚本会先生成 `src/config.py.bak` 备份。
-
-如果想把中英文混合的行情日志行统一成英文格式，可以先生成清理副本：
-
-```powershell
-python backtest\clean_strategy_logs.py --log-dir logs --out-dir logs_cleaned
-python backtest\log_parameter_optimizer.py --log-dir logs_cleaned --sample-sec 3
-```
-
-`logs_cleaned/` 是生成副本，默认不提交到 GitHub。
-
-## 常用参数
-
-主要参数集中在 [src/config.py](src/config.py)：
+常用参数：
 
 ```python
-INST_ID = "ETH-USDT-SWAP"
-LEVER = 50
-
-PRICE_LOG_INTERVAL = 1
-POLL_INTERVAL = 3
-
-BOLL_PERIOD = 20
-BOLL_STD = 2.0
-BOLL_INCLUDE_CURRENT = True
-
-MIN_BOLL_WIDTH_USD = 15
-MIN_BOLL_WIDTH_PCT = 0.008
-ENTRY_MAX_BOLL_WIDTH_FILTER_ENABLED = True
+MIN_BOLL_WIDTH_PCT = 0.015
 ENTRY_MAX_BOLL_WIDTH_PCT = 0.028
-ENTRY_MAX_BOLL_WIDTH_USD = 80.0
-ENTRY_DISASTER_FILTER_ENABLED = True
 ENTRY_DISASTER_SCORE_THRESHOLD = 4
-ENTRY_DISASTER_TP_DISTANCE_MULT = 4.0
-
-MIN_ENTRY_GAP_USD = 6
+NO_NEW_EXTREME_TICKS = 2
 REPRICE_GAP_USD = 0.5
+```
 
-FIRST_BATCH_RATIO = 0.1
+### 补仓规则
+
+补仓会比头仓更严格。它要求：
+
+- 已有真实持仓。
+- 没有未成交的补仓挂单。
+- 本根 15m K 线还没补过仓。
+- 距离上一批真实成交价满足有效补仓间距。
+- 已完成 K 线极值守卫允许补仓。
+- 补仓后止盈价有明显改善。
+- 总入场保证金不超过上限。
+- 固定亏损止损仍距离头仓足够远。
+- 趋势风险没有冻结补仓。
+
+第一次补仓也已改成动态比例：
+
+```python
 SECOND_BATCH_DYNAMIC_BASE_RATIO = 0.14
 SECOND_BATCH_DYNAMIC_MIN_RATIO = 0.05
 SECOND_BATCH_DYNAMIC_MAX_RATIO = 0.18
 SECOND_BATCH_DYNAMIC_FULL_GAP_USD = 10.0
+```
+
+第 3 批及之后：
+
+```python
 DYNAMIC_BASE_ENTRY_RATIO = 0.08
 DYNAMIC_MIN_ENTRY_RATIO = 0.05
 DYNAMIC_MAX_ENTRY_RATIO = 0.15
-MAX_TOTAL_ENTRY_RATIO = 0.8
+```
 
+### 止盈规则
+
+当前默认止盈不是固定 10U，而是保证金收益率：
+
+```python
+TP_TARGET_MARGIN_RETURN = 0.28
+```
+
+50 倍杠杆下，28% 保证金收益大约对应 0.56% 的价格波动。
+
+动态锁盈：
+
+```python
+DYNAMIC_TP_ENABLED = True
+DYNAMIC_TP_ARM_RETURN = 0.22
+DYNAMIC_TP_RESTORE_RETURN = 0.18
+DYNAMIC_TP_REPRICE_GAP_USD = 0.5
+```
+
+意思是浮盈达到 22% 后开始观察。如果价格不再继续向有利方向创新高/低，就尝试把止盈单改到实时价格附近；如果收益回落到 18% 以下，就恢复普通止盈目标。
+
+### 止损和风险守卫
+
+当前程序中的止损/风控手段：
+
+- 固定亏损条件止损：按策略风险资金乘以 `COPY_FIXED_LOSS_STOP_RATIO` 计算。
+- 强平线保护：根据 OKX 同步的真实强平价更新条件止损。
+- 固定止损头仓缓冲：如果补仓会让止损太接近头仓，就跳过。
+- 灾难止损：头仓逆向达到阈值且浮亏达到比例时，平掉当前仓位并继续运行。
+- 布林中轨成本止损：多单中轨跌到成本、空单中轨涨到成本时平仓。
+- 趋势风险守卫：默认只提醒并冻结补仓，不直接市价平仓。
+
+关键参数：
+
+```python
+COPY_FIXED_LOSS_STOP_RATIO = 0.95
+FIXED_LOSS_HEAD_BUFFER_PCT = 0.05
+DISASTER_HEAD_DROP_PCT = 0.05
+DISASTER_LOSS_RATIO = 0.7
+BOLL_MID_COST_STOP_ENABLED = True
+TREND_RISK_GUARD_ENABLED = True
+TREND_RISK_GUARD_CLOSE_ENABLED = False
+TREND_RISK_FREEZE_ADDON_ENABLED = True
+TREND_RISK_SCORE_THRESHOLD = 5
+```
+
+### 固本、滚仓和带单保护
+
+默认固本模式：
+
+```python
+TRADING_ACCOUNT_TARGET = 50
+ROLLING_COMPOUND_ENABLED = False
+```
+
+盈利后，实际已实现盈利会从交易账户划转到资金账户；亏损后会尝试从资金账户补回目标资金。资金不足时，程序不会新开仓，但仍会持续记录价格和布林带。
+
+滚仓模式：
+
+```python
+ROLLING_COMPOUND_ENABLED = True
+```
+
+开启后盈利不划走，交易账户利润继续参与下一轮开仓、补仓、固定止损和灾难止损计算。
+
+带单保护：
+
+```python
+CROSS_COPY_PROTECT_ENABLED = False
+CROSS_COPY_PROTECT_EQUITY_USDT = 500.0
+CROSS_COPY_DYNAMIC_SIZING_ENABLED = False
+```
+
+开启后会保留一部分账户权益作为保护资金。若同时开启滚仓，有效策略资金为：
+
+```text
+账户总权益 - CROSS_COPY_PROTECT_EQUITY_USDT
+```
+
+### 本地看板
+
+看板会读取实时状态和历史 log，用于查看：
+
+- 当前价格、布林带、持仓和权益。
+- 单日开仓、补仓、平仓记录。
+- 实际收益。
+- 图表上的头仓、补仓、平仓和风险事件标记。
+
+### 优化器
+
+运行：
+
+```powershell
+.\optimize_report.bat
+```
+
+优化器会读取本地 log，按当前策略逻辑做离线回放。当前只接入核心参数，避免网格过大：
+
+```text
+FIRST_BATCH_RATIO
+MAX_TOTAL_ENTRY_RATIO
+MIN_ENTRY_GAP_USD
+MIN_BOLL_WIDTH_PCT
+ENTRY_MAX_BOLL_WIDTH_PCT
+ENTRY_DISASTER_SCORE_THRESHOLD
+SECOND_BATCH_DYNAMIC_*
+DYNAMIC_*_RATIO
+TP_TARGET_MARGIN_RETURN
+DYNAMIC_TP_ARM_RETURN
+DYNAMIC_TP_RESTORE_RETURN
+BOLL_MID_COST_STOP_ENABLED
+```
+
+报告会输出收益、回撤、最小强平缓冲、是否 wipeout、交易次数和信号次数。它适合做参数方向判断，但不是订单簿级别的成交模拟。
+
+### GitHub 注意事项
+
+建议提交：
+
+- `src/`
+- `backtest/log_parameter_optimizer.py`
+- `README.md`
+- `start.bat`
+- `optimize_report.bat`
+- `assets/`
+
+不要提交：
+
+- `.env`
+- `.idea/`
+- `logs/`
+- `logs_cleaned/`
+- `backtest/.cache/`
+- 下载的历史行情数据
+- 极端行情模拟输出
+- 临时 tunnel/log 文件
+
+### Current Core Defaults
+
+```python
+INST_ID = "ETH-USDT-SWAP"
+LEVER = 50
+PRICE_LOG_INTERVAL = 1
+POLL_INTERVAL = 3
+TRADING_ACCOUNT_TARGET = 50
+FIRST_BATCH_RATIO = 0.1
+MAX_TOTAL_ENTRY_RATIO = 0.8
+MIN_ENTRY_GAP_USD = 6
+MIN_BOLL_WIDTH_PCT = 0.015
+ENTRY_MAX_BOLL_WIDTH_PCT = 0.028
+ENTRY_DISASTER_SCORE_THRESHOLD = 4
 TP_TARGET_MARGIN_RETURN = 0.28
 DYNAMIC_TP_ARM_RETURN = 0.22
 DYNAMIC_TP_RESTORE_RETURN = 0.18
-
-COPY_FIXED_LOSS_STOP_RATIO = 0.95
-DISASTER_HEAD_DROP_PCT = 0.05
-DISASTER_LOSS_RATIO = 0.7
-
-TRADING_ACCOUNT_TARGET = 200
-CROSS_COPY_PROTECT_ENABLED = True
-CROSS_COPY_PROTECT_EQUITY_USDT = 500.0
-CROSS_COPY_DYNAMIC_SIZING_ENABLED = True
+ROLLING_COMPOUND_ENABLED = False
 ```
-
-## GitHub 注意事项
-
-`.gitignore` 默认应排除：
-
-```text
-.env
-logs/
-logs_cleaned/
-.idea/
-*.zip
-backtest/results/
-src/config.py.bak
-backtest/extreme_log_simulator.py
-```
-
-提交前建议检查：
-
-```powershell
-git status --short
-git diff --cached --check
-```
-
-确认没有 API 密钥、运行日志、清理日志副本、优化结果、极端行情模拟文件或大型数据文件后再推送。

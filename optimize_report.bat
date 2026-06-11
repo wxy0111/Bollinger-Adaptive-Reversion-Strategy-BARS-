@@ -13,9 +13,10 @@ echo OKX log parameter optimizer
 echo ========================================
 echo Reading logs and replaying slim core live-logic parameters with Optuna.
 echo Default replay uses 3s final replay, current sizing, and add-on guards.
-echo This searches only the core risk/profit knobs:
-echo TP-space width, max Bollinger width, entry gap,
-echo first/second/later sizing, fixed-loss/disaster stops, and add-on gap max,
+echo This searches only the selected core risk/profit knobs:
+echo min/max Bollinger width, entry gap, entry disaster score,
+echo first/second/later sizing, total entry cap,
+echo target TP, dynamic TP arm/restore, and Boll-mid cost stop,
 echo then writes a balanced report with walk-forward validation.
 echo.
 

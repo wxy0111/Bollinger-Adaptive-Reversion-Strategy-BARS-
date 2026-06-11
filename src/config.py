@@ -325,6 +325,10 @@ DISASTER_STOP_ENABLED = True
 DISASTER_HEAD_DROP_PCT = 0.05
 DISASTER_LOSS_RATIO = 0.7
 
+# Bollinger-mid cost stop.
+# 均线成本止损：持仓中实时布林中轨穿过持仓均价时，市价平掉当前仓位。
+BOLL_MID_COST_STOP_ENABLED = True
+
 # Trend risk guard.
 # 趋势风险守卫：开启后进行趋势恶化评分，达到阈值会打印日志并发送微信通知。
 TREND_RISK_GUARD_ENABLED = True
@@ -358,6 +362,11 @@ TREND_RISK_NOTIFY_INTERVAL_SEC = 3600
 # Strategy target capital.
 # 策略目标资金：开仓/补仓按这个目标资金计算；平仓后利润划走，亏损从资金账户补回。
 TRADING_ACCOUNT_TARGET = 50
+
+# Rolling compound mode.
+# 滚仓模式：开启后盈利不再自动划转到资金账户，开仓/补仓/策略止损按真实有效权益计算。
+# 若同时开启 CROSS_COPY_PROTECT_ENABLED，有效权益 = 账户总权益 - CROSS_COPY_PROTECT_EQUITY_USDT。
+ROLLING_COMPOUND_ENABLED = False
 
 # Cross-margin copy-protection mode.
 # 全仓带单保护：保护固定账户权益，策略只使用可用策略资金部分。
