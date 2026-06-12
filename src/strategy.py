@@ -28,6 +28,7 @@ from src.config import (
     ENTRY_DISASTER_FILTER_ENABLED, ENTRY_DISASTER_SCORE_THRESHOLD,
     ENTRY_DISASTER_KLINE_COUNT, ENTRY_DISASTER_WIDTH_EXPAND,
     ENTRY_DISASTER_TP_DISTANCE_MULT, ENTRY_DISASTER_EXPECTED_RETURN,
+    ENTRY_DISASTER_FAR_MID_RATIO,
     TP_TARGET_MARGIN_RETURN, DYNAMIC_TP_ENABLED,
     DYNAMIC_TP_ARM_RETURN, DYNAMIC_TP_RESTORE_RETURN,
     DYNAMIC_TP_REPRICE_GAP_USD,
@@ -1348,8 +1349,10 @@ class BollPinStrategy:
                 reasons.append("lower_band_down")
             if mids[-1] < mids[0]:
                 reasons.append("mid_down")
-            if mark_price < mid:
-                reasons.append("below_mid")
+            current_width = float(last["boll_width"])
+            mid_ratio = (mid - mark_price) / current_width if current_width > 0 else 0.0
+            if mid_ratio >= ENTRY_DISASTER_FAR_MID_RATIO:
+                reasons.append("far_below_mid")
         elif direction == "short":
             if all(highs[i] > highs[i - 1] for i in range(1, len(highs))):
                 reasons.append("higher_highs")
@@ -1357,8 +1360,10 @@ class BollPinStrategy:
                 reasons.append("upper_band_up")
             if mids[-1] > mids[0]:
                 reasons.append("mid_up")
-            if mark_price > mid:
-                reasons.append("above_mid")
+            current_width = float(last["boll_width"])
+            mid_ratio = (mark_price - mid) / current_width if current_width > 0 else 0.0
+            if mid_ratio >= ENTRY_DISASTER_FAR_MID_RATIO:
+                reasons.append("far_above_mid")
         else:
             return None
 

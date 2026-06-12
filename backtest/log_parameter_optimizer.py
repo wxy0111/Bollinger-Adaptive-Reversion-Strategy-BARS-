@@ -104,6 +104,7 @@ from src.config import (
     ENTRY_DISASTER_WIDTH_EXPAND,
     ENTRY_DISASTER_TP_DISTANCE_MULT,
     ENTRY_DISASTER_EXPECTED_RETURN,
+    ENTRY_DISASTER_FAR_MID_RATIO,
     MIN_ENTRY_GAP_USD,
     MIN_BOLL_WIDTH_FLOOR_USD,
     MIN_HEAD_LIQ_BUFFER_PCT,
@@ -186,6 +187,7 @@ class Params:
     entry_disaster_width_expand: float = ENTRY_DISASTER_WIDTH_EXPAND
     entry_disaster_tp_distance_mult: float = ENTRY_DISASTER_TP_DISTANCE_MULT
     entry_disaster_expected_return: float = ENTRY_DISASTER_EXPECTED_RETURN
+    entry_disaster_far_mid_ratio: float = ENTRY_DISASTER_FAR_MID_RATIO
     addon_max_width_enabled: int = int(ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED)
     addon_max_width_pct: float = ADDON_MAX_BOLL_WIDTH_PCT
     addon_max_width_usd: float = ADDON_MAX_BOLL_WIDTH_USD
@@ -583,7 +585,7 @@ class LogReplay:
             return None
 
         price = float(row.price)
-        _, mid, _, _ = self._bands(row)
+        _, mid, _, current_width = self._bands(row)
         lows = [item["low"] for item in recent]
         highs = [item["high"] for item in recent]
         lowers = [item["lower"] for item in recent]
@@ -599,8 +601,9 @@ class LogReplay:
                 reasons.append("lower_band_down")
             if mids[-1] < mids[0]:
                 reasons.append("mid_down")
-            if price < mid:
-                reasons.append("below_mid")
+            mid_ratio = (mid - price) / current_width if current_width > 0 else 0.0
+            if mid_ratio >= self.params.entry_disaster_far_mid_ratio:
+                reasons.append("far_below_mid")
         elif direction == "short":
             if all(highs[i] > highs[i - 1] for i in range(1, len(highs))):
                 reasons.append("higher_highs")
@@ -608,8 +611,9 @@ class LogReplay:
                 reasons.append("upper_band_up")
             if mids[-1] > mids[0]:
                 reasons.append("mid_up")
-            if price > mid:
-                reasons.append("above_mid")
+            mid_ratio = (price - mid) / current_width if current_width > 0 else 0.0
+            if mid_ratio >= self.params.entry_disaster_far_mid_ratio:
+                reasons.append("far_above_mid")
         else:
             return None
 
@@ -1836,6 +1840,7 @@ class LogReplay:
             "entry_disaster_width_expand": self.params.entry_disaster_width_expand,
             "entry_disaster_tp_distance_mult": self.params.entry_disaster_tp_distance_mult,
             "entry_disaster_expected_return": self.params.entry_disaster_expected_return,
+            "entry_disaster_far_mid_ratio": self.params.entry_disaster_far_mid_ratio,
             "addon_max_width_enabled": self.params.addon_max_width_enabled,
             "addon_max_width_pct": self.params.addon_max_width_pct,
             "addon_max_width_usd": self.params.addon_max_width_usd,
@@ -2263,6 +2268,7 @@ def current_config_params(args) -> Params:
         entry_disaster_width_expand=ENTRY_DISASTER_WIDTH_EXPAND,
         entry_disaster_tp_distance_mult=ENTRY_DISASTER_TP_DISTANCE_MULT,
         entry_disaster_expected_return=ENTRY_DISASTER_EXPECTED_RETURN,
+        entry_disaster_far_mid_ratio=ENTRY_DISASTER_FAR_MID_RATIO,
         addon_max_width_enabled=int(ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED),
         addon_max_width_pct=ADDON_MAX_BOLL_WIDTH_PCT,
         addon_max_width_usd=ADDON_MAX_BOLL_WIDTH_USD,
@@ -2416,6 +2422,9 @@ def params_from_report_row(row: dict) -> Params:
         ),
         entry_disaster_expected_return=row.get(
             "entry_disaster_expected_return", ENTRY_DISASTER_EXPECTED_RETURN
+        ),
+        entry_disaster_far_mid_ratio=row.get(
+            "entry_disaster_far_mid_ratio", ENTRY_DISASTER_FAR_MID_RATIO
         ),
         addon_max_width_enabled=row.get("addon_max_width_enabled", int(ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED)),
         addon_max_width_pct=row.get("addon_max_width_pct", ADDON_MAX_BOLL_WIDTH_PCT),

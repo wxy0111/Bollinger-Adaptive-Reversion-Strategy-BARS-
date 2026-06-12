@@ -123,11 +123,14 @@ ENTRY_MAX_BOLL_WIDTH_PCT = 0.028
 ENTRY_MAX_BOLL_WIDTH_USD = 80.0
 ENTRY_DISASTER_FILTER_ENABLED = True
 ENTRY_DISASTER_SCORE_THRESHOLD = 4
+ENTRY_DISASTER_FAR_MID_RATIO = 0.85
 NO_NEW_EXTREME_TICKS = 2
 REPRICE_GAP_USD = 0.5
 ```
 
 The effective minimum Bollinger width is calculated by the live strategy from the configured width rules. `BOLL_WIDTH_TP_SPACE_ENABLED` is currently available but disabled by default.
+
+`ENTRY_DISASTER_FAR_MID_RATIO` replaces the old simple `below_mid` / `above_mid` entry-disaster reason. A fresh long signal is only scored as `far_below_mid` when `(boll_mid - price) / boll_width >= 0.85`; shorts use the mirrored `far_above_mid` check. This avoids blocking normal band-break entries just because they are naturally below or above the middle band.
 
 ### Add-on Logic
 
@@ -380,6 +383,7 @@ flowchart TD
 MIN_BOLL_WIDTH_PCT = 0.015
 ENTRY_MAX_BOLL_WIDTH_PCT = 0.028
 ENTRY_DISASTER_SCORE_THRESHOLD = 4
+ENTRY_DISASTER_FAR_MID_RATIO = 0.85
 NO_NEW_EXTREME_TICKS = 2
 REPRICE_GAP_USD = 0.5
 ```
@@ -520,6 +524,7 @@ MIN_ENTRY_GAP_USD
 MIN_BOLL_WIDTH_PCT
 ENTRY_MAX_BOLL_WIDTH_PCT
 ENTRY_DISASTER_SCORE_THRESHOLD
+ENTRY_DISASTER_FAR_MID_RATIO
 SECOND_BATCH_DYNAMIC_*
 DYNAMIC_*_RATIO
 TP_TARGET_MARGIN_RETURN
@@ -566,6 +571,7 @@ MIN_ENTRY_GAP_USD = 6
 MIN_BOLL_WIDTH_PCT = 0.015
 ENTRY_MAX_BOLL_WIDTH_PCT = 0.028
 ENTRY_DISASTER_SCORE_THRESHOLD = 4
+ENTRY_DISASTER_FAR_MID_RATIO = 0.85
 TP_TARGET_MARGIN_RETURN = 0.28
 DYNAMIC_TP_ARM_RETURN = 0.22
 DYNAMIC_TP_RESTORE_RETURN = 0.18
