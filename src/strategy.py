@@ -55,6 +55,7 @@ from src.config import (
     LIQ_WARNING_REPEAT_SEC,
     NO_NEW_EXTREME_TICKS,
     REPRICE_GAP_USD, INSIDE_BAND_CANCEL_KLINES,
+    PENDING_ORDER_BAND_GUARD_ENABLED,
     STRATEGY_EQUITY_CAP_USDT, CT_VAL, CONTRACT_STEP,
     TRADING_ACCOUNT_TARGET,
     ROLLING_COMPOUND_ENABLED,
@@ -1694,6 +1695,7 @@ class BollPinStrategy:
                 f"ordId={pending_batch.ord_id}: {exc}"
             )
         self._state.remove_batch(pending_batch.ord_id)
+        self._last_entry_check_kline_ts = None
         self._save_runtime_state()
 
     async def _cancel_pending_if_addon_guards_fail(self, client: OKXClient, df, last, pending_batch) -> bool:
@@ -1992,9 +1994,7 @@ class BollPinStrategy:
             self._probe_kline_ts = last["ts"]
             self._probe_direction = direction
             self._probe_entry_price = mark_price
-            self._last_plan_kline_ts = last["ts"]
             self._last_plan_entry_price = mark_price
-            self._last_batch_kline_ts = last["ts"]
 
     def _intrabar_probe_direction(self, df, last, mark_price: float) -> str:
         """Return signal side when mark price is outside the current band."""
@@ -2006,6 +2006,54 @@ class BollPinStrategy:
             return "short"
 
         return "none"
+
+    def _pending_order_still_breaks_band(self, last, pending_batch) -> bool:
+        """Return whether a pending entry price is still outside the current band."""
+        lower = float(last["boll_lower"])
+        upper = float(last["boll_upper"])
+        if self._state.direction == "long":
+            return float(pending_batch.price) <= lower
+        if self._state.direction == "short":
+            return float(pending_batch.price) >= upper
+        return True
+
+    async def _cancel_pending_if_order_returns_inside_band(
+        self,
+        client: OKXClient,
+        last,
+        pending_batch,
+    ) -> bool:
+        """Cancel a pending entry when its order price is no longer outside the band."""
+        if not PENDING_ORDER_BAND_GUARD_ENABLED:
+            return False
+        if pending_batch is None:
+            return False
+        if self._pending_order_still_breaks_band(last, pending_batch):
+            return False
+
+        lower = float(last["boll_lower"])
+        upper = float(last["boll_upper"])
+        label = "first batch" if pending_batch.batch_idx == 0 else f"batch {pending_batch.batch_idx + 1}"
+        log_check(
+            f"Pending {label} order returned inside Bollinger band; cancel "
+            f"direction={self._state.direction} order={pending_batch.price:.2f} "
+            f"lower={lower:.2f} upper={upper:.2f}"
+        )
+        await self._cancel_entry_orders(client)
+        self._inside_band_kline_count = 0
+        self._last_inside_band_kline_ts = None
+        self._last_entry_check_kline_ts = None
+
+        if not self._state.is_active():
+            self._last_plan_kline_ts = None
+            self._last_batch_kline_ts = None
+            self._last_plan_entry_price = 0.0
+            self._reset_probe_state()
+            self._state.reset()
+            self._clear_runtime_state()
+        else:
+            self._save_runtime_state()
+        return True
 
     async def _cancel_pending_if_inside_too_long(self, client: OKXClient, last, mark_price: float) -> bool:
         """Cancel a pending entry after enough consecutive inside-band candles."""
@@ -2149,13 +2197,13 @@ class BollPinStrategy:
         if pending_batch is not None:
             if await self._cancel_pending_if_trend_risk_freeze(client, pending_batch):
                 return
+            if await self._cancel_pending_if_order_returns_inside_band(client, last, pending_batch):
+                return
             if self._last_batch_kline_ts is not None and last["ts"] == self._last_batch_kline_ts:
                 return
             if await self._cancel_pending_if_width_too_narrow(client, last, mark_price):
                 return
             if await self._cancel_pending_if_addon_width_too_wide(client, last, mark_price, pending_batch):
-                return
-            if await self._cancel_pending_if_inside_too_long(client, last, mark_price):
                 return
             if await self._cancel_pending_if_addon_guards_fail(client, df, last, pending_batch):
                 return
@@ -2252,7 +2300,7 @@ class BollPinStrategy:
         log_check(f"Add-on batch triggered: batch={next_idx + 1} direction={self._state.direction}")
         self._log_plan(next_plan, mark_price)
         if await self._place_batch_orders(client, next_plan, remaining_batches_placed=False):
-            self._last_batch_kline_ts = kline_ts
+            self._save_runtime_state()
 
     async def _maybe_reprice_pending_batch(self, client: OKXClient, df, last, equity: float,
                                            mark_price: float, pending_batch):
@@ -2339,7 +2387,9 @@ class BollPinStrategy:
         await client.cancel_order(INST_ID, pending_batch.ord_id)
         self._state.remove_batch(pending_batch.ord_id)
         if await self._place_batch_orders(client, next_plan, remaining_batches_placed=False):
-            self._last_batch_kline_ts = kline_ts
+            self._save_runtime_state()
+        else:
+            self._last_entry_check_kline_ts = None
         self._save_runtime_state()
 
     async def _maybe_reprice_probe_batch(self, client: OKXClient, df, last, equity: float, mark_price: float):
@@ -2348,6 +2398,8 @@ class BollPinStrategy:
         if pending_batch is None or pending_batch.batch_idx != 0:
             return
 
+        if await self._cancel_pending_if_order_returns_inside_band(client, last, pending_batch):
+            return
         if await self._cancel_pending_if_width_too_narrow(client, last, mark_price):
             return
         if await self._cancel_probe_if_width_too_wide(client, last, mark_price):
@@ -2357,9 +2409,6 @@ class BollPinStrategy:
         if self._last_entry_check_kline_ts is not None and kline_ts == self._last_entry_check_kline_ts:
             return
         self._last_entry_check_kline_ts = kline_ts
-
-        if await self._cancel_pending_if_inside_too_long(client, last, mark_price):
-            return
 
         if not self._boll_width_ok(last, mark_price):
             self._log_boll_width_skip("probe_reprice_skip", last, mark_price)
@@ -2418,9 +2467,7 @@ class BollPinStrategy:
             self._probe_kline_ts = kline_ts
             self._probe_direction = direction
             self._probe_entry_price = mark_price
-            self._last_plan_kline_ts = kline_ts
             self._last_plan_entry_price = mark_price
-            self._last_batch_kline_ts = kline_ts
         self._save_runtime_state()
 
     def _plan_order_at(self, plan, batch_idx: int):
@@ -2634,7 +2681,6 @@ class BollPinStrategy:
         )
         self._log_plan(recovery_plan, mark_price)
         if await self._place_batch_orders(client, recovery_plan, remaining_batches_placed=False):
-            self._last_batch_kline_ts = last["ts"]
             self._last_recovery_kline_ts = last["ts"]
 
 
@@ -2694,7 +2740,7 @@ class BollPinStrategy:
                     )
                     if fill_ts is not None:
                         filled_kline_ts = fill_ts
-                    newly_filled.append((batch_idx, fill_ts or kline_ts))
+                    newly_filled.append((batch_idx, fill_ts or kline_ts, fill_price))
                     filled_this_tick = True
                 elif order_info.get("state") in ("canceled", "cancelled"):
                     canceled_batches.append(batch)
@@ -2709,7 +2755,10 @@ class BollPinStrategy:
 
         if filled_this_tick:
             self._last_batch_kline_ts = filled_kline_ts or kline_ts
-            for batch_idx, fill_ts in newly_filled:
+            for batch_idx, fill_ts, fill_price in newly_filled:
+                if batch_idx == 0:
+                    self._last_plan_kline_ts = fill_ts or kline_ts
+                    self._last_plan_entry_price = fill_price
                 self._start_addon_extreme_guard_from_fill(
                     df,
                     self._state.direction,
@@ -3205,15 +3254,19 @@ class BollPinStrategy:
     async def _cancel_entry_orders(self, client: OKXClient):
         """Cancel all local unfilled entry orders."""
         kept_batches = []
+        canceled_any = False
         for batch in self._state.batches:
             if batch.filled:
                 kept_batches.append(batch)
                 continue
+            canceled_any = True
             try:
                 await client.cancel_order(INST_ID, batch.ord_id)
             except Exception as e:
                 logger.warning(f"Cancel remaining add-on order failed ordId={batch.ord_id}: {e}")
         self._state.batches = kept_batches
+        if canceled_any:
+            self._last_entry_check_kline_ts = None
         self._save_runtime_state()
 
     async def _cancel_untriggered_entry_orders(self, client: OKXClient, last, mark_price: float):
@@ -3331,6 +3384,9 @@ class BollPinStrategy:
                         batch.price = fill_price
                         if fill_kline_ts is not None:
                             self._last_batch_kline_ts = fill_kline_ts
+                            if batch.batch_idx == 0:
+                                self._last_plan_kline_ts = fill_kline_ts
+                                self._last_plan_entry_price = fill_price
                     except Exception:
                         pass
                     batch.filled = True
@@ -3368,6 +3424,8 @@ class BollPinStrategy:
                 continue
             if fill_kline_ts is not None:
                 self._last_batch_kline_ts = fill_kline_ts
+                if batch.batch_idx == 0:
+                    self._last_plan_kline_ts = fill_kline_ts
                 changed = True
             if fill_sz > 0 and abs(fill_sz - batch.sz) > 1e-8:
                 logger.info(
@@ -3382,6 +3440,8 @@ class BollPinStrategy:
                     f"{batch.price:.2f} -> {fill_price:.2f}"
                 )
                 batch.price = fill_price
+                if batch.batch_idx == 0:
+                    self._last_plan_entry_price = fill_price
                 changed = True
         if changed:
             self._save_runtime_state()

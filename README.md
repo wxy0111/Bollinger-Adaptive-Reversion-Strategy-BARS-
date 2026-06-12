@@ -8,6 +8,8 @@ BARS is a local OKX futures strategy for `ETH-USDT-SWAP`. It trades Bollinger-ba
 
 This repository is for research and personal automation only. Futures trading with leverage can lose money quickly. Review every parameter before live use.
 
+Release notes are tracked in [CHANGELOG.md](CHANGELOG.md). Check it before uploading or restoring a GitHub version.
+
 ## English
 
 ### What It Does
@@ -126,11 +128,30 @@ ENTRY_DISASTER_SCORE_THRESHOLD = 4
 ENTRY_DISASTER_FAR_MID_RATIO = 0.85
 NO_NEW_EXTREME_TICKS = 2
 REPRICE_GAP_USD = 0.5
+PENDING_ORDER_BAND_GUARD_ENABLED = True
 ```
 
 The effective minimum Bollinger width is calculated by the live strategy from the configured width rules. `BOLL_WIDTH_TP_SPACE_ENABLED` is currently available but disabled by default.
 
 `ENTRY_DISASTER_FAR_MID_RATIO` replaces the old simple `below_mid` / `above_mid` entry-disaster reason. A fresh long signal is only scored as `far_below_mid` when `(boll_mid - price) / boll_width >= 0.85`; shorts use the mirrored `far_above_mid` check. This avoids blocking normal band-break entries just because they are naturally below or above the middle band.
+
+### Pending Order Maintenance
+
+Pending entry orders are maintained separately from real fills:
+
+- A placed-but-unfilled order does not lock the current 15-minute candle.
+- A canceled or repriced order does not lock the current candle.
+- Only a real fill locks the candle, so each 15-minute candle can have at most one actual entry or add-on fill.
+- `PENDING_ORDER_BAND_GUARD_ENABLED` cancels stale pending entries when the order price is no longer outside the current Bollinger band.
+
+Band-guard rules:
+
+```text
+Long pending order: keep only when order_price <= current lower band.
+Short pending order: keep only when order_price >= current upper band.
+```
+
+This keeps the strategy consistent with the band-break entry idea while still allowing the same candle to re-evaluate and re-place orders if nothing has filled yet.
 
 ### Add-on Logic
 
@@ -276,6 +297,7 @@ The optimizer replays local logs with live-like sizing and current risk guards. 
 - `MIN_BOLL_WIDTH_PCT`
 - `ENTRY_MAX_BOLL_WIDTH_PCT`
 - `ENTRY_DISASTER_SCORE_THRESHOLD`
+- `ENTRY_DISASTER_FAR_MID_RATIO`
 - `SECOND_BATCH_DYNAMIC_*`
 - `DYNAMIC_*_RATIO`
 - `TP_TARGET_MARGIN_RETURN`
@@ -572,6 +594,7 @@ MIN_BOLL_WIDTH_PCT = 0.015
 ENTRY_MAX_BOLL_WIDTH_PCT = 0.028
 ENTRY_DISASTER_SCORE_THRESHOLD = 4
 ENTRY_DISASTER_FAR_MID_RATIO = 0.85
+PENDING_ORDER_BAND_GUARD_ENABLED = True
 TP_TARGET_MARGIN_RETURN = 0.28
 DYNAMIC_TP_ARM_RETURN = 0.22
 DYNAMIC_TP_RESTORE_RETURN = 0.18

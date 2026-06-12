@@ -150,6 +150,11 @@ REPRICE_GAP_USD = 0.5
 # 兼容保留：当前主要按K线更新和价格阈值维护挂单。
 INSIDE_BAND_CANCEL_KLINES = 2
 
+# Cancel pending entry orders when the order price is no longer outside the
+# current Bollinger band. Long orders must stay at/below the lower band; short
+# orders must stay at/above the upper band.
+PENDING_ORDER_BAND_GUARD_ENABLED = True
+
 # Reserved: first-batch wall-clock expiry is disabled.
 # 保留参数：45秒未成交撤单逻辑已停用。
 # PROBE_ORDER_TTL_SEC = 45

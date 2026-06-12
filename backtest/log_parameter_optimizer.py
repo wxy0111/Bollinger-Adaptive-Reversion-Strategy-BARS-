@@ -114,6 +114,7 @@ from src.config import (
     NO_NEW_EXTREME_TICKS,
     OKX_LIQ_FEE_RATE,
     OKX_MAINTENANCE_MARGIN_RATE,
+    PENDING_ORDER_BAND_GUARD_ENABLED,
     POLL_INTERVAL,
     REPRICE_GAP_USD,
     SECOND_BATCH_DYNAMIC_BASE_RATIO,
@@ -1377,13 +1378,38 @@ class LogReplay:
             }
         )
         self.last_plan_price = price
-        self.last_batch_kline = row.kline_ts
         self.last_entry_check_kline = row.kline_ts
         self.entry_time = str(row.ts)
         self._try_fill_pending(row)
 
+    def _pending_order_still_breaks_band(self, row) -> bool:
+        if self.pos.pending is None:
+            return True
+        lower, _, upper, _ = self._bands(row)
+        if self.pos.direction == "long":
+            return self.pos.pending.price <= lower
+        if self.pos.direction == "short":
+            return self.pos.pending.price >= upper
+        return True
+
+    def _cancel_pending_if_order_returns_inside_band(self, row) -> bool:
+        if not PENDING_ORDER_BAND_GUARD_ENABLED:
+            return False
+        if self.pos.pending is None:
+            return False
+        if self._pending_order_still_breaks_band(row):
+            return False
+        self.inside_cancel += 1
+        self.pos.pending = None
+        self.last_entry_check_kline = None
+        if not self.pos.is_active():
+            self.pos.reset()
+        return True
+
     def _maintain_plan(self, row) -> None:
         if self.pos.pending is not None:
+            if self._cancel_pending_if_order_returns_inside_band(row):
+                return
             if not self._width_ok(row):
                 self.width_cancel += 1
                 self.pos.pending = None
@@ -1481,7 +1507,6 @@ class LogReplay:
                 "note": "琛ヤ粨鎸傚崟",
             }
         )
-        self.last_batch_kline = row.kline_ts
         self.last_entry_check_kline = row.kline_ts
         self._try_fill_pending(row)
 
