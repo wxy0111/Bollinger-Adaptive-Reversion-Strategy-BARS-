@@ -281,11 +281,20 @@ TP_PROFIT_USD = 10.0
 # 默认止盈收益率：0.25=保证金收益25%。
 TP_TARGET_MARGIN_RETURN = 0.28
 
+# Narrow Bollinger entry mode.
+# When width is below 1.5%, entries are allowed but use a closer TP and smaller
+# first batch because the available mean-reversion space is smaller.
+LOW_BOLL_WIDTH_TP_ENABLED = False
+LOW_BOLL_WIDTH_REF_PCT = 0.015
+LOW_BOLL_WIDTH_MIN_TP_RETURN = 0.08
+LOW_BOLL_WIDTH_MAX_TP_RETURN = 0.28
+LOW_BOLL_WIDTH_TP_CAPTURE_RATIO = 0.35
+LOW_BOLL_WIDTH_SIZE_MULT = 0.5
+
 # Dynamic take-profit lock.
-# 动态锁盈：达到启动收益后，如价格不再创新高/低，则按实时价格附近止盈。
+# 动态锁盈：达到启动收益后，如价格不再创新高/低，则按实时价格附近止盈；启动后不再恢复普通止盈。
 DYNAMIC_TP_ENABLED = True
 DYNAMIC_TP_ARM_RETURN = 0.22
-DYNAMIC_TP_RESTORE_RETURN = 0.18
 DYNAMIC_TP_REPRICE_GAP_USD = 0.5
 
 # Bollinger take-profit compression exit.
@@ -332,8 +341,9 @@ DISASTER_HEAD_DROP_PCT = 0.05
 DISASTER_LOSS_RATIO = 0.7
 
 # Bollinger-mid cost stop.
-# 均线成本止损：持仓中实时布林中轨穿过持仓均价时，市价平掉当前仓位。
+# 均线成本触发止盈重定价：布林中轨穿过持仓均价时，把止盈压到动态锁盈启动收益附近，不市价平仓。
 BOLL_MID_COST_STOP_ENABLED = True
+BOLL_MID_COST_TP_RETURN = 0.05
 
 # Trend risk guard.
 # 趋势风险守卫：开启后进行趋势恶化评分，达到阈值会打印日志并发送微信通知。
@@ -372,7 +382,7 @@ TRADING_ACCOUNT_TARGET = 50
 # Rolling compound mode.
 # 滚仓模式：开启后盈利不再自动划转到资金账户，开仓/补仓/策略止损按真实有效权益计算。
 # 若同时开启 CROSS_COPY_PROTECT_ENABLED，有效权益 = 账户总权益 - CROSS_COPY_PROTECT_EQUITY_USDT。
-ROLLING_COMPOUND_ENABLED = False
+ROLLING_COMPOUND_ENABLED = True
 
 # Cross-margin copy-protection mode.
 # 全仓带单保护：保护固定账户权益，策略只使用可用策略资金部分。

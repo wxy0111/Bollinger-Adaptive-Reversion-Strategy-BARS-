@@ -4,6 +4,40 @@ All notable strategy, risk-control, dashboard, and optimizer changes should be r
 
 Use this file to answer: what changed, why it changed, how it was tested, and what risk remains.
 
+## 2026-06-15 - Narrow Bollinger TP Experiment Default Off
+
+### Added
+
+- Added optional narrow-Bollinger take-profit controls:
+  - `LOW_BOLL_WIDTH_TP_ENABLED`
+  - `LOW_BOLL_WIDTH_REF_PCT`
+  - `LOW_BOLL_WIDTH_MIN_TP_RETURN`
+  - `LOW_BOLL_WIDTH_MAX_TP_RETURN`
+  - `LOW_BOLL_WIDTH_TP_CAPTURE_RATIO`
+  - `LOW_BOLL_WIDTH_SIZE_MULT`
+- Added per-cycle TP target persistence so a restarted strategy keeps the TP target selected at entry time.
+- Added `BOLL_MID_COST_TP_RETURN` for the Bollinger-mid cost trigger.
+
+### Changed
+
+- `LOW_BOLL_WIDTH_TP_ENABLED` is disabled by default.
+- The default entry width remains `MIN_BOLL_WIDTH_PCT = 0.015`.
+- Dynamic TP no longer restores to the original TP target after activation.
+- Bollinger-mid cost trigger now reprices take-profit near `BOLL_MID_COST_TP_RETURN` instead of immediately market-closing the position.
+- Log replay and optimizer parameter reports now mirror the live narrow-width TP and Bollinger-mid TP reprice logic.
+
+### Tested
+
+- `python -m compileall -q main.py src backtest`
+- Current settings replay at 15-second sampling.
+- Parameter spot checks for relaxed width thresholds: `0.008`, `0.010`, `0.012`, and `0.014`.
+
+### Risk Notes
+
+- Relaxing the minimum Bollinger width below 1.5% performed poorly in the tested local and extreme logs, even with closer TP and smaller first batch.
+- The feature remains available for future controlled experiments, but it is intentionally off by default.
+- GitHub CLI was not authenticated in this environment, so PR creation may require a separate authenticated session.
+
 ## 2026-06-12
 
 ### Added
@@ -121,7 +155,7 @@ Use this file to answer: what changed, why it changed, how it was tested, and wh
 ### Take Profit And Stop Logic
 
 - Replaced fixed 10U take-profit distance with margin-return based take profit.
-- Added dynamic take-profit lock and restore thresholds.
+- Added dynamic take-profit lock thresholds.
 - Added fixed-loss conditional stop based on strategy risk equity.
 - Added liquidation-line stop refresh.
 - Added disaster stop that closes the current position and keeps the program running.

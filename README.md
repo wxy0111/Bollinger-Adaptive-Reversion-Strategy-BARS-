@@ -135,6 +135,27 @@ The effective minimum Bollinger width is calculated by the live strategy from th
 
 `ENTRY_DISASTER_FAR_MID_RATIO` replaces the old simple `below_mid` / `above_mid` entry-disaster reason. A fresh long signal is only scored as `far_below_mid` when `(boll_mid - price) / boll_width >= 0.85`; shorts use the mirrored `far_above_mid` check. This avoids blocking normal band-break entries just because they are naturally below or above the middle band.
 
+#### Narrow Bollinger Entry Experiment
+
+The strategy can optionally support entries below the historical 1.5% Bollinger-width threshold, but this mode is **disabled by default** after local and extreme log replays showed materially worse risk when the threshold was relaxed.
+
+```python
+LOW_BOLL_WIDTH_TP_ENABLED = False
+LOW_BOLL_WIDTH_REF_PCT = 0.015
+LOW_BOLL_WIDTH_MIN_TP_RETURN = 0.08
+LOW_BOLL_WIDTH_MAX_TP_RETURN = 0.28
+LOW_BOLL_WIDTH_TP_CAPTURE_RATIO = 0.35
+LOW_BOLL_WIDTH_SIZE_MULT = 0.5
+```
+
+When enabled and the entry width is below `LOW_BOLL_WIDTH_REF_PCT`, the strategy locks a closer take-profit target for that position cycle:
+
+```text
+tp_return = width_pct * LEVER * LOW_BOLL_WIDTH_TP_CAPTURE_RATIO
+```
+
+The result is clamped between `LOW_BOLL_WIDTH_MIN_TP_RETURN` and `LOW_BOLL_WIDTH_MAX_TP_RETURN`. The first batch is also scaled by `LOW_BOLL_WIDTH_SIZE_MULT`. To actually allow lower-width entries, `MIN_BOLL_WIDTH_PCT` must still be lowered deliberately, for example in a backtest branch first.
+
 ### Pending Order Maintenance
 
 Pending entry orders are maintained separately from real fills:
@@ -203,11 +224,10 @@ Dynamic take-profit can lock profit before the default target:
 ```python
 DYNAMIC_TP_ENABLED = True
 DYNAMIC_TP_ARM_RETURN = 0.22
-DYNAMIC_TP_RESTORE_RETURN = 0.18
 DYNAMIC_TP_REPRICE_GAP_USD = 0.5
 ```
 
-If floating profit reaches the arm threshold and price stops making favorable extremes, the strategy can reprice the take-profit order near the current price. If profit falls below the restore threshold, it restores the normal target.
+If floating profit reaches the arm threshold and price stops making favorable extremes, the strategy can reprice the take-profit order near the current price. Once armed, it no longer restores the original target automatically.
 
 ### Stop Loss And Risk Guards
 
@@ -217,7 +237,7 @@ Current stop and risk modules:
 - Fixed-loss stop: places a stop based on strategy risk equity and `COPY_FIXED_LOSS_STOP_RATIO`.
 - Fixed-loss head buffer: blocks add-ons if the fixed-loss stop would move too close to the first entry.
 - Disaster stop: closes the current position when head adverse move and loss ratio both hit the configured threshold, then keeps the program running.
-- Bollinger-mid cost stop: market-closes when Bollinger midline crosses the position cost.
+- Bollinger-mid cost stop: reprices take-profit near the configured cost-midline target when Bollinger midline crosses the position cost.
 - Trend risk guard: scores trend deterioration, sends alerts, and can freeze add-ons; market close is disabled by default.
 
 Key parameters:
@@ -231,6 +251,7 @@ DISASTER_STOP_ENABLED = True
 DISASTER_HEAD_DROP_PCT = 0.05
 DISASTER_LOSS_RATIO = 0.7
 BOLL_MID_COST_STOP_ENABLED = True
+BOLL_MID_COST_TP_RETURN = 0.05
 TREND_RISK_GUARD_ENABLED = True
 TREND_RISK_GUARD_CLOSE_ENABLED = False
 TREND_RISK_FREEZE_ADDON_ENABLED = True
@@ -302,8 +323,8 @@ The optimizer replays local logs with live-like sizing and current risk guards. 
 - `DYNAMIC_*_RATIO`
 - `TP_TARGET_MARGIN_RETURN`
 - `DYNAMIC_TP_ARM_RETURN`
-- `DYNAMIC_TP_RESTORE_RETURN`
 - `BOLL_MID_COST_STOP_ENABLED`
+- `BOLL_MID_COST_TP_RETURN`
 
 The report compares the current config with optimized candidates and includes PnL, drawdown, liquidation buffer, wipeout flags, trades, and signal counts. It is a log replay, not an order-book fill simulator.
 
@@ -320,7 +341,7 @@ BARS 是一个运行在本地的 OKX ETH 永续合约布林带均值回归策略
 - 头仓只在破轨且通过布林宽度、趋势和灾难过滤后挂单。
 - 补仓按真实成交价、动态间距、动态比例和风险守卫执行。
 - 止盈按保证金收益率计算，支持动态锁盈。
-- 止损包含固定亏损条件单、强平保护、灾难止损、布林中轨成本止损、趋势风险冻结补仓。
+- 止损包含固定亏损条件单、强平保护、灾难止损、布林中轨成本止盈重定价、趋势风险冻结补仓。
 - 平仓后可选择固本划转，或开启滚仓让利润留在交易账户。
 - 本地网页看板展示行情、日志、交易点位和收益。
 - 优化器只优化核心收益/风险参数。
@@ -381,7 +402,7 @@ flowchart TD
     D --> E{"已有持仓?"}
     E -- "否" --> F["检查头仓过滤"]
     F --> G["挂头仓或跳过"]
-    E -- "是" --> H["检查趋势风险/灾难止损/中轨止损"]
+    E -- "是" --> H["检查趋势风险/灾难止损/中轨止盈重定价"]
     H --> I["检查补仓条件"]
     I --> J["挂补仓或冻结"]
     J --> K["更新看板和日志"]
@@ -456,11 +477,20 @@ TP_TARGET_MARGIN_RETURN = 0.28
 ```python
 DYNAMIC_TP_ENABLED = True
 DYNAMIC_TP_ARM_RETURN = 0.22
-DYNAMIC_TP_RESTORE_RETURN = 0.18
 DYNAMIC_TP_REPRICE_GAP_USD = 0.5
 ```
 
-意思是浮盈达到 22% 后开始观察。如果价格不再继续向有利方向创新高/低，就尝试把止盈单改到实时价格附近；如果收益回落到 18% 以下，就恢复普通止盈目标。
+意思是浮盈达到 22% 后开始观察。如果价格不再继续向有利方向创新高/低，就尝试把止盈单改到实时价格附近；触发后不再自动恢复普通止盈目标。
+
+窄布林止盈实验默认关闭：
+
+```python
+LOW_BOLL_WIDTH_TP_ENABLED = False
+LOW_BOLL_WIDTH_REF_PCT = 0.015
+LOW_BOLL_WIDTH_SIZE_MULT = 0.5
+```
+
+如果以后手动降低 `MIN_BOLL_WIDTH_PCT` 允许低于 1.5% 入场，开启该实验后会按当前布林宽度压缩本轮止盈，并降低头仓大小。当前回测显示放宽到 0.8%-1.4% 风险明显变差，所以默认不启用。
 
 ### 止损和风险守卫
 
@@ -470,7 +500,7 @@ DYNAMIC_TP_REPRICE_GAP_USD = 0.5
 - 强平线保护：根据 OKX 同步的真实强平价更新条件止损。
 - 固定止损头仓缓冲：如果补仓会让止损太接近头仓，就跳过。
 - 灾难止损：头仓逆向达到阈值且浮亏达到比例时，平掉当前仓位并继续运行。
-- 布林中轨成本止损：多单中轨跌到成本、空单中轨涨到成本时平仓。
+- 布林中轨成本止盈重定价：多单中轨跌到成本、空单中轨涨到成本时，把止盈压到 `BOLL_MID_COST_TP_RETURN` 附近，不再直接市价平仓。
 - 趋势风险守卫：默认只提醒并冻结补仓，不直接市价平仓。
 
 关键参数：
@@ -481,6 +511,7 @@ FIXED_LOSS_HEAD_BUFFER_PCT = 0.05
 DISASTER_HEAD_DROP_PCT = 0.05
 DISASTER_LOSS_RATIO = 0.7
 BOLL_MID_COST_STOP_ENABLED = True
+BOLL_MID_COST_TP_RETURN = 0.05
 TREND_RISK_GUARD_ENABLED = True
 TREND_RISK_GUARD_CLOSE_ENABLED = False
 TREND_RISK_FREEZE_ADDON_ENABLED = True
@@ -551,8 +582,8 @@ SECOND_BATCH_DYNAMIC_*
 DYNAMIC_*_RATIO
 TP_TARGET_MARGIN_RETURN
 DYNAMIC_TP_ARM_RETURN
-DYNAMIC_TP_RESTORE_RETURN
 BOLL_MID_COST_STOP_ENABLED
+BOLL_MID_COST_TP_RETURN
 ```
 
 报告会输出收益、回撤、最小强平缓冲、是否 wipeout、交易次数和信号次数。它适合做参数方向判断，但不是订单簿级别的成交模拟。
@@ -597,6 +628,7 @@ ENTRY_DISASTER_FAR_MID_RATIO = 0.85
 PENDING_ORDER_BAND_GUARD_ENABLED = True
 TP_TARGET_MARGIN_RETURN = 0.28
 DYNAMIC_TP_ARM_RETURN = 0.22
-DYNAMIC_TP_RESTORE_RETURN = 0.18
+LOW_BOLL_WIDTH_TP_ENABLED = False
+BOLL_MID_COST_TP_RETURN = 0.05
 ROLLING_COMPOUND_ENABLED = False
 ```

@@ -15,7 +15,7 @@ from pathlib import Path
 from loguru import logger
 
 from src.config import (
-    INST_ID, BAR_15M, LEVER, KLINE_LIMIT,
+    INST_ID, BAR_15M, LEVER, KLINE_LIMIT, FLAG,
     BOLL_INCLUDE_CURRENT,
     PRICE_LOG_INTERVAL, POLL_INTERVAL, BOLL_PERIOD,
     TP_PROFIT_USD, MIN_ENTRY_GAP_USD,
@@ -30,7 +30,10 @@ from src.config import (
     ENTRY_DISASTER_TP_DISTANCE_MULT, ENTRY_DISASTER_EXPECTED_RETURN,
     ENTRY_DISASTER_FAR_MID_RATIO,
     TP_TARGET_MARGIN_RETURN, DYNAMIC_TP_ENABLED,
-    DYNAMIC_TP_ARM_RETURN, DYNAMIC_TP_RESTORE_RETURN,
+    LOW_BOLL_WIDTH_TP_ENABLED, LOW_BOLL_WIDTH_REF_PCT,
+    LOW_BOLL_WIDTH_MIN_TP_RETURN, LOW_BOLL_WIDTH_MAX_TP_RETURN,
+    LOW_BOLL_WIDTH_TP_CAPTURE_RATIO, LOW_BOLL_WIDTH_SIZE_MULT,
+    DYNAMIC_TP_ARM_RETURN,
     DYNAMIC_TP_REPRICE_GAP_USD,
     BOLL_TP_COMPRESSION_ENABLED, BOLL_TP_COMPRESSION_MIN_RETURN,
     BOLL_TP_COMPRESSION_EXIT_OFFSET_USD,
@@ -67,7 +70,7 @@ from src.config import (
     COPY_FIXED_LOSS_STOP_RATIO,
     FIXED_LOSS_HEAD_BUFFER_ENABLED, FIXED_LOSS_HEAD_BUFFER_PCT,
     DISASTER_STOP_ENABLED, DISASTER_HEAD_DROP_PCT, DISASTER_LOSS_RATIO,
-    BOLL_MID_COST_STOP_ENABLED,
+    BOLL_MID_COST_STOP_ENABLED, BOLL_MID_COST_TP_RETURN,
     TREND_RISK_GUARD_ENABLED, TREND_RISK_GUARD_CLOSE_ENABLED,
     TREND_RISK_FREEZE_ADDON_ENABLED,
     TREND_RISK_SCORE_THRESHOLD,
@@ -147,6 +150,8 @@ class BollPinStrategy:
         self._trend_entry_time = None
         self._trend_last_notify_ts = 0.0
         self._trend_risk_guard_active = False
+        self._last_tp_improve_skip_key = None
+        self._cycle_tp_target_margin_return = TP_TARGET_MARGIN_RETURN
 
     async def run(self):
         """Run the strategy loop until stopped."""
@@ -159,6 +164,7 @@ class BollPinStrategy:
                 await client.set_leverage(INST_ID, LEVER)
             except Exception as e:
                 logger.warning(f"Set leverage failed; please verify {LEVER}x in OKX App: {e}")
+            await self._run_startup_api_check(client)
             self._load_runtime_state()
             self._load_close_cooldown()
             await self._ensure_fixed_batch_sizes(client)
@@ -177,6 +183,38 @@ class BollPinStrategy:
                     logger.exception(f"tick 异常: {e}")
                 await asyncio.sleep(PRICE_LOG_INTERVAL)
 
+
+    async def _run_startup_api_check(self, client: OKXClient) -> None:
+        """Log a lightweight OKX read-api check once at startup."""
+        log_check(f"Startup API check start inst={INST_ID} flag={FLAG} mode={'demo' if FLAG == '1' else 'live'}")
+        try:
+            mark_price = await client.get_mark_price(INST_ID)
+            klines = await client.get_klines(INST_ID, BAR_15M, limit=2)
+            balance = await client.get_balance("USDT")
+            equity = await client.get_equity("USDT")
+            account_config = await client.get_account_config()
+            instrument = await client.get_instrument(INST_ID)
+            position = await client.get_position(INST_ID)
+            open_orders = await client.get_open_orders(INST_ID)
+
+            pos_mode = account_config.get("posMode", "--")
+            min_sz = str(instrument.get("minSz") or CONTRACT_STEP)
+            lot_sz = instrument.get("lotSz", "--")
+            tick_sz = instrument.get("tickSz", "--")
+            log_check(
+                f"Startup API check read-ok mark={mark_price:.2f} klines={len(klines)} "
+                f"balance={balance:.4f} equity={equity:.4f} posMode={pos_mode} "
+                f"minSz={min_sz} lotSz={lot_sz} tickSz={tick_sz} "
+                f"position={'yes' if position else 'none'} open_orders={len(open_orders)}"
+            )
+
+            if pos_mode not in ("long_short_mode", "--", ""):
+                logger.warning(
+                    f"OKX posMode={pos_mode}; strategy sends posSide=long/short. "
+                    "If real orders fail, switch OKX to hedge/long-short mode or adapt posSide."
+                )
+        except Exception as exc:
+            logger.warning(f"Startup API read check failed; continuing strategy startup: {exc}")
 
     def _desired_sizing_equity(self, account_equity: float) -> float:
         """Return the fixed equity base used to size strategy batches."""
@@ -547,7 +585,7 @@ class BollPinStrategy:
         return True
 
     async def _check_boll_mid_cost_stop(self, client: OKXClient, row) -> bool:
-        """Market-close when Bollinger mid crosses the position average entry."""
+        """Reprice take-profit when Bollinger mid crosses the position average entry."""
         if not BOLL_MID_COST_STOP_ENABLED:
             return False
         if not self._state.is_active():
@@ -574,12 +612,23 @@ class BollPinStrategy:
         if not triggered:
             return False
 
+        new_tp = self._tp_price_from_margin_return(direction, avg_entry, BOLL_MID_COST_TP_RETURN)
+        if new_tp <= 0:
+            return False
+        if self._state.plan_tp_price > 0 and abs(new_tp - self._state.plan_tp_price) < DYNAMIC_TP_REPRICE_GAP_USD:
+            return False
+
+        old_tp = self._state.plan_tp_price
+        self._state.plan_tp_price = new_tp
+        self._dynamic_tp_active = True
         log_action(
-            "Boll mid cost stop triggered "
+            "Boll mid cost TP repriced "
             f"direction={direction} boll_mid={boll_mid:.2f} "
-            f"avg_entry={avg_entry:.2f} sz={self._state.total_sz}"
+            f"avg_entry={avg_entry:.2f} old_tp={old_tp:.2f} new_tp={new_tp:.2f} "
+            f"target_return={BOLL_MID_COST_TP_RETURN:.2%} sz={self._state.total_sz}"
         )
-        await self._emergency_close(client, reason="boll_mid_cost_stop")
+        await self._update_tp(client)
+        self._save_runtime_state()
         return True
 
     def _floor_contract_size(self, raw_sz: float) -> float:
@@ -609,7 +658,7 @@ class BollPinStrategy:
     def _dynamic_entry_ratio(self, batch_idx: int, candidate_price: float) -> float:
         """Calculate the next entry margin ratio from recent price gaps."""
         if batch_idx == 0:
-            return FIRST_BATCH_RATIO
+            return FIRST_BATCH_RATIO * self._current_head_size_mult()
         if batch_idx == 1:
             head_batch = next(
                 (batch for batch in self._state.filled_batches() if batch.batch_idx == 0),
@@ -790,15 +839,26 @@ class BollPinStrategy:
         expected_distance = abs(old_tp - old_avg)
         required = max(ADDON_TP_IMPROVE_MIN_USD, expected_distance * ADDON_TP_IMPROVE_RATIO)
         if improve + 1e-9 >= required:
+            self._last_tp_improve_skip_key = None
             return True
 
-        log_check(
-            f"Add-on skipped: TP improvement too small batch={batch_idx + 1} "
-            f"old_tp={old_tp:.2f} new_tp={new_tp:.2f} "
-            f"improve={improve:.2f} required={required:.2f} "
-            f"avg={old_avg:.2f} new_avg={new_avg:.2f} "
-            f"price={candidate_price:.2f} sz={candidate_sz}"
+        skip_key = (
+            batch_idx,
+            round(candidate_price, 2),
+            round(candidate_sz, 4),
+            round(old_avg, 2),
+            round(new_avg, 2),
+            round(required, 2),
         )
+        if skip_key != self._last_tp_improve_skip_key:
+            log_check(
+                f"Add-on skipped: TP improvement too small batch={batch_idx + 1} "
+                f"old_tp={old_tp:.2f} new_tp={new_tp:.2f} "
+                f"improve={improve:.2f} required={required:.2f} "
+                f"avg={old_avg:.2f} new_avg={new_avg:.2f} "
+                f"price={candidate_price:.2f} sz={candidate_sz}"
+            )
+            self._last_tp_improve_skip_key = skip_key
         return False
 
     def _sync_known_batch_sizes(self) -> bool:
@@ -930,6 +990,9 @@ class BollPinStrategy:
                 "fixed_batch_sizes": self._fixed_batch_sizes,
                 "capital_shortage_active": self._capital_shortage_active,
                 "dynamic_tp_active": self._dynamic_tp_active and self._state.is_active(),
+                "cycle_tp_target_margin_return": (
+                    self._cycle_tp_target_margin_return if self._state.has_working_plan() else TP_TARGET_MARGIN_RETURN
+                ),
                 "entry_extreme_gap_pct": self._entry_extreme_gap_pct if self._state.has_working_plan() else 0.0,
                 "entry_extreme_gap_mult": self._entry_extreme_gap_mult if self._state.has_working_plan() else 1.0,
                 "addon_extreme_guard_price": (
@@ -987,6 +1050,7 @@ class BollPinStrategy:
     def _clear_runtime_state(self):
         """Delete the persisted runtime-state file."""
         self._dynamic_tp_active = False
+        self._cycle_tp_target_margin_return = TP_TARGET_MARGIN_RETURN
         self._entry_extreme_gap_pct = 0.0
         self._entry_extreme_gap_mult = 1.0
         self._addon_extreme_guard_price = 0.0
@@ -1053,6 +1117,53 @@ class BollPinStrategy:
         self._probe_direction = "none"
         self._probe_entry_price = 0.0
 
+    def _clamp_tp_return(self, value: float) -> float:
+        """Clamp a TP return into the configured narrow-width range."""
+        low = max(LOW_BOLL_WIDTH_MIN_TP_RETURN, 0.0)
+        high = min(LOW_BOLL_WIDTH_MAX_TP_RETURN, TP_TARGET_MARGIN_RETURN)
+        if high <= 0:
+            return TP_TARGET_MARGIN_RETURN
+        if low > high:
+            low = high
+        return max(low, min(high, value))
+
+    def _low_boll_width_tp_return(self, last, mark_price: float) -> float:
+        """Return the TP target for a first entry in the current width regime."""
+        if (
+            not LOW_BOLL_WIDTH_TP_ENABLED
+            or mark_price <= 0
+            or LEVER <= 0
+            or LOW_BOLL_WIDTH_REF_PCT <= 0
+        ):
+            return TP_TARGET_MARGIN_RETURN
+        width = float(last["boll_width"])
+        width_pct = width / mark_price if mark_price > 0 else 0.0
+        if width_pct >= LOW_BOLL_WIDTH_REF_PCT:
+            return TP_TARGET_MARGIN_RETURN
+        raw_return = width_pct * LEVER * LOW_BOLL_WIDTH_TP_CAPTURE_RATIO
+        return self._clamp_tp_return(raw_return)
+
+    def _set_cycle_tp_target_from_boll(self, last, mark_price: float, reason: str) -> None:
+        """Lock the current plan's TP target from Bollinger width."""
+        target = self._low_boll_width_tp_return(last, mark_price)
+        previous = self._cycle_tp_target_margin_return
+        self._cycle_tp_target_margin_return = target
+        width = float(last["boll_width"])
+        width_pct = width / mark_price if mark_price > 0 else 0.0
+        if abs(previous - target) >= 1e-9:
+            log_check(
+                f"{reason}: cycle TP target return set to {target:.2%} "
+                f"width={width:.2f} width_pct={width_pct:.2%}"
+            )
+
+    def _current_head_size_mult(self) -> float:
+        """Return first-batch size multiplier for the active TP regime."""
+        if not LOW_BOLL_WIDTH_TP_ENABLED:
+            return 1.0
+        if self._cycle_tp_target_margin_return >= TP_TARGET_MARGIN_RETURN - 1e-9:
+            return 1.0
+        return max(0.0, min(1.0, LOW_BOLL_WIDTH_SIZE_MULT))
+
     def _load_runtime_state(self):
         """Load local strategy state from disk when available."""
         if not STATE_FILE.exists():
@@ -1104,6 +1215,9 @@ class BollPinStrategy:
             if ROLLING_COMPOUND_ENABLED and self._capital_shortage_active:
                 self._capital_shortage_active = False
             self._dynamic_tp_active = bool(strategy.get("dynamic_tp_active", False))
+            self._cycle_tp_target_margin_return = float(
+                strategy.get("cycle_tp_target_margin_return", TP_TARGET_MARGIN_RETURN) or TP_TARGET_MARGIN_RETURN
+            )
             self._entry_extreme_gap_pct = float(strategy.get("entry_extreme_gap_pct", 0) or 0)
             self._entry_extreme_gap_mult = float(strategy.get("entry_extreme_gap_mult", 1) or 1)
             self._addon_extreme_guard_price = float(strategy.get("addon_extreme_guard_price", 0) or 0)
@@ -1808,7 +1922,19 @@ class BollPinStrategy:
         """Return take-profit distance targeting a margin-return percentage."""
         if avg_entry <= 0:
             return TP_PROFIT_USD
-        return round(avg_entry * TP_TARGET_MARGIN_RETURN / LEVER, 2)
+        target_return = self._cycle_tp_target_margin_return or TP_TARGET_MARGIN_RETURN
+        return round(avg_entry * target_return / LEVER, 2)
+
+    def _tp_price_from_margin_return(self, direction: str, avg_entry: float, margin_return: float) -> float:
+        """Return a take-profit price for a target leveraged margin return."""
+        if avg_entry <= 0 or margin_return <= 0 or LEVER <= 0:
+            return 0.0
+        distance = round(avg_entry * margin_return / LEVER, 2)
+        if direction == "long":
+            return round(avg_entry + distance, 2)
+        if direction == "short":
+            return round(avg_entry - distance, 2)
+        return 0.0
 
     def _tp_price_from_avg(self, direction: str, avg_entry: float) -> float:
         """Return dynamic take-profit price from average entry."""
@@ -1830,20 +1956,11 @@ class BollPinStrategy:
         if not DYNAMIC_TP_ENABLED or not self._state.is_active():
             return
         ret = self._position_margin_return(mark_price)
-        target_tp = self._tp_price_from_avg(self._state.direction, self._state.avg_entry)
-
         if self._dynamic_tp_active:
-            if ret < DYNAMIC_TP_RESTORE_RETURN:
-                self._state.plan_tp_price = target_tp
-                self._dynamic_tp_active = False
-                log_check(
-                    f"Dynamic TP restored: return={ret:.2%} tp={target_tp:.2f}"
-                )
-                await self._update_tp(client)
-                self._save_runtime_state()
             return
 
-        if ret < DYNAMIC_TP_ARM_RETURN or ret >= TP_TARGET_MARGIN_RETURN:
+        target_return = self._cycle_tp_target_margin_return or TP_TARGET_MARGIN_RETURN
+        if ret < DYNAMIC_TP_ARM_RETURN or ret >= target_return:
             return
         if self._state.direction == "long" and self._still_making_new_high():
             return
@@ -1964,6 +2081,7 @@ class BollPinStrategy:
         if not self._can_open_new_plan(last["ts"], mark_price):
             return
 
+        self._set_cycle_tp_target_from_boll(last, mark_price, "probe_prepare")
         if not self._prepare_dynamic_batch_size(0, mark_price):
             return
 
@@ -2426,6 +2544,7 @@ class BollPinStrategy:
             self._save_runtime_state()
             return
 
+        self._set_cycle_tp_target_from_boll(last, mark_price, "probe_reprice")
         if not self._prepare_dynamic_batch_size(0, mark_price):
             self._save_runtime_state()
             return
@@ -2528,7 +2647,7 @@ class BollPinStrategy:
         self._state.direction      = plan.direction
         self._state.plan_liq_price = plan.liq_price
         self._state.plan_sl_price  = plan.sl_price
-        self._state.plan_tp_price  = plan.tp_price
+        self._state.plan_tp_price  = self._tp_price_from_avg(plan.direction, plan.avg_entry) if plan.avg_entry > 0 else plan.tp_price
 
         side     = "buy"  if plan.direction == "long"  else "sell"
         pos_side = plan.direction
@@ -3667,6 +3786,10 @@ class BollPinStrategy:
 
     async def _calibrate_capital_after_close(self, client: OKXClient) -> float:
         """Align trading account capital after realized-PnL transfer."""
+        if ROLLING_COMPOUND_ENABLED:
+            logger.info("[Capital] Rolling compound enabled; skip post-close capital calibration")
+            return 0.0
+
         target = self._capital_target_equity()
         if target <= 0:
             return 0.0
