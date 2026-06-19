@@ -376,13 +376,17 @@ TREND_RISK_NOTIFY_INTERVAL_SEC = 3600
 # =============================================================================
 
 # Strategy target capital.
-# 策略目标资金：开仓/补仓按这个目标资金计算；平仓后利润划走，亏损从资金账户补回。
-TRADING_ACCOUNT_TARGET = 50
+# 策略目标资金：开仓/补仓按这个目标资金计算；平仓后利润是否划走由 TRANSFER_PROFIT_AFTER_CLOSE_ENABLED 控制。
+TRADING_ACCOUNT_TARGET = 100
 
 # Rolling compound mode.
 # 滚仓模式：开启后盈利不再自动划转到资金账户，开仓/补仓/策略止损按真实有效权益计算。
 # 若同时开启 CROSS_COPY_PROTECT_ENABLED，有效权益 = 账户总权益 - CROSS_COPY_PROTECT_EQUITY_USDT。
-ROLLING_COMPOUND_ENABLED = True
+ROLLING_COMPOUND_ENABLED = False
+
+# Profit transfer after close.
+# 固本划转开关：False=平仓盈利/超额资金留在交易账户；亏损补回仍然按固本逻辑执行。
+TRANSFER_PROFIT_AFTER_CLOSE_ENABLED = False
 
 # Cross-margin copy-protection mode.
 # 全仓带单保护：保护固定账户权益，策略只使用可用策略资金部分。

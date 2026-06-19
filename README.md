@@ -265,8 +265,9 @@ Default fixed-capital mode:
 ```python
 TRADING_ACCOUNT_TARGET = 50
 ROLLING_COMPOUND_ENABLED = False
+TRANSFER_PROFIT_AFTER_CLOSE_ENABLED = False
 ```
-In this mode, entries and add-ons size from `TRADING_ACCOUNT_TARGET`. After a realized profit, the strategy transfers the realized profit from trading to funding. After a realized loss, it attempts to refill the trading account. If capital is insufficient, it pauses new entries but continues logging market data.
+In this mode, entries and add-ons size from `TRADING_ACCOUNT_TARGET`. After a realized profit, `TRANSFER_PROFIT_AFTER_CLOSE_ENABLED` controls whether profit is transferred from trading to funding. After a realized loss, it still attempts to refill the trading account. If capital is insufficient, it pauses new entries but continues logging market data.
 
 Rolling compound mode:
 
@@ -525,9 +526,10 @@ TREND_RISK_SCORE_THRESHOLD = 5
 ```python
 TRADING_ACCOUNT_TARGET = 50
 ROLLING_COMPOUND_ENABLED = False
+TRANSFER_PROFIT_AFTER_CLOSE_ENABLED = False
 ```
 
-盈利后，实际已实现盈利会从交易账户划转到资金账户；亏损后会尝试从资金账户补回目标资金。资金不足时，程序不会新开仓，但仍会持续记录价格和布林带。
+盈利后，是否把实际已实现盈利从交易账户划转到资金账户，由 `TRANSFER_PROFIT_AFTER_CLOSE_ENABLED` 控制；当前默认关闭，所以盈利留在交易账户。亏损后仍会尝试从资金账户补回目标资金。资金不足时，程序不会新开仓，但仍会持续记录价格和布林带。
 
 滚仓模式：
 
@@ -631,4 +633,5 @@ DYNAMIC_TP_ARM_RETURN = 0.22
 LOW_BOLL_WIDTH_TP_ENABLED = False
 BOLL_MID_COST_TP_RETURN = 0.05
 ROLLING_COMPOUND_ENABLED = False
+TRANSFER_PROFIT_AFTER_CLOSE_ENABLED = False
 ```

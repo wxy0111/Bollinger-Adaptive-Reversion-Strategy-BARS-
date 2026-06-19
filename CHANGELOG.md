@@ -4,6 +4,22 @@ All notable strategy, risk-control, dashboard, and optimizer changes should be r
 
 Use this file to answer: what changed, why it changed, how it was tested, and what risk remains.
 
+## 2026-06-19 - Profit Transfer Switch
+
+### Added
+
+- Added `TRANSFER_PROFIT_AFTER_CLOSE_ENABLED`.
+
+### Changed
+
+- When `TRANSFER_PROFIT_AFTER_CLOSE_ENABLED = False`, realized profit and excess trading-account balance stay in the trading account after a close.
+- Loss top-up from funding to trading still runs in fixed-capital mode.
+- README capital-mode documentation now describes the new switch.
+
+### Tested
+
+- `python -m compileall -q main.py src backtest tools`
+
 ## 2026-06-15 - Narrow Bollinger TP Experiment Default Off
 
 ### Added

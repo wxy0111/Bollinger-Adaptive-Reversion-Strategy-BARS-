@@ -62,6 +62,7 @@ from src.config import (
     STRATEGY_EQUITY_CAP_USDT, CT_VAL, CONTRACT_STEP,
     TRADING_ACCOUNT_TARGET,
     ROLLING_COMPOUND_ENABLED,
+    TRANSFER_PROFIT_AFTER_CLOSE_ENABLED,
     CROSS_COPY_PROTECT_ENABLED, CROSS_COPY_PROTECT_EQUITY_USDT,
     CROSS_COPY_DYNAMIC_SIZING_ENABLED,
     SIZING_EQUITY_LOG_THRESHOLD_USDT,
@@ -3816,6 +3817,12 @@ class BollPinStrategy:
                 return 0.0
 
             if diff > tolerance:
+                if not TRANSFER_PROFIT_AFTER_CLOSE_ENABLED:
+                    logger.info(
+                        f"[Capital] Profit transfer disabled; keep excess in trading account "
+                        f"value={account_value:.4f} target={target:.4f} excess={diff:.4f}"
+                    )
+                    return 0.0
                 trading_balance = await client.get_balance("USDT")
                 transfer_amt = round(min(diff, trading_balance), 4)
                 if transfer_amt < 0.01:
@@ -3882,6 +3889,12 @@ class BollPinStrategy:
                     return 0.0
 
                 if actual_pnl > 0:
+                    if not TRANSFER_PROFIT_AFTER_CLOSE_ENABLED:
+                        logger.info(
+                            f"[Capital] Profit transfer disabled; keep realized PnL "
+                            f"{actual_pnl:+.4f} USDT in trading account"
+                        )
+                        return actual_pnl
                     trading_bal = await client.get_balance("USDT")
                     transfer_amt = round(min(actual_pnl, trading_bal), 4)
                     if transfer_amt < 0.01:
@@ -3932,6 +3945,12 @@ class BollPinStrategy:
             diff = round(trading_bal - TRADING_ACCOUNT_TARGET, 4)
 
             if diff > 0.01:
+                if not TRANSFER_PROFIT_AFTER_CLOSE_ENABLED:
+                    logger.info(
+                        f"[Capital] Profit transfer disabled; keep excess trading balance "
+                        f"trading={trading_bal:.4f} target={TRADING_ACCOUNT_TARGET:.4f} excess={diff:.4f}"
+                    )
+                    return diff
                 logger.info(
                     f"[Capital] Profit +{diff:.4f} USDT; "
                     f"trading {trading_bal:.4f} -> {TRADING_ACCOUNT_TARGET:.4f}; transfer to funding"
@@ -3998,6 +4017,22 @@ class BollPinStrategy:
 
         excess = round(trading_balance - target, 4)
         if excess > tolerance:
+            if not TRANSFER_PROFIT_AFTER_CLOSE_ENABLED:
+                logger.info(
+                    f"[Capital] Profit transfer disabled; keep restored excess in trading account "
+                    f"value={trading_balance:.4f} target={target:.4f} excess={excess:.4f}"
+                )
+                excess = 0.0
+            if excess <= tolerance:
+                self._capital_shortage_active = False
+                self._save_runtime_state()
+                logger.info(
+                    f"[Capital] Trading account restored to target "
+                    f"{trading_balance:.4f}/{target:.4f} USDT"
+                )
+                await notify_capital_restored(trading_balance, target)
+                await self._ensure_fixed_batch_sizes(client)
+                return
             available = await client.get_balance("USDT")
             transfer_amt = round(min(excess, available), 4)
             if transfer_amt < 0.01:
