@@ -4,6 +4,77 @@ All notable strategy, risk-control, dashboard, and optimizer changes should be r
 
 Use this file to answer: what changed, why it changed, how it was tested, and what risk remains.
 
+## 2026-06-20 - Realized Close PnL From Fills
+
+### Changed
+
+- Changed close PnL reporting to prefer OKX fill history instead of whole-account equity differences.
+- Net close PnL now uses exchange-reported `fillPnl + fee`, so actual fees are included from the fills.
+- Account-equity movement is kept as a diagnostic log only and is ignored for close PnL because other positions can change account equity while this strategy closes.
+- When close fills are unavailable, the strategy falls back to estimated display PnL and skips realized-PnL rebalance instead of using trading-balance or account-equity differences.
+
+### Tested
+
+- `python -m compileall -q main.py src backtest tools`
+- `git diff --check -- src\strategy.py`
+
+## 2026-06-20 - Dashboard UX Status Strip And Safer History Loading
+
+### Added
+
+- Added a live trade status strip to the dashboard with:
+  - Current position.
+  - Unrealized PnL.
+  - Take-profit distance.
+  - Liquidation buffer.
+  - Daily PnL.
+  - Data age.
+- Added online, delayed, and offline dashboard freshness states.
+- Added history loading status and failure messages.
+
+### Changed
+
+- Reframed the risk ring as liquidation-buffer / safety-margin feedback with red, yellow, and green states.
+- Changed the history tab to default to the latest single-day log instead of auto-loading `全部日志`.
+- Kept `全部日志` available for manual full-period review, with a warning that it can take longer to parse.
+- Updated README dashboard documentation in English and Chinese.
+
+### Tested
+
+- `.venv\Scripts\python.exe -m py_compile src\dashboard.py`
+- Extracted dashboard JavaScript and checked it with `node --check`.
+- Checked `/api/logs`.
+- Checked single-day `/api/history`.
+- `git diff --check -- src\dashboard.py`
+
+### Risk Notes
+
+- Browser visual verification could not run in this sandboxed session, so final pixel/layout QA should be done after restarting the local dashboard.
+- Full `全部日志` parsing can still be slow on large log sets; it is now manual instead of automatic.
+
+## 2026-06-20 - WxPusher Notifications And Levels
+
+### Added
+
+- Added `NOTIFY_PROVIDER` with `serverchan`, `wxpusher`, and `none` options.
+- Added `NOTIFY_MIN_LEVEL` with `info`, `trade`, and `critical` levels.
+- Added WxPusher configuration:
+  - `WXPUSHER_APP_TOKEN`
+  - `WXPUSHER_UIDS`
+  - `WXPUSHER_TOPIC_IDS`
+
+### Changed
+
+- Rebuilt notification routing so all existing strategy notifications can use either ServerChan or WxPusher.
+- Classified routine submitted-order messages as `info`.
+- Classified fills, closes, and capital restoration as `trade`.
+- Classified liquidation warning, trend risk, capital shortage, drawdown, and cross-copy protection as `critical`.
+- Updated README and `.env.example` with WxPusher setup.
+
+### Tested
+
+- `python -m compileall -q main.py src backtest tools`
+
 ## 2026-06-19 - Profit Transfer Switch
 
 ### Added

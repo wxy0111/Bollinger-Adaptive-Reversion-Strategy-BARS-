@@ -3153,7 +3153,7 @@ class BollPinStrategy:
         try:
             fills = await client.get_fills_history(INST_ID, begin=begin_ms, end=end_ms, limit=100)
         except Exception as e:
-            logger.warning(f"Fetch close fills failed; fallback to balance diff: {e}")
+            logger.warning(f"Fetch close fills failed; fallback to estimated PnL: {e}")
             return None
 
         matched = []
@@ -3177,7 +3177,7 @@ class BollPinStrategy:
                     break
 
         if not matched:
-            logger.warning("No close fills found; fallback to balance diff for capital rebalance")
+            logger.warning("No close fills found; fallback to estimated PnL and skip realized-PnL rebalance")
             return None
 
         gross_pnl = 0.0
@@ -3241,9 +3241,8 @@ class BollPinStrategy:
                 avg_entry      = sum(b.price * b.sz for b in filled) / total_sz
             close_ord_id = self._state.tp_ord_id or ""
             actual_close = await self._fetch_actual_close_pnl(client, direction, total_sz, close_ord_id)
-            equity_close = await self._fetch_account_equity_close_pnl(client)
-            actual_pnl = equity_close["pnl"] if equity_close else (actual_close["pnl"] if actual_close else None)
-            pnl_source = "account_equity_diff" if equity_close else ("fills" if actual_close else "estimate")
+            actual_pnl = actual_close["pnl"] if actual_close else None
+            pnl_source = "fills" if actual_close else "estimate"
             if total_sz > 0 and avg_entry > 0:
                 if actual_close:
                     display_close_price = actual_close["avg_price"] or close_price
@@ -3254,15 +3253,6 @@ class BollPinStrategy:
                         f"close_avg={display_close_price:.2f} sz={display_sz:.2f} "
                         f"actual_pnl={pnl:+.4f} USDT fills={actual_close['fills']} "
                         f"fee={actual_close['fee']:+.4f} source={pnl_source}"
-                    )
-                elif equity_close:
-                    display_close_price = close_price
-                    display_sz = total_sz
-                    pnl = actual_pnl
-                    log_action(
-                        f"Position closed {direction} avg_entry={avg_entry:.2f} "
-                        f"close_ref={close_price:.2f} sz={total_sz:.2f} "
-                        f"actual_pnl={pnl:+.4f} USDT source={pnl_source}"
                     )
                 else:
                     from src.config import CT_VAL
@@ -3285,6 +3275,7 @@ class BollPinStrategy:
                 )
                 await notify_close(direction, avg_entry, display_close_price, pnl, display_sz)
 
+            await self._log_account_equity_diff_diagnostic(client)
             await self._cancel_entry_orders(client)
             await self._cancel_exchange_exit_orders(client)
             await self._cancel_exit_orders(client)
@@ -3346,8 +3337,8 @@ class BollPinStrategy:
                 await self._cancel_exit_orders(client)
                 await client.close_position(INST_ID, direction)
                 await asyncio.sleep(1)
-                equity_close = await self._fetch_account_equity_close_pnl(client)
-                actual_pnl = equity_close["pnl"] if equity_close else None
+                actual_close = await self._fetch_actual_close_pnl(client, direction, total_sz)
+                actual_pnl = actual_close["pnl"] if actual_close else None
                 if avg_entry > 0 and total_sz > 0:
                     if direction == "long":
                         pnl = (close_price - avg_entry) * total_sz * CT_VAL
@@ -3355,11 +3346,14 @@ class BollPinStrategy:
                         pnl = (avg_entry - close_price) * total_sz * CT_VAL
                     if actual_pnl is not None:
                         pnl = actual_pnl
+                        close_price = actual_close["avg_price"] or close_price
+                        total_sz = actual_close["sz"] or total_sz
                         log_action(
                             f"Emergency close actual_pnl={pnl:+.4f} USDT "
-                            f"source=account_equity_diff reason={reason}"
+                            f"source=fills reason={reason}"
                         )
                     await notify_close(direction, avg_entry, close_price, pnl, total_sz)
+                await self._log_account_equity_diff_diagnostic(client)
                 self._reset_probe_state()
                 self._state.reset()
                 self._clear_runtime_state()
@@ -3775,8 +3769,8 @@ class BollPinStrategy:
             return None
 
         pnl = round(end_value - start_value, 4)
-        log_action(
-            f"Actual close PnL from account equity diff actual_pnl={pnl:+.4f} USDT "
+        log_check(
+            f"Account equity diff observed diff={pnl:+.4f} USDT "
             f"start={start_value:.4f} end={end_value:.4f}"
         )
         return {
@@ -3784,6 +3778,17 @@ class BollPinStrategy:
             "start": round(start_value, 4),
             "end": round(end_value, 4),
         }
+
+    async def _log_account_equity_diff_diagnostic(self, client: OKXClient) -> None:
+        """Log whole-account equity movement without using it as trade PnL."""
+        equity_close = await self._fetch_account_equity_close_pnl(client)
+        if not equity_close:
+            return
+        log_check(
+            "Account equity diff diagnostic only; ignored for close PnL "
+            f"diff={equity_close['pnl']:+.4f} USDT "
+            f"start={equity_close['start']:.4f} end={equity_close['end']:.4f}"
+        )
 
     async def _calibrate_capital_after_close(self, client: OKXClient) -> float:
         """Align trading account capital after realized-PnL transfer."""
@@ -3934,59 +3939,11 @@ class BollPinStrategy:
                 await client.transfer(amt=top_up, from_acct="6", to_acct="18")
                 return actual_pnl
 
-            if CROSS_COPY_PROTECT_ENABLED:
-                logger.warning(
-                    "[Capital] Actual PnL unavailable in cross-copy mode; "
-                    "skip balance-diff rebalance to avoid moving protected trading equity"
-                )
-                return 0.0
-
-            trading_bal = await client.get_balance("USDT")
-            diff = round(trading_bal - TRADING_ACCOUNT_TARGET, 4)
-
-            if diff > 0.01:
-                if not TRANSFER_PROFIT_AFTER_CLOSE_ENABLED:
-                    logger.info(
-                        f"[Capital] Profit transfer disabled; keep excess trading balance "
-                        f"trading={trading_bal:.4f} target={TRADING_ACCOUNT_TARGET:.4f} excess={diff:.4f}"
-                    )
-                    return diff
-                logger.info(
-                    f"[Capital] Profit +{diff:.4f} USDT; "
-                    f"trading {trading_bal:.4f} -> {TRADING_ACCOUNT_TARGET:.4f}; transfer to funding"
-                )
-                await client.transfer(amt=diff, from_acct="18", to_acct="6")
-                return diff
-
-            elif diff < -0.01:
-                needed = abs(diff)
-                funding_bal = await client.get_funding_balance("USDT")
-                top_up = round(min(needed, funding_bal), 4)
-                shortage = top_up < needed
-                if shortage and top_up >= 0.01 and not self._capital_shortage_active:
-                    self._capital_shortage_active = True
-                    await notify_capital_shortage(trading_bal + top_up, TRADING_ACCOUNT_TARGET, funding_bal, top_up)
-                    self._save_runtime_state()
-                if top_up < 0.01:
-                    if not self._capital_shortage_active:
-                        self._capital_shortage_active = True
-                        await notify_capital_shortage(trading_bal, TRADING_ACCOUNT_TARGET, funding_bal, 0.0)
-                        self._save_runtime_state()
-                    logger.warning(
-                        f"[Capital] Funding balance insufficient ({funding_bal:.4f} USDT); "
-                        f"cannot top up trading account"
-                    )
-                    return diff
-                partial = " (partial top-up; funding insufficient)" if top_up < needed else ""
-                logger.info(
-                    f"[Capital] Loss {diff:.4f} USDT; "
-                    f"transfer {top_up:.4f} USDT from funding to trading{partial}"
-                )
-                await client.transfer(amt=top_up, from_acct="6", to_acct="18")
-                return diff
-
-            else:
-                logger.debug("[Capital] Balance is within 0.01 USDT of target; skip transfer")
+            logger.warning(
+                "[Capital] Realized close PnL unavailable; skip PnL rebalance "
+                "to avoid using whole-account balance/equity changes"
+            )
+            return 0.0
 
         except Exception as e:
             logger.warning(f"[Capital] Transfer failed; strategy continues: {e}")

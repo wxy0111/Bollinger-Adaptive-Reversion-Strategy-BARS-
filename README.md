@@ -57,6 +57,11 @@ OKX_SECRET_KEY=your_secret
 OKX_PASSPHRASE=your_passphrase
 OKX_FLAG=1
 SERVERCHAN_KEY=your_serverchan_send_key
+NOTIFY_PROVIDER=wxpusher
+NOTIFY_MIN_LEVEL=trade
+WXPUSHER_APP_TOKEN=your_wxpusher_app_token
+WXPUSHER_UIDS=your_wxpusher_uid
+WXPUSHER_TOPIC_IDS=
 ```
 
 2. Install dependencies in the existing virtual environment or create one:
@@ -78,16 +83,45 @@ python -m venv .venv
 http://localhost:8080
 ```
 
-### ServerChan Key
+### WeChat Notifications
 
-`SERVERCHAN_KEY` is used for WeChat notifications.
+BARS supports ServerChan and WxPusher.
+
+```python
+NOTIFY_PROVIDER = "serverchan"  # serverchan / wxpusher / none
+NOTIFY_MIN_LEVEL = "trade"      # info / trade / critical
+```
+
+Notification levels:
+
+- `info`: routine messages, such as submitted entry or add-on orders.
+- `trade`: fills, closes, capital restoration, and normal trade lifecycle events.
+- `critical`: liquidation warnings, trend-risk guard, capital shortage, and protection stops.
+
+The default `trade` level avoids pushing routine order-submission noise while still sending fills, closes, and risk events.
+
+ServerChan:
 
 1. Open [ServerChan](https://sct.ftqq.com/).
 2. Log in with WeChat.
 3. Copy your `SendKey`.
 4. Put it into `.env` as `SERVERCHAN_KEY=...`.
 
-The strategy sends notifications for program-driven entries, add-ons, closes, capital shortage/restoration, liquidation warnings, and trend-risk alerts.
+WxPusher:
+
+1. Open [WxPusher](https://wxpusher.zjiecode.com/docs/).
+2. Create an app and copy `appToken`.
+3. Follow or subscribe to the app and copy your `UID`.
+4. Put these into `.env`:
+
+```env
+NOTIFY_PROVIDER=wxpusher
+NOTIFY_MIN_LEVEL=trade
+WXPUSHER_APP_TOKEN=your_app_token
+WXPUSHER_UIDS=your_uid
+```
+
+Multiple UIDs can be comma-separated. Topic IDs are optional and can be placed in `WXPUSHER_TOPIC_IDS`.
 
 ### Runtime Rhythm
 
@@ -277,6 +311,13 @@ ROLLING_COMPOUND_ENABLED = True
 
 In rolling mode, realized profit stays in the trading account. Entry sizing, add-on sizing, fixed-loss stop, and disaster-stop risk use live effective equity instead of the fixed target.
 
+Realized PnL source:
+
+- Close notifications and realized-PnL capital handling use OKX fill history when available.
+- Net close PnL is calculated from exchange-reported `fillPnl + fee`, so taker/maker fees come from the actual fills instead of a local estimate.
+- Whole-account equity differences are logged only as diagnostics and are ignored for close PnL, because they can include unrelated floating PnL from other positions.
+- If close fills are not available yet, the strategy falls back to an estimated display PnL and skips realized-PnL rebalance for that close.
+
 Cross-copy protection can be combined with either mode:
 
 ```python
@@ -295,11 +336,14 @@ effective equity = account equity - CROSS_COPY_PROTECT_EQUITY_USDT
 
 The local dashboard shows:
 
+- Live trade status strip with current position, unrealized PnL, take-profit distance, liquidation buffer, daily PnL, and data age.
 - Live price and Bollinger state.
-- Runtime strategy state.
+- Runtime strategy state with online, delayed, and offline freshness indicators.
 - Historical log files.
 - Daily trades and realized profit from logs.
 - Chart markers for first entry, add-ons, exits, and risk events.
+
+The history tab defaults to the latest single-day log. The `全部日志` option remains available for full-period review, but it is no longer auto-loaded because large local log sets can take noticeably longer to parse.
 
 The dashboard is local-only by default and runs from the strategy process.
 
@@ -357,6 +401,11 @@ OKX_SECRET_KEY=你的OKX_SECRET
 OKX_PASSPHRASE=你的OKX密码短语
 OKX_FLAG=1
 SERVERCHAN_KEY=你的ServerChan_SendKey
+NOTIFY_PROVIDER=wxpusher
+NOTIFY_MIN_LEVEL=trade
+WXPUSHER_APP_TOKEN=你的WxPusher_APP_TOKEN
+WXPUSHER_UIDS=你的WxPusher_UID
+WXPUSHER_TOPIC_IDS=
 ```
 
 2. 安装依赖：
@@ -557,10 +606,14 @@ CROSS_COPY_DYNAMIC_SIZING_ENABLED = False
 
 看板会读取实时状态和历史 log，用于查看：
 
+- 顶部交易状态条：当前持仓、浮盈亏、止盈距离、强平缓冲、今日收益和数据延迟。
 - 当前价格、布林带、持仓和权益。
+- 策略数据状态：正常、延迟、离线/无数据。
 - 单日开仓、补仓、平仓记录。
 - 实际收益。
 - 图表上的头仓、补仓、平仓和风险事件标记。
+
+历史页默认加载最新单日日志，避免进入页面时自动解析全部历史日志导致卡顿；需要全量复盘时仍可手动选择 `全部日志`。
 
 ### 优化器
 

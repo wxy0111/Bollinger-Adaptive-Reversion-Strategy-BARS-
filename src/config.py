@@ -426,9 +426,23 @@ WEEKLY_EMA_PERIOD = 10
 # 11. Notification And Dashboard / 通知与本地看板
 # =============================================================================
 
+# Notification provider.
+# 通知通道：serverchan 或 wxpusher。
+NOTIFY_PROVIDER = os.getenv("NOTIFY_PROVIDER", "serverchan").lower()
+
+# Notification level filter.
+# 通知等级过滤：info=全部推送，trade=成交/平仓/资金/风险，critical=只推高风险。
+NOTIFY_MIN_LEVEL = os.getenv("NOTIFY_MIN_LEVEL", "trade").lower()
+
 # ServerChan SendKey from .env.
 # ServerChan微信推送密钥。
 SERVERCHAN_KEY = os.getenv("SERVERCHAN_KEY", "")
+
+# WxPusher config from .env.
+# WxPusher配置：UID可用逗号分隔；Topic ID也可用逗号分隔。
+WXPUSHER_APP_TOKEN = os.getenv("WXPUSHER_APP_TOKEN", "")
+WXPUSHER_UIDS = os.getenv("WXPUSHER_UIDS", "")
+WXPUSHER_TOPIC_IDS = os.getenv("WXPUSHER_TOPIC_IDS", "")
 
 # Local dashboard bind host and port.
 # 本地看板地址：http://localhost:8080
