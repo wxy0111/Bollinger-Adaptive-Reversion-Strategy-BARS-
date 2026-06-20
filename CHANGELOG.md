@@ -4,6 +4,29 @@ All notable strategy, risk-control, dashboard, and optimizer changes should be r
 
 Use this file to answer: what changed, why it changed, how it was tested, and what risk remains.
 
+## 2026-06-21 - Post-Close Same-Direction Entry Guard
+
+### Added
+
+- Added `POST_CLOSE_SAME_DIRECTION_PRICE_GUARD_ENABLED`.
+- Added `POST_CLOSE_SAME_DIRECTION_PRICE_GUARD_KLINES`.
+- Extended `logs/close_cooldown.json` to persist the last closed direction and last filled entry/add-on reference price.
+
+### Changed
+
+- The strategy still blocks new first-batch entries on the same candle as a close.
+- During the next configured candles, same-direction re-entry must not be worse than the previous cycle's last filled entry/add-on price:
+  - Long re-entry must be at or below the previous last filled price.
+  - Short re-entry must be at or above the previous last filled price.
+- Opposite-direction entries are not blocked by this guard.
+- The guard clears automatically after the configured candle window, including after a restart.
+
+### Tested
+
+- Direct `_can_open_new_plan` boundary check for same-candle block, 1-candle same-direction block, allowed better same-direction entry, allowed opposite-direction entry, and automatic expiry after the window.
+- `python -m compileall -q main.py src backtest tools`
+- `git diff --check -- src\strategy.py README.md CHANGELOG.md src\config.py`
+
 ## 2026-06-20 - Realized Close PnL From Fills
 
 ### Changed

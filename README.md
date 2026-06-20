@@ -147,6 +147,7 @@ A first batch is considered only when:
 - Entry disaster score does not block the signal.
 - The current candle has not already created a plan.
 - The price is not still making a fresh extreme according to the no-new-extreme rule.
+- After a close, the same candle is blocked; during the next 4 candles, same-direction re-entry must not be worse than the previous cycle's last filled entry/add-on price.
 
 Important entry parameters:
 
@@ -163,11 +164,15 @@ ENTRY_DISASTER_FAR_MID_RATIO = 0.85
 NO_NEW_EXTREME_TICKS = 2
 REPRICE_GAP_USD = 0.5
 PENDING_ORDER_BAND_GUARD_ENABLED = True
+POST_CLOSE_SAME_DIRECTION_PRICE_GUARD_ENABLED = True
+POST_CLOSE_SAME_DIRECTION_PRICE_GUARD_KLINES = 4
 ```
 
 The effective minimum Bollinger width is calculated by the live strategy from the configured width rules. `BOLL_WIDTH_TP_SPACE_ENABLED` is currently available but disabled by default.
 
 `ENTRY_DISASTER_FAR_MID_RATIO` replaces the old simple `below_mid` / `above_mid` entry-disaster reason. A fresh long signal is only scored as `far_below_mid` when `(boll_mid - price) / boll_width >= 0.85`; shorts use the mirrored `far_above_mid` check. This avoids blocking normal band-break entries just because they are naturally below or above the middle band.
+
+`POST_CLOSE_SAME_DIRECTION_PRICE_GUARD_ENABLED` persists the last close candle, direction, and last filled entry/add-on price in `logs/close_cooldown.json`. The same close candle cannot open a new first batch. For the next `POST_CLOSE_SAME_DIRECTION_PRICE_GUARD_KLINES` candles, a same-direction long entry must be at or below the previous last filled price, and a same-direction short entry must be at or above it. The guard is ignored for opposite-direction entries and is cleared automatically after the window expires, including after a restart.
 
 #### Narrow Bollinger Entry Experiment
 
@@ -681,6 +686,8 @@ ENTRY_MAX_BOLL_WIDTH_PCT = 0.028
 ENTRY_DISASTER_SCORE_THRESHOLD = 4
 ENTRY_DISASTER_FAR_MID_RATIO = 0.85
 PENDING_ORDER_BAND_GUARD_ENABLED = True
+POST_CLOSE_SAME_DIRECTION_PRICE_GUARD_ENABLED = True
+POST_CLOSE_SAME_DIRECTION_PRICE_GUARD_KLINES = 4
 TP_TARGET_MARGIN_RETURN = 0.28
 DYNAMIC_TP_ARM_RETURN = 0.22
 LOW_BOLL_WIDTH_TP_ENABLED = False

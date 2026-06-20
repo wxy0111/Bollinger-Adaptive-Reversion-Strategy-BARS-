@@ -59,6 +59,8 @@ from src.config import (
     NO_NEW_EXTREME_TICKS,
     REPRICE_GAP_USD, INSIDE_BAND_CANCEL_KLINES,
     PENDING_ORDER_BAND_GUARD_ENABLED,
+    POST_CLOSE_SAME_DIRECTION_PRICE_GUARD_ENABLED,
+    POST_CLOSE_SAME_DIRECTION_PRICE_GUARD_KLINES,
     STRATEGY_EQUITY_CAP_USDT, CT_VAL, CONTRACT_STEP,
     TRADING_ACCOUNT_TARGET,
     ROLLING_COMPOUND_ENABLED,
@@ -122,6 +124,8 @@ class BollPinStrategy:
         self._last_recovery_kline_ts = None
         self._last_entry_check_kline_ts = None
         self._last_close_kline_ts = None
+        self._last_closed_direction = "none"
+        self._last_closed_reference_price = 0.0
         self._probe_kline_ts = None
         self._probe_direction = "none"
         self._probe_entry_price = 0.0
@@ -1078,6 +1082,8 @@ class BollPinStrategy:
             payload = {
                 "inst_id": INST_ID,
                 "last_close_kline_ts": self._ts_to_str(self._last_close_kline_ts),
+                "last_closed_direction": self._last_closed_direction,
+                "last_closed_reference_price": self._last_closed_reference_price,
             }
             COOLDOWN_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as e:
@@ -1092,16 +1098,39 @@ class BollPinStrategy:
             if payload.get("inst_id") != INST_ID:
                 return
             self._last_close_kline_ts = self._str_to_ts(payload.get("last_close_kline_ts"))
+            self._last_closed_direction = str(payload.get("last_closed_direction", "none") or "none")
+            self._last_closed_reference_price = float(payload.get("last_closed_reference_price", 0) or 0)
         except Exception as e:
             logger.warning(f"Load close cooldown failed: {e}")
 
     def _clear_close_cooldown(self):
         """Clear the close-kline cooldown marker after the next kline arrives."""
+        self._last_close_kline_ts = None
+        self._last_closed_direction = "none"
+        self._last_closed_reference_price = 0.0
         try:
             if COOLDOWN_FILE.exists():
                 COOLDOWN_FILE.unlink()
         except Exception as e:
             logger.warning(f"Clear close cooldown failed: {e}")
+
+    def _elapsed_klines_since_close(self, kline_ts) -> int | None:
+        """Return elapsed candle count since the persisted close candle."""
+        if self._last_close_kline_ts is None or kline_ts is None:
+            return None
+        try:
+            current = pd.Timestamp(kline_ts)
+            closed = pd.Timestamp(self._last_close_kline_ts)
+            seconds = pd.Timedelta(current - closed).total_seconds()
+            if seconds < 0:
+                return 0
+            bar_seconds = pd.Timedelta(self._kline_floor_freq()).total_seconds()
+            if bar_seconds <= 0:
+                return None
+            return int(seconds // bar_seconds)
+        except Exception as exc:
+            logger.warning(f"Calculate close cooldown candle distance failed: {exc}")
+            return None
 
     def _sanitize_runtime_state(self):
         """Drop impossible local position residue before persisting or using it."""
@@ -2079,7 +2108,7 @@ class BollPinStrategy:
             logger.info("Price is still making new highs; skip first short batch")
             return
 
-        if not self._can_open_new_plan(last["ts"], mark_price):
+        if not self._can_open_new_plan(last["ts"], mark_price, direction):
             return
 
         self._set_cycle_tp_target_from_boll(last, mark_price, "probe_prepare")
@@ -2282,14 +2311,37 @@ class BollPinStrategy:
         recent = self._recent_prices[-(NO_NEW_EXTREME_TICKS + 1):]
         return recent[-1] >= max(recent[:-1])
 
-    def _can_open_new_plan(self, kline_ts, entry_price: float) -> bool:
+    def _can_open_new_plan(self, kline_ts, entry_price: float, direction: str) -> bool:
         """Return whether a new first-batch plan can be opened."""
         if self._last_close_kline_ts is not None:
-            if kline_ts == self._last_close_kline_ts:
+            elapsed_klines = self._elapsed_klines_since_close(kline_ts)
+            if elapsed_klines == 0:
                 log_check(f"Close-cooldown active; skip opening on same candle ts={kline_ts}")
                 return False
-            self._last_close_kline_ts = None
-            self._clear_close_cooldown()
+            guard_klines = max(int(POST_CLOSE_SAME_DIRECTION_PRICE_GUARD_KLINES), 0)
+            if not POST_CLOSE_SAME_DIRECTION_PRICE_GUARD_ENABLED:
+                self._clear_close_cooldown()
+            elif elapsed_klines is None or elapsed_klines > guard_klines:
+                self._clear_close_cooldown()
+            elif (
+                1 <= elapsed_klines <= guard_klines
+                and direction == self._last_closed_direction
+                and self._last_closed_reference_price > 0
+            ):
+                if direction == "long" and entry_price > self._last_closed_reference_price:
+                    log_check(
+                        f"Post-close same-direction guard blocks long entry "
+                        f"elapsed_klines={elapsed_klines}/{guard_klines} "
+                        f"last_ref={self._last_closed_reference_price:.2f} current={entry_price:.2f}"
+                    )
+                    return False
+                if direction == "short" and entry_price < self._last_closed_reference_price:
+                    log_check(
+                        f"Post-close same-direction guard blocks short entry "
+                        f"elapsed_klines={elapsed_klines}/{guard_klines} "
+                        f"last_ref={self._last_closed_reference_price:.2f} current={entry_price:.2f}"
+                    )
+                    return False
 
         if self._last_plan_kline_ts is not None and kline_ts == self._last_plan_kline_ts:
             log_check(f"This kline already opened one plan; skip signal ts={kline_ts}")
@@ -3291,11 +3343,14 @@ class BollPinStrategy:
         pos = await client.get_position(INST_ID)
         if pos is None or float(pos.get("pos", 0)) == 0:
             self._last_close_kline_ts = kline_ts
-            self._save_close_cooldown()
             filled = self._state.filled_batches()
             avg_entry = self._state.avg_entry
             total_sz = self._state.total_sz
             direction = self._state.direction
+            last_filled = max(filled, key=lambda batch: batch.batch_idx) if filled else None
+            self._last_closed_direction = direction if direction in ("long", "short") else "none"
+            self._last_closed_reference_price = float(last_filled.price) if last_filled and last_filled.price > 0 else 0.0
+            self._save_close_cooldown()
             close_price = self._state.plan_tp_price if self._state.plan_tp_price > 0 else mark_price
             if filled and avg_entry <= 0:
                 total_sz       = sum(b.sz for b in filled)

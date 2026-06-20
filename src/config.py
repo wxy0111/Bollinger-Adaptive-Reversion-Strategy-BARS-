@@ -155,6 +155,11 @@ INSIDE_BAND_CANCEL_KLINES = 2
 # orders must stay at/above the upper band.
 PENDING_ORDER_BAND_GUARD_ENABLED = True
 
+# Post-close same-direction entry guard.
+# 平仓后同向再开保护：当前K线不开仓，之后N根K线内同向开仓不能比上一轮最后成交价更差。
+POST_CLOSE_SAME_DIRECTION_PRICE_GUARD_ENABLED = True
+POST_CLOSE_SAME_DIRECTION_PRICE_GUARD_KLINES = 4
+
 # Reserved: first-batch wall-clock expiry is disabled.
 # 保留参数：45秒未成交撤单逻辑已停用。
 # PROBE_ORDER_TTL_SEC = 45
