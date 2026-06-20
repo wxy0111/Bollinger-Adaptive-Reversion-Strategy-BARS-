@@ -1157,6 +1157,8 @@ _DESIGN_HTML = """<!DOCTYPE html>
     justify-content: flex-end;
   }
   .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--green); box-shadow: 0 0 16px var(--green); }
+  .status-pill.stale .dot { background: var(--yellow); box-shadow: 0 0 16px var(--yellow); }
+  .status-pill.offline .dot { background: var(--red); box-shadow: 0 0 16px var(--red); }
   .hidden { display: none; }
   .grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 14px; }
   .span-3 { grid-column: span 3; }
@@ -1175,6 +1177,23 @@ _DESIGN_HTML = """<!DOCTYPE html>
     padding: 18px;
   }
   .panel.hot { border-color: rgba(16, 215, 255, .45); box-shadow: 0 0 0 1px rgba(16, 215, 255, .10), var(--shadow); }
+  .trade-strip {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 10px;
+    padding: 14px;
+    background: linear-gradient(180deg, rgba(15, 20, 32, .96), rgba(10, 14, 24, .96));
+  }
+  .trade-card {
+    min-width: 0;
+    border: 1px solid rgba(132,144,165,.20);
+    border-radius: 10px;
+    background: rgba(8, 12, 22, .72);
+    padding: 12px;
+  }
+  .trade-card .label { display: block; font-size: 12px; margin-bottom: 8px; }
+  .trade-card .value { display: block; text-align: left; font-size: 20px; white-space: normal; }
+  .trade-card.primary { border-color: rgba(16,215,255,.38); background: rgba(16,215,255,.08); }
   .panel h2, .section-title {
     margin: 0 0 14px;
     color: #dce8ff;
@@ -1227,11 +1246,17 @@ _DESIGN_HTML = """<!DOCTYPE html>
     place-items: center;
     background:
       radial-gradient(circle at center, #101724 52%, transparent 54%),
-      conic-gradient(var(--cyan) var(--risk-pct, 70%), rgba(255,255,255,.08) 0);
+      conic-gradient(var(--risk-color, var(--cyan)) var(--risk-pct, 70%), rgba(255,255,255,.08) 0);
     box-shadow: 0 0 34px rgba(16, 215, 255, .18);
   }
   .risk-ring strong { display: block; font-size: 42px; line-height: 1; text-align: center; }
   .risk-ring span { display: block; color: var(--cyan); margin-top: 6px; font-weight: 800; text-align: center; }
+  .history-message {
+    margin: 10px 0 0;
+    min-height: 18px;
+    color: var(--muted);
+    font-size: 12px;
+  }
   table { width: 100%; border-collapse: collapse; table-layout: auto; }
   th, td {
     padding: 10px 10px;
@@ -1320,9 +1345,14 @@ _DESIGN_HTML = """<!DOCTYPE html>
     .nav button { justify-content: center; }
     .main { padding: 12px; }
     .span-3, .span-4, .span-5, .span-6, .span-7, .span-8 { grid-column: 1 / -1; }
+    .trade-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .history-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .history-grid { grid-template-columns: 1fr; }
     .topbar { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 680px) {
+    .trade-strip { grid-template-columns: 1fr; }
+    .status-pill { min-width: 0; justify-content: flex-start; }
   }
 </style>
 </head>
@@ -1341,11 +1371,37 @@ _DESIGN_HTML = """<!DOCTYPE html>
         <h1>BARS 策略看板</h1>
         <div class="sub">Bollinger Adaptive Reversion Strategy · ETH-USDT-SWAP</div>
       </div>
-      <div class="status-pill"><span class="dot"></span><span id="updated">等待策略数据</span></div>
+      <div class="status-pill offline" id="connection-status"><span class="dot"></span><span id="updated">等待策略数据</span></div>
     </div>
 
     <section id="live">
       <div class="grid">
+        <div class="panel trade-strip span-12">
+          <div class="trade-card primary">
+            <span class="label">当前持仓</span>
+            <span class="value" id="summary-position">--</span>
+          </div>
+          <div class="trade-card">
+            <span class="label">浮盈亏</span>
+            <span class="value" id="summary-upnl">--</span>
+          </div>
+          <div class="trade-card">
+            <span class="label">止盈距离</span>
+            <span class="value" id="summary-tp-distance">--</span>
+          </div>
+          <div class="trade-card">
+            <span class="label">强平缓冲</span>
+            <span class="value" id="summary-liq-buffer">--</span>
+          </div>
+          <div class="trade-card">
+            <span class="label">今日收益</span>
+            <span class="value" id="summary-today-pnl">--</span>
+          </div>
+          <div class="trade-card">
+            <span class="label">数据延迟</span>
+            <span class="value" id="summary-data-age">--</span>
+          </div>
+        </div>
         <div class="panel hot span-5">
           <div class="eyebrow">MARKET</div>
           <div class="metric"><span class="label">标记价格</span><span class="value hero-price" id="mark-price">--</span></div>
@@ -1405,9 +1461,10 @@ _DESIGN_HTML = """<!DOCTYPE html>
           </div>
           <div>
             <select id="log-select"></select>
-            <button class="primary" onclick="loadHistory()">加载</button>
+            <button class="primary" id="history-load" onclick="loadHistory()">加载</button>
           </div>
         </div>
+        <div class="history-message" id="history-message"></div>
         <div class="chart-wrap">
           <canvas id="history-chart"></canvas>
           <div class="tooltip" id="chart-tooltip"></div>
@@ -1475,24 +1532,101 @@ function showTab(name) {
   if (name === 'history') loadLogs();
 }
 
+function parseUpdatedAt(value) {
+  if (!value) return null;
+  const parsed = new Date(String(value).replace(' ', 'T'));
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function dataAgeSeconds(value) {
+  const parsed = parseUpdatedAt(value);
+  if (!parsed) return null;
+  return Math.max(0, Math.round((Date.now() - parsed.getTime()) / 1000));
+}
+
+function setLiveStatus(status, text) {
+  const pill = document.getElementById('connection-status');
+  pill.className = `status-pill ${status}`;
+  document.getElementById('updated').textContent = text;
+}
+
+function distanceText(from, to, direction, favorableForLong = true) {
+  if (!from || !to) return '--';
+  const raw = favorableForLong
+    ? (direction === 'long' ? to - from : from - to)
+    : (direction === 'long' ? from - to : to - from);
+  const pct = raw / from * 100;
+  return `${fmt(raw)} (${fmt(pct)}%)`;
+}
+
 function riskScore(d) {
-  if (!d.total_sz || !d.liq_price || !d.mark_price) return { score: '--', label: '空仓', pct: 75 };
+  if (!d.total_sz || !d.liq_price || !d.mark_price) {
+    return { score: '--', label: '空仓', pct: 0, color: 'rgba(132,144,165,.42)', level: 'muted' };
+  }
   const side = d.direction;
   const distance = side === 'long'
     ? (d.mark_price - d.liq_price) / d.mark_price
     : (d.liq_price - d.mark_price) / d.mark_price;
-  const safe = Math.max(0, Math.min(100, distance * 1000));
+  const pctValue = distance * 100;
+  const color = pctValue < 8 ? 'var(--red)' : pctValue < 18 ? 'var(--yellow)' : 'var(--green)';
   return {
-    score: fmt(distance * 100, 2),
-    label: '强平距离%',
-    pct: Math.max(8, Math.min(92, safe))
+    score: fmt(pctValue, 2),
+    label: pctValue < 8 ? '危险缓冲%' : pctValue < 18 ? '注意缓冲%' : '安全缓冲%',
+    pct: Math.max(8, Math.min(92, pctValue * 5)),
+    color,
+    level: pctValue < 8 ? 'red' : pctValue < 18 ? 'yellow' : 'green'
   };
 }
 
+function updateSummary(d, age) {
+  const hasPosition = Number(d.total_sz || 0) > 0;
+  const dirMap = {long: 'LONG 做多', short: 'SHORT 做空', none: '空仓'};
+  const positionText = hasPosition
+    ? `${dirMap[d.direction] || d.direction} · ${d.total_sz} 张`
+    : '空仓，等待信号';
+  const summaryPosition = document.getElementById('summary-position');
+  summaryPosition.textContent = positionText;
+  summaryPosition.className = `value ${hasPosition ? (d.direction === 'long' ? 'green' : 'red') : 'muted'}`;
+
+  const summaryUpnl = document.getElementById('summary-upnl');
+  summaryUpnl.textContent = hasPosition ? pnlText(d.unrealized_pnl) : '--';
+  summaryUpnl.className = `value ${hasPosition ? pnlClass(d.unrealized_pnl) : 'muted'}`;
+
+  document.getElementById('summary-tp-distance').textContent = hasPosition
+    ? distanceText(d.mark_price, d.tp_price, d.direction, true)
+    : '--';
+  const r = riskScore(d);
+  const liqBuffer = document.getElementById('summary-liq-buffer');
+  liqBuffer.textContent = hasPosition ? `${r.score}%` : '--';
+  liqBuffer.className = `value ${r.level}`;
+
+  const summaryToday = document.getElementById('summary-today-pnl');
+  summaryToday.textContent = pnlText(d.today_pnl);
+  summaryToday.className = `value ${pnlClass(d.today_pnl)}`;
+  document.getElementById('summary-data-age').textContent = age === null ? '--' : `${age} 秒`;
+}
+
 async function refreshLive() {
-  const res = await fetch('/api/state');
-  const d = await res.json();
-  document.getElementById('updated').textContent = d.updated_at ? `更新于 ${d.updated_at}` : '等待策略数据';
+  let d;
+  try {
+    const res = await fetch('/api/state');
+    if (!res.ok) throw new Error(`state ${res.status}`);
+    d = await res.json();
+  } catch (err) {
+    setLiveStatus('offline', '无法连接策略数据');
+    return;
+  }
+  const age = dataAgeSeconds(d.updated_at);
+  if (!d.updated_at) {
+    setLiveStatus('offline', '等待策略数据');
+  } else if (age !== null && age > 30) {
+    setLiveStatus('offline', `数据中断 ${age} 秒`);
+  } else if (age !== null && age > 10) {
+    setLiveStatus('stale', `数据延迟 ${age} 秒`);
+  } else {
+    setLiveStatus('', `更新于 ${d.updated_at}`);
+  }
+  updateSummary(d, age);
   document.getElementById('last-tick').textContent = d.updated_at || '--';
   document.getElementById('mark-price').textContent = money(d.mark_price);
   document.getElementById('bands').textContent = `${fmt(d.boll_lower)} / ${fmt(d.boll_mid)} / ${fmt(d.boll_upper)}`;
@@ -1531,6 +1665,7 @@ async function refreshLive() {
   document.getElementById('risk-score').textContent = r.score;
   document.getElementById('risk-label').textContent = r.label;
   document.getElementById('risk-ring').style.setProperty('--risk-pct', `${r.pct}%`);
+  document.getElementById('risk-ring').style.setProperty('--risk-color', r.color);
 
   const batches = d.batches || [];
   document.getElementById('batch-body').innerHTML = batches.length ? batches.map(b => `
@@ -1551,20 +1686,41 @@ async function loadLogs() {
   const select = document.getElementById('log-select');
   if (!select.options.length) {
     select.innerHTML = logs.map(log => `<option value="${log.name}">${log.label || log.name}</option>`).join('');
-    if (logs.length) loadHistory();
+    const latest = logs.find(log => log.name !== '__all__');
+    if (latest) select.value = latest.name;
+    if (latest) loadHistory();
   }
 }
 
 async function loadHistory() {
   const select = document.getElementById('log-select');
   if (!select.value) return;
-  const res = await fetch(`/api/history?file=${encodeURIComponent(select.value)}&limit=1800`);
-  const data = await res.json();
-  const tradeRes = await fetch(`/api/history/trades?file=${encodeURIComponent(select.value)}`);
-  const tradeData = await tradeRes.json();
-  renderHistoryStats(data.summary || {});
-  renderHistoryTrades(tradeData || {});
-  drawHistory(data.points || [], tradeData.events || []);
+  const button = document.getElementById('history-load');
+  const message = document.getElementById('history-message');
+  const selectedLabel = select.options[select.selectedIndex]?.textContent || select.value;
+  button.disabled = true;
+  button.textContent = '加载中';
+  message.textContent = select.value === '__all__'
+    ? '正在解析全部日志，数据量较大，可能需要更久。'
+    : `正在加载 ${selectedLabel}`;
+  try {
+    const res = await fetch(`/api/history?file=${encodeURIComponent(select.value)}&limit=1800`);
+    if (!res.ok) throw new Error(`history ${res.status}`);
+    const data = await res.json();
+    const tradeRes = await fetch(`/api/history/trades?file=${encodeURIComponent(select.value)}`);
+    if (!tradeRes.ok) throw new Error(`trades ${tradeRes.status}`);
+    const tradeData = await tradeRes.json();
+    renderHistoryStats(data.summary || {});
+    renderHistoryTrades(tradeData || {});
+    drawHistory(data.points || [], tradeData.events || []);
+    message.textContent = `已加载 ${selectedLabel}`;
+  } catch (err) {
+    message.textContent = '日志加载失败，请换一个单日日志重试。';
+    drawHistory([], []);
+  } finally {
+    button.disabled = false;
+    button.textContent = '加载';
+  }
 }
 
 function renderHistoryStats(s) {
