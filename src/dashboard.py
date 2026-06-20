@@ -675,7 +675,7 @@ _DESIGN_HTML = """<!DOCTYPE html>
   .panel.hot { border-color: rgba(16, 215, 255, .45); box-shadow: 0 0 0 1px rgba(16, 215, 255, .10), var(--shadow); }
   .trade-strip {
     display: grid;
-    grid-template-columns: repeat(7, minmax(0, 1fr));
+    grid-template-columns: repeat(8, minmax(0, 1fr));
     gap: 10px;
     padding: 14px;
     background: linear-gradient(180deg, rgba(15, 20, 32, .96), rgba(10, 14, 24, .96));
@@ -688,7 +688,9 @@ _DESIGN_HTML = """<!DOCTYPE html>
     padding: 12px;
   }
   .trade-card .label { display: block; font-size: 12px; margin-bottom: 8px; }
-  .trade-card .value { display: block; text-align: left; font-size: 20px; white-space: normal; }
+  .trade-card .value { display: block; text-align: left; font-size: 19px; white-space: normal; }
+  .trade-card.primary { grid-column: span 2; }
+  .trade-card.primary .value { font-size: 18px; white-space: nowrap; }
   .trade-card.primary { border-color: rgba(16,215,255,.38); background: rgba(16,215,255,.08); }
   .trade-card.attention { border-color: rgba(33,230,138,.28); }
   .trade-card.attention.warn { border-color: rgba(255,194,26,.44); background: rgba(255,194,26,.08); }
@@ -841,18 +843,27 @@ _DESIGN_HTML = """<!DOCTYPE html>
   @media (max-width: 1180px) {
     .shell { grid-template-columns: 1fr; }
     .side { margin: 12px; border-radius: 18px; }
+    .brand { padding: 0 8px 10px; }
+    .brand-logo { width: 44px; height: 44px; }
     .nav { display: flex; }
     .nav button { justify-content: center; }
     .main { padding: 12px; }
     .span-3, .span-4, .span-5, .span-6, .span-7, .span-8 { grid-column: 1 / -1; }
     .trade-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .trade-card.primary { grid-column: span 2; }
     .history-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .history-grid { grid-template-columns: 1fr; }
     .topbar { grid-template-columns: 1fr; }
   }
   @media (max-width: 680px) {
     .trade-strip { grid-template-columns: 1fr; }
+    .trade-card.primary { grid-column: auto; }
     .status-pill { min-width: 0; justify-content: flex-start; }
+    .toolbar { display: block; }
+    .toolbar-actions { justify-content: flex-start; margin-top: 12px; }
+    .toolbar-actions select { width: 100%; }
+    .toolbar-actions button { width: 100%; }
+    canvas { height: 360px; }
   }
 </style>
 </head>
@@ -1408,8 +1419,8 @@ function drawHistory(points, events = []) {
   const canvas = document.getElementById('history-chart');
   const rect = canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
-  canvas.width = Math.max(900 * dpr, Math.floor(rect.width * dpr));
-  canvas.height = Math.floor(560 * dpr);
+  canvas.width = Math.max(280 * dpr, Math.floor(rect.width * dpr));
+  canvas.height = Math.floor(rect.height * dpr);
   const ctx = canvas.getContext('2d');
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   const w = canvas.width / dpr;
