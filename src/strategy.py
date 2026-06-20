@@ -3180,10 +3180,11 @@ class BollPinStrategy:
             logger.warning("No close fills found; fallback to estimated PnL and skip realized-PnL rebalance")
             return None
 
+        entry_fee = await self._fetch_entry_fees_for_current_cycle(client, end_ms)
         gross_pnl = 0.0
         total_fill_sz = 0.0
         weighted_px = 0.0
-        total_fee = 0.0
+        close_fee = 0.0
         for fill in matched:
             try:
                 fill_pnl = float(fill.get("fillPnl") or 0)
@@ -3202,16 +3203,18 @@ class BollPinStrategy:
             except (TypeError, ValueError):
                 fill_px = 0.0
             gross_pnl += fill_pnl
-            total_fee += fee
+            close_fee += fee
             if fill_sz > 0 and fill_px > 0:
                 total_fill_sz += fill_sz
                 weighted_px += fill_sz * fill_px
 
+        total_fee = round(entry_fee + close_fee, 4)
         net_pnl = round(gross_pnl + total_fee, 4)
         avg_fill_px = round(weighted_px / total_fill_sz, 4) if total_fill_sz > 0 else 0.0
         log_action(
             f"Actual close PnL from fills net_pnl={net_pnl:+.4f} USDT "
             f"gross_pnl={gross_pnl:+.4f} fee={total_fee:+.4f} "
+            f"entry_fee={entry_fee:+.4f} close_fee={close_fee:+.4f} "
             f"avg_px={avg_fill_px or '--'} sz={total_fill_sz or '--'} "
             f"fills={len(matched)} ordId={close_ord_id or '--'}"
         )
@@ -3223,6 +3226,64 @@ class BollPinStrategy:
             "gross_pnl": round(gross_pnl, 4),
             "fills": len(matched),
         }
+
+    async def _fetch_entry_fees_for_current_cycle(self, client: OKXClient, end_ms: int) -> float:
+        """Return entry fill fees for the currently tracked filled batches."""
+        entry_ord_ids = {
+            str(batch.ord_id)
+            for batch in self._state.filled_batches()
+            if batch.ord_id and batch.ord_id != "existing-position"
+        }
+        if not entry_ord_ids:
+            return 0.0
+
+        begin_ms = end_ms - 24 * 60 * 60 * 1000
+        if self._state.cycle_start_ts:
+            try:
+                cycle_start = pd.Timestamp(self._state.cycle_start_ts)
+                begin_ms = int(cycle_start.timestamp() * 1000) - 5 * 60 * 1000
+            except Exception as exc:
+                logger.debug(f"Parse cycle start timestamp failed for entry fee lookup: {exc}")
+
+        try:
+            fills = await client.get_fills_history(INST_ID, begin=begin_ms, end=end_ms, limit=100)
+        except Exception as exc:
+            logger.warning(f"Fetch entry fills failed; close PnL will exclude entry fees: {exc}")
+            return 0.0
+
+        seen = set()
+        entry_fee = 0.0
+        matched_count = 0
+        for fill in fills:
+            ord_id = str(fill.get("ordId", ""))
+            if ord_id not in entry_ord_ids:
+                continue
+            fill_key = (
+                ord_id,
+                str(fill.get("tradeId") or ""),
+                str(fill.get("fillTime") or fill.get("ts") or ""),
+                str(fill.get("fillSz") or fill.get("sz") or ""),
+            )
+            if fill_key in seen:
+                continue
+            seen.add(fill_key)
+            try:
+                entry_fee += float(fill.get("fee") or 0)
+                matched_count += 1
+            except (TypeError, ValueError):
+                pass
+
+        missing = entry_ord_ids - {str(fill.get("ordId", "")) for fill in fills}
+        if missing:
+            logger.warning(
+                f"Entry fee lookup missed {len(missing)} entry order(s); "
+                "close PnL may be above OKX order-history net PnL"
+            )
+        log_check(
+            f"Entry fees for close PnL entry_fee={entry_fee:+.4f} "
+            f"matched_fills={matched_count} entry_orders={len(entry_ord_ids)}"
+        )
+        return round(entry_fee, 4)
 
 
     async def _check_position_closed(self, client: OKXClient, mark_price: float, kline_ts=None):
