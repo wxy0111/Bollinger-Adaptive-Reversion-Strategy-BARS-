@@ -342,13 +342,21 @@ effective equity = account equity - CROSS_COPY_PROTECT_EQUITY_USDT
 The local dashboard shows:
 
 - Live trade status strip with current position, unrealized PnL, take-profit distance, liquidation buffer, daily PnL, and data age.
+- A first-screen attention card for delayed data, missing take-profit, liquidation-buffer danger, and floating-loss states.
 - Live price and Bollinger state.
 - Runtime strategy state with online, delayed, and offline freshness indicators.
 - Historical log files.
 - Daily trades and realized profit from logs.
 - Chart markers for first entry, add-ons, exits, and risk events.
+- History filters for entry/add-on events, close/transfer events, and loss-focused review.
 
-The history tab defaults to the latest single-day log. The `全部日志` option remains available for full-period review, but it is no longer auto-loaded because large local log sets can take noticeably longer to parse.
+The history tab defaults to the latest single-day log. The `全部日志` option remains available for full-period review, but it is not auto-loaded because large local log sets can take noticeably longer to parse. Dashboard history parsing uses bounded sampling and a cache so repeated reviews of the same log do not reparse the same data.
+
+Run a lightweight dashboard smoke check with:
+
+```powershell
+.\.venv\Scripts\python.exe tools\dashboard_smoke_test.py
+```
 
 The dashboard is local-only by default and runs from the strategy process.
 
@@ -612,13 +620,21 @@ CROSS_COPY_DYNAMIC_SIZING_ENABLED = False
 看板会读取实时状态和历史 log，用于查看：
 
 - 顶部交易状态条：当前持仓、浮盈亏、止盈距离、强平缓冲、今日收益和数据延迟。
+- 首屏关注卡：提示数据延迟/中断、止盈缺失、强平缓冲危险和持仓浮亏。
 - 当前价格、布林带、持仓和权益。
 - 策略数据状态：正常、延迟、离线/无数据。
 - 单日开仓、补仓、平仓记录。
 - 实际收益。
 - 图表上的头仓、补仓、平仓和风险事件标记。
+- 历史筛选：只看开仓/补仓、只看平仓/划转、只看亏损交易。
 
-历史页默认加载最新单日日志，避免进入页面时自动解析全部历史日志导致卡顿；需要全量复盘时仍可手动选择 `全部日志`。
+历史页默认加载最新单日日志，避免进入页面时自动解析全部历史日志导致卡顿；需要全量复盘时仍可手动选择 `全部日志`。历史图表解析使用有界采样和缓存，同一个日志重复复盘不会反复解析同一批数据。
+
+轻量检查命令：
+
+```powershell
+.\.venv\Scripts\python.exe tools\dashboard_smoke_test.py
+```
 
 ### 优化器
 

@@ -1,9 +1,11 @@
 """Local aiohttp dashboard for live strategy state and historical logs."""
+import copy
 import json
 import re
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
+from time import monotonic
 from typing import List
 
 from aiohttp import web
@@ -15,6 +17,14 @@ from src.config import WEB_HOST, WEB_PORT
 LOG_DIR = Path("logs")
 ASSET_DIR = Path(__file__).resolve().parent.parent / "assets"
 PNL_CORRECTIONS_PATH = LOG_DIR / "pnl_corrections.json"
+HISTORY_CACHE_TTL_SECONDS = 30
+HISTORY_CACHE: dict[tuple[str, int], tuple[float, tuple[tuple[str, int, int], ...], dict]] = {}
+DASHBOARD_RISK_THRESHOLDS = {
+    "liquidation_danger_pct": 8,
+    "liquidation_warning_pct": 18,
+    "stale_seconds": 10,
+    "offline_seconds": 30,
+}
 TICK_RE = re.compile(
     "^(?P<ts>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d+).*?"
     "(?:price|\\u4ef7\\u683c)=(?P<price>\\d+(?:\\.\\d+)?)\\s+"
@@ -472,8 +482,35 @@ def _parse_trade_history(paths: list[Path]) -> dict:
 
 def _parse_history_log(path: Path, limit: int) -> dict:
     """Parse a log file into sampled chart points and summary stats."""
-    points = []
     paths = _selected_log_paths(path.name)
+    signature = tuple(
+        (log_path.name, log_path.stat().st_size, log_path.stat().st_mtime_ns)
+        for log_path in paths
+    )
+    cache_key = (path.name, limit)
+    cached = HISTORY_CACHE.get(cache_key)
+    if cached:
+        cached_at, cached_signature, cached_data = cached
+        if cached_signature == signature or monotonic() - cached_at <= HISTORY_CACHE_TTL_SECONDS:
+            return copy.deepcopy(cached_data)
+
+    sampled = []
+    total = 0
+    sample_stride = 1
+    start_ts = ""
+    end_ts = ""
+    min_price = None
+    max_price = None
+    first_equity = 0.0
+    last_equity = 0.0
+    position_ticks = 0
+
+    def add_sample(point: dict) -> None:
+        nonlocal sample_stride, sampled
+        sampled.append(point)
+        if len(sampled) > limit * 2:
+            sample_stride *= 2
+            sampled = sampled[::2]
 
     for log_path in paths:
         with log_path.open("r", encoding="utf-8", errors="ignore") as file:
@@ -481,7 +518,7 @@ def _parse_history_log(path: Path, limit: int) -> dict:
                 match = TICK_RE.search(line)
                 if not match:
                     continue
-                points.append({
+                point = {
                     "ts": match.group("ts")[:19],
                     "price": float(match.group("price")),
                     "lower": float(match.group("lower")),
@@ -489,581 +526,40 @@ def _parse_history_log(path: Path, limit: int) -> dict:
                     "upper": float(match.group("upper")),
                     "direction": match.group("direction"),
                     "equity": float(match.group("equity")),
-                })
+                }
+                total += 1
+                if not start_ts:
+                    start_ts = point["ts"]
+                    first_equity = point["equity"]
+                end_ts = point["ts"]
+                last_equity = point["equity"]
+                min_price = point["price"] if min_price is None else min(min_price, point["price"])
+                max_price = point["price"] if max_price is None else max(max_price, point["price"])
+                if point["direction"] != "none":
+                    position_ticks += 1
+                if total % sample_stride == 0:
+                    add_sample(point)
 
-    total = len(points)
-    if total > limit:
-        step = max(1, total // limit)
-        sampled = points[::step][:limit]
-    else:
-        sampled = points
+    if len(sampled) > limit:
+        step = max(1, len(sampled) // limit)
+        sampled = sampled[::step][:limit]
 
-    prices = [p["price"] for p in points]
-    equities = [p["equity"] for p in points]
     summary = {
         "file": "全部日志" if path.name == "__all__" else path.name,
         "total_ticks": total,
         "sampled_ticks": len(sampled),
-        "start": points[0]["ts"] if points else "",
-        "end": points[-1]["ts"] if points else "",
-        "min_price": min(prices) if prices else 0.0,
-        "max_price": max(prices) if prices else 0.0,
-        "first_equity": equities[0] if equities else 0.0,
-        "last_equity": equities[-1] if equities else 0.0,
-        "position_ticks": sum(1 for p in points if p["direction"] != "none"),
+        "start": start_ts,
+        "end": end_ts,
+        "min_price": min_price if min_price is not None else 0.0,
+        "max_price": max_price if max_price is not None else 0.0,
+        "first_equity": first_equity,
+        "last_equity": last_equity,
+        "position_ticks": position_ticks,
     }
-    return {"summary": summary, "points": sampled}
+    result = {"summary": summary, "points": sampled}
+    HISTORY_CACHE[cache_key] = (monotonic(), signature, copy.deepcopy(result))
+    return result
 
-
-_HTML = """<!DOCTYPE html>
-<html lang="zh">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BARS Strategy Dashboard</title>
-<link rel="icon" type="image/png" href="/assets/bars-favicon.png">
-<style>
-  :root {
-    --bg: #0b0e11;
-    --panel: #12171d;
-    --panel-2: #171d24;
-    --line: #26313d;
-    --text: #e8eef5;
-    --muted: #8a97a6;
-    --green: #27c483;
-    --red: #ff5f66;
-    --yellow: #e5b454;
-    --blue: #5aa7ff;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--text);
-    font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
-    font-size: 14px;
-  }
-  header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 16px;
-    padding: 18px 24px;
-    border-bottom: 1px solid var(--line);
-    background: #0f1419;
-  }
-  h1 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: 0; }
-  .header-brand { display: flex; align-items: center; gap: 12px; }
-  .header-logo { width: 48px; height: 48px; object-fit: contain; }
-  .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
-  .status { display: flex; gap: 8px; align-items: center; color: var(--muted); }
-  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); box-shadow: 0 0 10px var(--green); }
-  main { padding: 18px 24px 28px; max-width: 1500px; margin: 0 auto; }
-  .tabs { display: inline-flex; border: 1px solid var(--line); background: var(--panel); margin-bottom: 16px; }
-  .tabs button {
-    min-width: 96px;
-    border: 0;
-    color: var(--muted);
-    background: transparent;
-    padding: 9px 14px;
-    cursor: pointer;
-  }
-  .tabs button.active { background: var(--blue); color: #06111f; font-weight: 700; }
-  .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
-  .wide { grid-column: span 2; }
-  .full { grid-column: 1 / -1; }
-  .panel {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    padding: 14px;
-    min-width: 0;
-  }
-  .panel h2 { margin: 0 0 12px; font-size: 12px; color: var(--muted); font-weight: 650; text-transform: uppercase; }
-  .metric { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid rgba(255,255,255,.04); }
-  .metric:last-child { border-bottom: 0; }
-  .label { color: var(--muted); }
-  .value { font-weight: 650; text-align: right; white-space: nowrap; }
-  .big { font-size: 26px; line-height: 1.1; }
-  .green { color: var(--green); }
-  .red { color: var(--red); }
-  .yellow { color: var(--yellow); }
-  .muted { color: var(--muted); }
-  .band {
-    position: relative;
-    height: 10px;
-    background: #202832;
-    border-radius: 999px;
-    margin: 14px 2px 4px;
-  }
-  .band .inside {
-    height: 100%;
-    border-radius: inherit;
-    background: linear-gradient(90deg, var(--red), var(--yellow), var(--green));
-    opacity: .85;
-  }
-  .band .marker {
-    position: absolute;
-    top: -5px;
-    width: 20px;
-    height: 20px;
-    border-radius: 50%;
-    background: var(--blue);
-    border: 3px solid var(--panel);
-    transform: translateX(-50%);
-  }
-  table { width: 100%; border-collapse: collapse; }
-  th, td {
-    padding: 9px 8px;
-    border-bottom: 1px solid rgba(255,255,255,.06);
-    text-align: left;
-    vertical-align: middle;
-    white-space: nowrap;
-  }
-  th { color: var(--muted); font-size: 12px; font-weight: 600; }
-  td:last-child, th:last-child { text-align: right; }
-  .num { text-align: right; font-variant-numeric: tabular-nums; }
-  .time-cell { min-width: 150px; }
-  .note-cell { min-width: 150px; white-space: normal; }
-  .badge { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 12px; background: #24303b; color: var(--muted); }
-  .badge.fill { background: rgba(39,196,131,.14); color: var(--green); }
-  .badge.wait { background: rgba(229,180,84,.14); color: var(--yellow); }
-  .toolbar { display: flex; gap: 10px; align-items: center; justify-content: space-between; margin-bottom: 12px; }
-  select, button {
-    background: var(--panel-2);
-    color: var(--text);
-    border: 1px solid var(--line);
-    border-radius: 4px;
-    padding: 8px 10px;
-  }
-  button { cursor: pointer; }
-  button:hover { border-color: var(--blue); }
-  canvas { width: 100%; height: 420px; background: #0e1318; border: 1px solid var(--line); border-radius: 6px; display: block; }
-  .history-stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 10px; }
-  .mini { background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; padding: 10px; }
-  .mini .label { font-size: 12px; margin-bottom: 5px; }
-  .mini .value { text-align: left; }
-  .history-grid { display: grid; grid-template-columns: 1fr 1.35fr; gap: 12px; margin-top: 12px; }
-  .table-scroll { max-height: 340px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
-  .table-scroll table { background: var(--panel); }
-  .table-scroll thead th { position: sticky; top: 0; background: var(--panel-2); z-index: 1; }
-  .hidden { display: none; }
-  @media (max-width: 980px) {
-    header { align-items: flex-start; flex-direction: column; }
-    .grid { grid-template-columns: 1fr; }
-    .wide { grid-column: auto; }
-    .history-stats { grid-template-columns: 1fr 1fr; }
-    .history-grid { grid-template-columns: 1fr; }
-  }
-</style>
-</head>
-<body>
-<header>
-  <div class="header-brand">
-    <img class="header-logo" src="/assets/bars-favicon.png" alt="BARS logo">
-    <div>
-    <h1>BARS Strategy Dashboard</h1>
-    <div class="sub">Bollinger Adaptive Reversion Strategy · ETH-USDT-SWAP</div>
-    </div>
-  </div>
-  <div class="status"><span class="dot"></span><span id="updated">waiting for data</span></div>
-</header>
-<main>
-  <div class="tabs">
-    <button id="tab-live" class="active" onclick="showTab('live')">实时</button>
-    <button id="tab-history" onclick="showTab('history')">历史日志</button>
-  </div>
-
-  <section id="live">
-    <div class="grid">
-      <div class="panel wide">
-        <h2>Market</h2>
-        <div class="metric"><span class="label">标记价格</span><span class="value big" id="mark-price">--</span></div>
-        <div class="band"><div class="inside"></div><div class="marker" id="band-marker" style="left:50%"></div></div>
-        <div class="metric"><span class="label">下轨 / 中轨 / 上轨</span><span class="value" id="bands">--</span></div>
-        <div class="metric"><span class="label">布林宽度</span><span class="value" id="band-width">--</span></div>
-      </div>
-      <div class="panel">
-        <h2>Account</h2>
-        <div class="metric"><span class="label">权益</span><span class="value" id="equity">--</span></div>
-        <div class="metric"><span class="label">峰值</span><span class="value" id="peak">--</span></div>
-        <div class="metric"><span class="label">回撤</span><span class="value" id="drawdown">--</span></div>
-        <div class="metric"><span class="label">今日盈亏</span><span class="value" id="today-pnl">--</span></div>
-      </div>
-      <div class="panel">
-        <h2>Position</h2>
-        <div class="metric"><span class="label">方向</span><span class="value" id="direction">--</span></div>
-        <div class="metric"><span class="label">均价</span><span class="value" id="avg-entry">--</span></div>
-        <div class="metric"><span class="label">张数</span><span class="value" id="total-size">--</span></div>
-        <div class="metric"><span class="label">浮盈亏</span><span class="value" id="upnl">--</span></div>
-      </div>
-      <div class="panel wide">
-        <h2>Exit Orders</h2>
-        <div class="metric"><span class="label">止盈价</span><span class="value green" id="tp-price">--</span></div>
-        <div class="metric"><span class="label">强平线</span><span class="value red" id="liq-price">--</span></div>
-        <div class="metric"><span class="label">总成交次数</span><span class="value" id="trade-count">--</span></div>
-      </div>
-      <div class="panel wide">
-        <h2>Batches</h2>
-        <table><thead><tr><th>批次</th><th>价格</th><th>张数</th><th>状态</th></tr></thead><tbody id="batch-body"></tbody></table>
-      </div>
-      <div class="panel wide">
-        <h2>Recent Trades</h2>
-        <table><thead><tr><th>时间</th><th>操作</th><th>价格</th><th>张数</th><th>盈亏</th></tr></thead><tbody id="trade-body"></tbody></table>
-      </div>
-    </div>
-  </section>
-
-  <section id="history" class="hidden">
-    <div class="panel full">
-      <div class="toolbar">
-        <div>
-          <h2 style="margin-bottom:4px">Historical Logs</h2>
-          <div class="muted" id="history-range">选择一个日志文件查看价格和布林带变化</div>
-        </div>
-        <div>
-          <select id="log-select"></select>
-          <button onclick="loadHistory()">加载</button>
-        </div>
-      </div>
-      <canvas id="history-chart" width="1200" height="420"></canvas>
-      <div class="history-stats" id="history-stats"></div>
-      <div class="history-grid">
-        <div>
-          <h2 style="margin:14px 0 8px">单日统计</h2>
-          <div class="table-scroll">
-            <table>
-              <thead><tr><th>日期</th><th>开单</th><th>头仓</th><th>补仓</th><th>平仓</th><th>实际收益</th><th>累计</th></tr></thead>
-              <tbody id="daily-body"></tbody>
-            </table>
-          </div>
-        </div>
-        <div>
-          <h2 style="margin:14px 0 8px">交易明细</h2>
-          <div class="table-scroll">
-            <table>
-              <thead><tr><th>开仓时间</th><th>平仓时间</th><th>类型</th><th>均价</th><th>平仓价</th><th>张数</th><th>批次</th><th>实际收益</th><th>备注</th></tr></thead>
-              <tbody id="history-trade-body"></tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-      <h2 style="margin:14px 0 8px">动作流水</h2>
-      <div class="table-scroll">
-        <table>
-          <thead><tr><th>时间</th><th>类型</th><th>方向</th><th>价格</th><th>张数</th><th>收益</th><th>说明</th></tr></thead>
-          <tbody id="event-body"></tbody>
-        </table>
-      </div>
-    </div>
-  </section>
-</main>
-
-<script>
-const fmt = (v, d = 2) => Number(v || 0).toFixed(d);
-const money = v => `${fmt(v)} USDT`;
-const pnlText = v => `${v >= 0 ? '+' : ''}${fmt(v)} USDT`;
-const pnlClass = v => v >= 0 ? 'green' : 'red';
-
-function showTab(name) {
-  document.getElementById('live').classList.toggle('hidden', name !== 'live');
-  document.getElementById('history').classList.toggle('hidden', name !== 'history');
-  document.getElementById('tab-live').classList.toggle('active', name === 'live');
-  document.getElementById('tab-history').classList.toggle('active', name === 'history');
-  if (name === 'history') loadLogs();
-}
-
-async function refreshLive() {
-  const res = await fetch('/api/state');
-  const d = await res.json();
-  document.getElementById('updated').textContent = d.updated_at ? `更新于 ${d.updated_at}` : '等待策略数据';
-  document.getElementById('mark-price').textContent = money(d.mark_price);
-  document.getElementById('bands').textContent = `${fmt(d.boll_lower)} / ${fmt(d.boll_mid)} / ${fmt(d.boll_upper)}`;
-  const width = d.boll_upper - d.boll_lower;
-  document.getElementById('band-width').textContent = width > 0 ? `${fmt(width)} (${fmt(width / d.mark_price * 100)}%)` : '--';
-  const pct = width > 0 ? Math.max(0, Math.min(100, (d.mark_price - d.boll_lower) / width * 100)) : 50;
-  document.getElementById('band-marker').style.left = `${pct}%`;
-
-  document.getElementById('equity').textContent = money(d.equity);
-  document.getElementById('peak').textContent = money(d.peak_equity);
-  const dd = d.peak_equity > 0 ? (d.peak_equity - d.equity) / d.peak_equity * 100 : 0;
-  const ddEl = document.getElementById('drawdown');
-  ddEl.textContent = `${fmt(dd)}%`;
-  ddEl.className = `value ${dd > 5 ? 'red' : 'green'}`;
-  const pnlEl = document.getElementById('today-pnl');
-  pnlEl.textContent = pnlText(d.today_pnl);
-  pnlEl.className = `value ${pnlClass(d.today_pnl)}`;
-
-  const dirEl = document.getElementById('direction');
-  const dirMap = {long: ['LONG 做多', 'green'], short: ['SHORT 做空', 'red'], none: ['空仓', 'muted']};
-  const dir = dirMap[d.direction] || dirMap.none;
-  dirEl.textContent = dir[0];
-  dirEl.className = `value ${dir[1]}`;
-  document.getElementById('avg-entry').textContent = d.avg_entry > 0 ? fmt(d.avg_entry) : '--';
-  document.getElementById('total-size').textContent = d.total_sz > 0 ? `${d.total_sz} 张` : '--';
-  const upnlEl = document.getElementById('upnl');
-  upnlEl.textContent = d.total_sz > 0 ? pnlText(d.unrealized_pnl) : '--';
-  upnlEl.className = `value ${pnlClass(d.unrealized_pnl)}`;
-  document.getElementById('tp-price').textContent = d.tp_price > 0 ? fmt(d.tp_price) : '--';
-  document.getElementById('liq-price').textContent = d.liq_price > 0 ? fmt(d.liq_price) : '--';
-  document.getElementById('trade-count').textContent = `${d.total_trades} 次`;
-
-  const batches = d.batches || [];
-  document.getElementById('batch-body').innerHTML = batches.length ? batches.map(b => `
-    <tr><td>第 ${b.batch_idx + 1} 批</td><td>${fmt(b.price)}</td><td>${b.sz}</td>
-    <td><span class="badge ${b.filled ? 'fill' : 'wait'}">${b.filled ? '已成交' : '挂单中'}</span></td></tr>
-  `).join('') : '<tr><td colspan="4" class="muted">暂无批次</td></tr>';
-
-  const trades = d.trade_history || [];
-  document.getElementById('trade-body').innerHTML = trades.length ? trades.map(t => `
-    <tr><td>${t.time}</td><td>${t.action}</td><td>${fmt(t.price)}</td><td>${t.sz}</td>
-    <td class="${pnlClass(t.pnl)}">${t.pnl ? pnlText(t.pnl) : '--'}</td></tr>
-  `).join('') : '<tr><td colspan="5" class="muted">暂无成交</td></tr>';
-}
-
-async function loadLogs() {
-  const res = await fetch('/api/logs');
-  const logs = await res.json();
-  const select = document.getElementById('log-select');
-  if (!select.options.length) {
-    select.innerHTML = logs.map(log => `<option value="${log.name}">${log.label || log.name}</option>`).join('');
-    if (logs.length) loadHistory();
-  }
-}
-
-async function loadHistory() {
-  const select = document.getElementById('log-select');
-  if (!select.value) return;
-  const res = await fetch(`/api/history?file=${encodeURIComponent(select.value)}&limit=1200`);
-  const data = await res.json();
-  const tradeRes = await fetch(`/api/history/trades?file=${encodeURIComponent(select.value)}`);
-  const tradeData = await tradeRes.json();
-  drawHistory(data.points || [], tradeData.events || []);
-  renderHistoryStats(data.summary || {});
-  renderHistoryTrades(tradeData || {});
-}
-
-function renderHistoryStats(s) {
-  document.getElementById('history-range').textContent = s.start ? `${s.file}: ${s.start} -> ${s.end}` : '没有可解析数据';
-  const items = [
-    ['Tick', s.total_ticks || 0],
-    ['价格区间', `${fmt(s.min_price)} - ${fmt(s.max_price)}`],
-    ['采样点', s.sampled_ticks || 0],
-  ];
-  document.getElementById('history-stats').innerHTML = items.map(([label, value]) => `
-    <div class="mini"><div class="label">${label}</div><div class="value">${value}</div></div>
-  `).join('');
-}
-
-function eventTypeLabel(type) {
-  const map = {
-    signal: '信号',
-    entry_order: '入场挂单',
-    exit_order: '止盈挂单',
-    close_summary: '平仓摘要',
-    first_fill: '头仓成交',
-    add_fill: '补仓成交',
-    close: '平仓',
-    capital_profit: '固本收益',
-    capital_loss: '固本补亏'
-  };
-  return map[type] || type || '--';
-}
-
-function directionLabel(direction) {
-  if (direction === 'long') return '多';
-  if (direction === 'short') return '空';
-  return direction || '--';
-}
-
-function renderHistoryTrades(data) {
-  const summary = data.summary || {};
-  const currentStats = document.getElementById('history-stats').innerHTML;
-  const tradeStats = [
-    ['实际收益', pnlText(summary.total_pnl || 0)],
-    ['平仓次数', summary.closes || 0],
-    ['胜率', `${fmt(summary.win_rate || 0)}%`],
-    ['头仓/补仓', `${summary.first_fills || 0} / ${summary.add_fills || 0}`],
-    ['平均实际', pnlText(summary.avg_pnl || 0)],
-  ].map(([label, value]) => `
-    <div class="mini"><div class="label">${label}</div><div class="value">${value}</div></div>
-  `).join('');
-  document.getElementById('history-stats').innerHTML = currentStats + tradeStats;
-
-  const daily = data.daily || [];
-  document.getElementById('daily-body').innerHTML = daily.length ? daily.map(row => `
-    <tr>
-      <td>${row.date}</td>
-      <td>${row.orders}</td>
-      <td>${row.first_fills}</td>
-      <td>${row.add_fills}</td>
-      <td>${row.closes}</td>
-      <td class="num ${pnlClass(row.actual_pnl)}">${pnlText(row.actual_pnl)}</td>
-      <td class="num ${pnlClass(row.cum_pnl)}">${pnlText(row.cum_pnl)}</td>
-    </tr>
-  `).join('') : '<tr><td colspan="7" class="muted">暂无可解析交易</td></tr>';
-
-  const trades = data.trades || [];
-  document.getElementById('history-trade-body').innerHTML = trades.length ? trades.map(t => {
-    if (t.record_type === 'settlement') {
-      return `
-        <tr>
-          <td class="time-cell">${t.exit_time || '--'}</td>
-          <td colspan="6" class="note-cell muted">跨日固本划转，当前日志缺少对应开仓/平仓明细</td>
-          <td class="num ${pnlClass(t.actual_pnl || t.pnl)}">${pnlText(t.actual_pnl || t.pnl)}</td>
-          <td class="note-cell">实际收益</td>
-        </tr>
-      `;
-    }
-    return `
-      <tr>
-        <td class="time-cell">${t.entry_time || '--'}</td>
-        <td class="time-cell">${t.exit_time || '--'}</td>
-        <td>${directionLabel(t.direction)}</td>
-        <td class="num">${fmt(t.avg_entry)}</td>
-        <td class="num">${fmt(t.exit_price)}</td>
-        <td class="num">${t.sz || '--'}</td>
-        <td class="num">${t.batches || 0}</td>
-        <td class="num ${pnlClass(t.actual_pnl || t.pnl)}">${pnlText(t.actual_pnl || t.pnl)}</td>
-        <td class="note-cell">${t.pnl_source === 'capital' ? '实际收益' : ''}</td>
-      </tr>
-    `;
-  }).join('') : '<tr><td colspan="9" class="muted">暂无平仓交易</td></tr>';
-
-  const events = data.events || [];
-  document.getElementById('event-body').innerHTML = events.length ? events.map(e => `
-    <tr>
-      <td>${e.time}</td>
-      <td>${eventTypeLabel(e.type)}</td>
-      <td>${directionLabel(e.direction)}</td>
-      <td>${e.price ? fmt(e.price) : '--'}</td>
-      <td>${e.sz || '--'}</td>
-      <td class="${pnlClass(e.pnl)}">${e.pnl ? pnlText(e.pnl) : '--'}</td>
-      <td>${e.note || ''}</td>
-    </tr>
-  `).join('') : '<tr><td colspan="7" class="muted">暂无动作流水</td></tr>';
-}
-
-function drawHistory(points, events = []) {
-  const canvas = document.getElementById('history-chart');
-  const ctx = canvas.getContext('2d');
-  const w = canvas.width, h = canvas.height;
-  ctx.clearRect(0, 0, w, h);
-  ctx.fillStyle = '#0e1318';
-  ctx.fillRect(0, 0, w, h);
-  if (!points.length) {
-    ctx.fillStyle = '#8a97a6';
-    ctx.fillText('没有历史数据', 24, 40);
-    return;
-  }
-  const all = points.flatMap(p => [p.price, p.lower, p.mid, p.upper]);
-  const min = Math.min(...all), max = Math.max(...all);
-  const pad = Math.max((max - min) * 0.08, 1);
-  const lo = min - pad, hi = max + pad;
-  const x = i => 48 + i / Math.max(points.length - 1, 1) * (w - 78);
-  const y = v => 24 + (hi - v) / (hi - lo) * (h - 58);
-
-  ctx.strokeStyle = '#26313d';
-  ctx.lineWidth = 1;
-  for (let i = 0; i < 5; i++) {
-    const yy = 24 + i * (h - 58) / 4;
-    ctx.beginPath(); ctx.moveTo(48, yy); ctx.lineTo(w - 30, yy); ctx.stroke();
-    const labelValue = hi - i * (hi - lo) / 4;
-    ctx.fillStyle = '#8a97a6';
-    ctx.font = '11px Segoe UI';
-    ctx.fillText(fmt(labelValue), 8, yy + 4);
-  }
-  for (let i = 0; i < 6; i++) {
-    const xx = 48 + i * (w - 78) / 5;
-    ctx.strokeStyle = '#18202a';
-    ctx.beginPath(); ctx.moveTo(xx, 24); ctx.lineTo(xx, h - 34); ctx.stroke();
-  }
-
-  function line(key, color, width = 1.5) {
-    ctx.strokeStyle = color; ctx.lineWidth = width; ctx.beginPath();
-    points.forEach((p, i) => i ? ctx.lineTo(x(i), y(p[key])) : ctx.moveTo(x(i), y(p[key])));
-    ctx.stroke();
-  }
-  line('upper', '#ff5f66', 1);
-  line('mid', '#e5b454', 1);
-  line('lower', '#27c483', 1);
-  line('price', '#5aa7ff', 2);
-
-  const pointTimes = points.map(p => new Date(p.ts.replace(' ', 'T')).getTime());
-  const markerTypes = new Set(['first_fill', 'add_fill', 'close', 'capital_profit', 'capital_loss']);
-  const markers = (events || []).filter(e => markerTypes.has(e.type));
-  function nearestIndex(ts) {
-    const target = new Date(ts.replace(' ', 'T')).getTime();
-    if (!Number.isFinite(target)) return -1;
-    let best = -1, bestGap = Infinity;
-    pointTimes.forEach((value, idx) => {
-      const gap = Math.abs(value - target);
-      if (gap < bestGap) { bestGap = gap; best = idx; }
-    });
-    return best;
-  }
-  const markerStyle = {
-    first_fill: { color: '#27c483', label: '头', offset: -28 },
-    add_fill: { color: '#e5b454', label: '补', offset: 30 },
-    close: { color: '#ff5f66', label: '平', offset: -48 },
-    capital_profit: { color: '#ff5f66', label: '平', offset: -48 },
-    capital_loss: { color: '#ff5f66', label: '平', offset: -48 },
-  };
-  markers.forEach(e => {
-    const idx = nearestIndex(e.time);
-    if (idx < 0) return;
-    const style = markerStyle[e.type] || { color: '#ffffff', label: '?', offset: -28 };
-    const color = style.color;
-    const label = style.label;
-    const xx = x(idx);
-    const yy = y(e.price || points[idx].price);
-    const labelY = Math.max(34, Math.min(h - 48, yy + style.offset));
-    ctx.save();
-    ctx.strokeStyle = color;
-    ctx.setLineDash([4, 4]);
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(xx, 24);
-    ctx.lineTo(xx, h - 34);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.fillStyle = color;
-    ctx.beginPath();
-    ctx.arc(xx, yy, 6, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#0b0e11';
-    ctx.fillRect(xx - 13, labelY - 10, 26, 20);
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 1.5;
-    ctx.strokeRect(xx - 13, labelY - 10, 26, 20);
-    ctx.font = 'bold 13px "Microsoft YaHei", Segoe UI';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = color;
-    ctx.fillText(label, xx, labelY + 1);
-    ctx.restore();
-  });
-
-  ctx.fillStyle = '#8a97a6';
-  ctx.font = '12px Segoe UI';
-  ctx.fillText(points[0].ts, 48, h - 10);
-  ctx.textAlign = 'right';
-  ctx.fillText(points[points.length - 1].ts, w - 30, h - 10);
-  ctx.textAlign = 'left';
-  ctx.fillStyle = '#5aa7ff'; ctx.fillText('Price', w - 210, 22);
-  ctx.fillStyle = '#ff5f66'; ctx.fillText('Upper', w - 160, 22);
-  ctx.fillStyle = '#e5b454'; ctx.fillText('Mid', w - 108, 22);
-  ctx.fillStyle = '#27c483'; ctx.fillText('Lower', w - 70, 22);
-  ctx.fillStyle = '#27c483'; ctx.fillText('头 头仓', 56, 22);
-  ctx.fillStyle = '#e5b454'; ctx.fillText('补 补仓', 116, 22);
-  ctx.fillStyle = '#ff5f66'; ctx.fillText('平 平仓/划转', 176, 22);
-}
-
-refreshLive();
-setInterval(refreshLive, 3000);
-</script>
-</body>
-</html>"""
 
 _DESIGN_HTML = """<!DOCTYPE html>
 <html lang="zh">
@@ -1179,7 +675,7 @@ _DESIGN_HTML = """<!DOCTYPE html>
   .panel.hot { border-color: rgba(16, 215, 255, .45); box-shadow: 0 0 0 1px rgba(16, 215, 255, .10), var(--shadow); }
   .trade-strip {
     display: grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    grid-template-columns: repeat(7, minmax(0, 1fr));
     gap: 10px;
     padding: 14px;
     background: linear-gradient(180deg, rgba(15, 20, 32, .96), rgba(10, 14, 24, .96));
@@ -1194,6 +690,9 @@ _DESIGN_HTML = """<!DOCTYPE html>
   .trade-card .label { display: block; font-size: 12px; margin-bottom: 8px; }
   .trade-card .value { display: block; text-align: left; font-size: 20px; white-space: normal; }
   .trade-card.primary { border-color: rgba(16,215,255,.38); background: rgba(16,215,255,.08); }
+  .trade-card.attention { border-color: rgba(33,230,138,.28); }
+  .trade-card.attention.warn { border-color: rgba(255,194,26,.44); background: rgba(255,194,26,.08); }
+  .trade-card.attention.danger { border-color: rgba(255,79,120,.48); background: rgba(255,79,120,.08); }
   .panel h2, .section-title {
     margin: 0 0 14px;
     color: #dce8ff;
@@ -1283,6 +782,7 @@ _DESIGN_HTML = """<!DOCTYPE html>
   .badge.fill { background: rgba(33,230,138,.14); color: var(--green); }
   .badge.wait { background: rgba(255,194,26,.15); color: var(--yellow); }
   .toolbar { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+  .toolbar-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
   select, button {
     background: #111827;
     color: var(--text);
@@ -1377,6 +877,10 @@ _DESIGN_HTML = """<!DOCTYPE html>
     <section id="live">
       <div class="grid">
         <div class="panel trade-strip span-12">
+          <div class="trade-card attention" id="summary-attention-card">
+            <span class="label">需要关注</span>
+            <span class="value" id="summary-attention">--</span>
+          </div>
           <div class="trade-card primary">
             <span class="label">当前持仓</span>
             <span class="value" id="summary-position">--</span>
@@ -1459,8 +963,14 @@ _DESIGN_HTML = """<!DOCTYPE html>
             <h2 style="margin-bottom:4px">历史日志复盘</h2>
             <div class="muted" id="history-range">选择日志后查看价格、布林带、进场、补仓和平仓</div>
           </div>
-          <div>
+          <div class="toolbar-actions">
             <select id="log-select"></select>
+            <select id="event-filter" onchange="renderHistoryFromCache()">
+              <option value="all">全部事件</option>
+              <option value="entry">只看开/补仓</option>
+              <option value="close">只看平仓/划转</option>
+              <option value="loss">只看亏损交易</option>
+            </select>
             <button class="primary" id="history-load" onclick="loadHistory()">加载</button>
           </div>
         </div>
@@ -1522,7 +1032,17 @@ const fmt = (v, d = 2) => {
 const money = v => `${fmt(v)} USDT`;
 const pnlText = v => `${Number(v || 0) >= 0 ? '+' : ''}${fmt(v)} USDT`;
 const pnlClass = v => Number(v || 0) >= 0 ? 'green' : 'red';
+const RISK_THRESHOLDS = { danger: 8, warning: 18, stale: 10, offline: 30 };
+const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#39;'
+}[ch]));
 let historyChartState = null;
+let currentHistoryData = null;
+let currentTradeData = null;
 
 function showTab(name) {
   document.getElementById('live').classList.toggle('hidden', name !== 'live');
@@ -1568,14 +1088,41 @@ function riskScore(d) {
     ? (d.mark_price - d.liq_price) / d.mark_price
     : (d.liq_price - d.mark_price) / d.mark_price;
   const pctValue = distance * 100;
-  const color = pctValue < 8 ? 'var(--red)' : pctValue < 18 ? 'var(--yellow)' : 'var(--green)';
+  const color = pctValue < RISK_THRESHOLDS.danger ? 'var(--red)' : pctValue < RISK_THRESHOLDS.warning ? 'var(--yellow)' : 'var(--green)';
   return {
     score: fmt(pctValue, 2),
-    label: pctValue < 8 ? '危险缓冲%' : pctValue < 18 ? '注意缓冲%' : '安全缓冲%',
+    label: pctValue < RISK_THRESHOLDS.danger ? '危险缓冲%' : pctValue < RISK_THRESHOLDS.warning ? '注意缓冲%' : '安全缓冲%',
     pct: Math.max(8, Math.min(92, pctValue * 5)),
     color,
-    level: pctValue < 8 ? 'red' : pctValue < 18 ? 'yellow' : 'green'
+    level: pctValue < RISK_THRESHOLDS.danger ? 'red' : pctValue < RISK_THRESHOLDS.warning ? 'yellow' : 'green'
   };
+}
+
+function updateAttention(d, age, risk) {
+  const card = document.getElementById('summary-attention-card');
+  const text = document.getElementById('summary-attention');
+  const hasPosition = Number(d.total_sz || 0) > 0;
+  let level = 'ok';
+  let label = '正常巡航';
+  if (!d.updated_at || age === null || age > RISK_THRESHOLDS.offline) {
+    level = 'danger';
+    label = '数据中断';
+  } else if (age > RISK_THRESHOLDS.stale) {
+    level = 'warn';
+    label = '数据延迟';
+  } else if (hasPosition && risk.level === 'red') {
+    level = 'danger';
+    label = '接近强平';
+  } else if (hasPosition && !Number(d.tp_price || 0)) {
+    level = 'warn';
+    label = '止盈缺失';
+  } else if (hasPosition && Number(d.unrealized_pnl || 0) < 0) {
+    level = 'warn';
+    label = '持仓浮亏';
+  }
+  card.className = `trade-card attention ${level === 'danger' ? 'danger' : level === 'warn' ? 'warn' : ''}`;
+  text.textContent = label;
+  text.className = `value ${level === 'danger' ? 'red' : level === 'warn' ? 'yellow' : 'green'}`;
 }
 
 function updateSummary(d, age) {
@@ -1596,6 +1143,7 @@ function updateSummary(d, age) {
     ? distanceText(d.mark_price, d.tp_price, d.direction, true)
     : '--';
   const r = riskScore(d);
+  updateAttention(d, age, r);
   const liqBuffer = document.getElementById('summary-liq-buffer');
   liqBuffer.textContent = hasPosition ? `${r.score}%` : '--';
   liqBuffer.className = `value ${r.level}`;
@@ -1619,9 +1167,9 @@ async function refreshLive() {
   const age = dataAgeSeconds(d.updated_at);
   if (!d.updated_at) {
     setLiveStatus('offline', '等待策略数据');
-  } else if (age !== null && age > 30) {
+  } else if (age !== null && age > RISK_THRESHOLDS.offline) {
     setLiveStatus('offline', `数据中断 ${age} 秒`);
-  } else if (age !== null && age > 10) {
+  } else if (age !== null && age > RISK_THRESHOLDS.stale) {
     setLiveStatus('stale', `数据延迟 ${age} 秒`);
   } else {
     setLiveStatus('', `更新于 ${d.updated_at}`);
@@ -1669,13 +1217,13 @@ async function refreshLive() {
 
   const batches = d.batches || [];
   document.getElementById('batch-body').innerHTML = batches.length ? batches.map(b => `
-    <tr><td>第 ${Number(b.batch_idx || 0) + 1} 批</td><td class="num">${fmt(b.price)}</td><td class="num">${b.sz}</td>
+    <tr><td>第 ${Number(b.batch_idx || 0) + 1} 批</td><td class="num">${fmt(b.price)}</td><td class="num">${escapeHtml(b.sz)}</td>
     <td><span class="badge ${b.filled ? 'fill' : 'wait'}">${b.filled ? '已成交' : '挂单中'}</span></td></tr>
   `).join('') : '<tr><td colspan="4" class="muted">暂无批次</td></tr>';
 
   const trades = d.trade_history || [];
   document.getElementById('trade-body').innerHTML = trades.length ? trades.map(t => `
-    <tr><td>${t.time}</td><td>${t.action}</td><td class="num">${fmt(t.price)}</td><td class="num">${t.sz}</td>
+    <tr><td>${escapeHtml(t.time)}</td><td>${escapeHtml(t.action)}</td><td class="num">${fmt(t.price)}</td><td class="num">${escapeHtml(t.sz)}</td>
     <td class="num ${pnlClass(t.pnl)}">${t.pnl ? pnlText(t.pnl) : '--'}</td></tr>
   `).join('') : '<tr><td colspan="5" class="muted">暂无成交</td></tr>';
 }
@@ -1685,7 +1233,7 @@ async function loadLogs() {
   const logs = await res.json();
   const select = document.getElementById('log-select');
   if (!select.options.length) {
-    select.innerHTML = logs.map(log => `<option value="${log.name}">${log.label || log.name}</option>`).join('');
+    select.innerHTML = logs.map(log => `<option value="${escapeHtml(log.name)}">${escapeHtml(log.label || log.name)}</option>`).join('');
     const latest = logs.find(log => log.name !== '__all__');
     if (latest) select.value = latest.name;
     if (latest) loadHistory();
@@ -1710,9 +1258,11 @@ async function loadHistory() {
     const tradeRes = await fetch(`/api/history/trades?file=${encodeURIComponent(select.value)}`);
     if (!tradeRes.ok) throw new Error(`trades ${tradeRes.status}`);
     const tradeData = await tradeRes.json();
+    currentHistoryData = data;
+    currentTradeData = tradeData;
     renderHistoryStats(data.summary || {});
     renderHistoryTrades(tradeData || {});
-    drawHistory(data.points || [], tradeData.events || []);
+    drawHistory(data.points || [], filteredEvents(tradeData.events || []));
     message.textContent = `已加载 ${selectedLabel}`;
   } catch (err) {
     message.textContent = '日志加载失败，请换一个单日日志重试。';
@@ -1723,6 +1273,13 @@ async function loadHistory() {
   }
 }
 
+function renderHistoryFromCache() {
+  if (!currentHistoryData || !currentTradeData) return;
+  renderHistoryStats(currentHistoryData.summary || {});
+  renderHistoryTrades(currentTradeData || {});
+  drawHistory(currentHistoryData.points || [], filteredEvents(currentTradeData.events || []));
+}
+
 function renderHistoryStats(s) {
   document.getElementById('history-range').textContent = s.start ? `${s.file}: ${s.start} → ${s.end}` : '没有可解析数据';
   const items = [
@@ -1731,7 +1288,7 @@ function renderHistoryStats(s) {
     ['价格区间', `${fmt(s.min_price)} - ${fmt(s.max_price)}`],
   ];
   document.getElementById('history-stats').innerHTML = items.map(([label, value]) => `
-    <div class="mini"><div class="label">${label}</div><div class="value">${value}</div></div>
+    <div class="mini"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(value)}</div></div>
   `).join('');
 }
 
@@ -1766,6 +1323,18 @@ function cleanNote(e) {
   return e.note || '';
 }
 
+function historyFilterValue() {
+  return document.getElementById('event-filter')?.value || 'all';
+}
+
+function filteredEvents(events) {
+  const filter = historyFilterValue();
+  if (filter === 'entry') return events.filter(e => ['first_fill', 'add_fill', 'entry_order', 'signal'].includes(e.type));
+  if (filter === 'close') return events.filter(e => ['close', 'close_summary', 'exit_order', 'capital_profit', 'capital_loss'].includes(e.type));
+  if (filter === 'loss') return events.filter(e => Number(e.pnl || 0) < 0);
+  return events;
+}
+
 function renderHistoryTrades(data) {
   const summary = data.summary || {};
   const currentStats = document.getElementById('history-stats').innerHTML;
@@ -1776,14 +1345,14 @@ function renderHistoryTrades(data) {
     ['头仓/补仓', `${summary.first_fills || 0} / ${summary.add_fills || 0}`],
     ['平均实际', pnlText(summary.avg_pnl || 0)],
   ].map(([label, value]) => `
-    <div class="mini"><div class="label">${label}</div><div class="value ${String(value).startsWith('-') ? 'red' : ''}">${value}</div></div>
+    <div class="mini"><div class="label">${escapeHtml(label)}</div><div class="value ${String(value).startsWith('-') ? 'red' : ''}">${escapeHtml(value)}</div></div>
   `).join('');
   document.getElementById('history-stats').innerHTML = currentStats + tradeStats;
 
   const daily = data.daily || [];
   document.getElementById('daily-body').innerHTML = daily.length ? daily.map(row => `
     <tr>
-      <td>${row.date}</td>
+      <td>${escapeHtml(row.date)}</td>
       <td class="num">${row.orders}</td>
       <td class="num">${row.first_fills}</td>
       <td class="num">${row.add_fills}</td>
@@ -1793,12 +1362,13 @@ function renderHistoryTrades(data) {
     </tr>
   `).join('') : '<tr><td colspan="7" class="muted">暂无可解析交易</td></tr>';
 
-  const trades = data.trades || [];
+  const filter = historyFilterValue();
+  const trades = (data.trades || []).filter(t => filter !== 'loss' || Number(t.actual_pnl || t.pnl || 0) < 0);
   document.getElementById('history-trade-body').innerHTML = trades.length ? trades.map(t => {
     if (t.record_type === 'settlement') {
       return `
         <tr>
-          <td class="time-cell">${t.exit_time || '--'}</td>
+          <td class="time-cell">${escapeHtml(t.exit_time || '--')}</td>
           <td colspan="6" class="note-cell muted">跨日固本划转，当前日志缺少对应开仓和平仓明细</td>
           <td class="num ${pnlClass(t.actual_pnl || t.pnl)}">${pnlText(t.actual_pnl || t.pnl)}</td>
           <td class="note-cell">实际收益</td>
@@ -1807,12 +1377,12 @@ function renderHistoryTrades(data) {
     }
     return `
       <tr>
-        <td class="time-cell">${t.entry_time || '--'}</td>
-        <td class="time-cell">${t.exit_time || '--'}</td>
-        <td>${directionLabel(t.direction)}</td>
+        <td class="time-cell">${escapeHtml(t.entry_time || '--')}</td>
+        <td class="time-cell">${escapeHtml(t.exit_time || '--')}</td>
+        <td>${escapeHtml(directionLabel(t.direction))}</td>
         <td class="num">${fmt(t.avg_entry)}</td>
         <td class="num">${fmt(t.exit_price)}</td>
-        <td class="num">${t.sz || '--'}</td>
+        <td class="num">${escapeHtml(t.sz || '--')}</td>
         <td class="num">${t.batches || 0}</td>
         <td class="num ${pnlClass(t.actual_pnl || t.pnl)}">${pnlText(t.actual_pnl || t.pnl)}</td>
         <td class="note-cell">${t.pnl_source === 'capital' ? '实际收益' : ''}</td>
@@ -1820,16 +1390,16 @@ function renderHistoryTrades(data) {
     `;
   }).join('') : '<tr><td colspan="9" class="muted">暂无平仓交易</td></tr>';
 
-  const events = data.events || [];
+  const events = filteredEvents(data.events || []);
   document.getElementById('event-body').innerHTML = events.length ? events.map(e => `
     <tr>
-      <td>${e.time}</td>
-      <td>${eventTypeLabel(e.type)}</td>
-      <td>${directionLabel(e.direction)}</td>
+      <td>${escapeHtml(e.time)}</td>
+      <td>${escapeHtml(eventTypeLabel(e.type))}</td>
+      <td>${escapeHtml(directionLabel(e.direction))}</td>
       <td class="num">${e.price ? fmt(e.price) : '--'}</td>
-      <td class="num">${e.sz || '--'}</td>
+      <td class="num">${escapeHtml(e.sz || '--')}</td>
       <td class="num ${pnlClass(e.pnl)}">${e.pnl ? pnlText(e.pnl) : '--'}</td>
-      <td class="note-cell">${cleanNote(e)}</td>
+      <td class="note-cell">${escapeHtml(cleanNote(e))}</td>
     </tr>
   `).join('') : '<tr><td colspan="7" class="muted">暂无动作流水</td></tr>';
 }
@@ -1988,9 +1558,9 @@ function attachChartTooltip() {
     const idx = Math.max(0, Math.min(points.length - 1, Math.round((mx - left) / (w - left - right) * (points.length - 1))));
     const p = points[idx];
     const near = markers.find(m => Math.abs(m.x - mx) < 14 && Math.abs(m.y - my) < 20);
-    const eventHtml = near ? `<div style="margin-top:8px;color:${near.style.color}">${eventTypeLabel(near.event.type)} ${near.event.price ? fmt(near.event.price) : ''} ${near.event.pnl ? pnlText(near.event.pnl) : ''}</div>` : '';
+    const eventHtml = near ? `<div style="margin-top:8px;color:${near.style.color}">${escapeHtml(eventTypeLabel(near.event.type))} ${near.event.price ? fmt(near.event.price) : ''} ${near.event.pnl ? pnlText(near.event.pnl) : ''}</div>` : '';
     tooltip.innerHTML = `
-      <div class="muted">${p.ts}</div>
+      <div class="muted">${escapeHtml(p.ts)}</div>
       <div>价格 <b class="cyan">${fmt(p.price)}</b></div>
       <div>布林 <span class="green">${fmt(p.lower)}</span> / <span class="yellow">${fmt(p.mid)}</span> / <span class="red">${fmt(p.upper)}</span></div>
       <div>宽度 <b>${fmt(p.upper - p.lower)}</b></div>
@@ -2041,7 +1611,7 @@ async def _handle_logs(request):
     logs = _list_log_files()
     if logs:
         total_size = sum(item["size"] for item in logs)
-        logs.insert(0, {
+        logs.append({
             "name": "__all__",
             "size": total_size,
             "modified": logs[0]["modified"],
@@ -2068,8 +1638,8 @@ async def _handle_history_trades(request):
     return web.json_response(data)
 
 
-async def start_dashboard():
-    """Start the dashboard server in the current event loop."""
+def create_dashboard_app() -> web.Application:
+    """Create the local dashboard aiohttp app."""
     app = web.Application()
     app.router.add_get("/", _handle_index)
     app.router.add_get("/assets/{filename}", _handle_asset)
@@ -2077,6 +1647,12 @@ async def start_dashboard():
     app.router.add_get("/api/logs", _handle_logs)
     app.router.add_get("/api/history", _handle_history)
     app.router.add_get("/api/history/trades", _handle_history_trades)
+    return app
+
+
+async def start_dashboard():
+    """Start the dashboard server in the current event loop."""
+    app = create_dashboard_app()
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, WEB_HOST, WEB_PORT)

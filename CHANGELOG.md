@@ -4,6 +4,44 @@ All notable strategy, risk-control, dashboard, and optimizer changes should be r
 
 Use this file to answer: what changed, why it changed, how it was tested, and what risk remains.
 
+## 2026-06-21 - Dashboard P0-P2 Hardening
+
+### Added
+
+- Added a first-screen attention card for:
+  - Delayed or missing strategy data.
+  - Dangerous liquidation buffer.
+  - Missing take-profit price while holding a position.
+  - Floating-loss position state.
+- Added frontend history filters for:
+  - Entry and add-on events.
+  - Close and transfer events.
+  - Loss-focused review.
+- Added `tools/dashboard_smoke_test.py` for dashboard source and API smoke checks.
+
+### Changed
+
+- Removed the unused legacy dashboard HTML block so there is only one active `_DESIGN_HTML` implementation.
+- Changed historical chart parsing to stream points with bounded sampling instead of retaining every tick in memory.
+- Added an in-process history cache keyed by selected log, limit, file size, and file mtime.
+- Moved the `全部日志` option to the end of the log selector response so the latest single-day log remains the default review target.
+- Centralized dashboard risk thresholds in `DASHBOARD_RISK_THRESHOLDS` / frontend threshold constants.
+- Escaped dynamic log text before injecting table rows and chart tooltips into dashboard HTML.
+- Added `create_dashboard_app()` so dashboard API smoke tests can run without binding the production port.
+- Updated README dashboard documentation for the attention card, history filters, cache behavior, and smoke test.
+
+### Tested
+
+- `.venv\Scripts\python.exe -m py_compile src\dashboard.py tools\dashboard_smoke_test.py`
+- Extracted dashboard JavaScript and checked it with `node --check`.
+- `.venv\Scripts\python.exe tools\dashboard_smoke_test.py`
+- `git diff --check -- src\dashboard.py tools\dashboard_smoke_test.py README.md CHANGELOG.md`
+
+### Risk Notes
+
+- Browser visual verification still could not run in this Windows sandbox because the browser runtime failed with `CreateProcessAsUserW failed: 5`; restart the local dashboard and do a manual desktop/mobile visual pass before relying on the layout.
+- `全部日志` still requires reading all selected log files on first parse; bounded sampling and caching reduce memory and repeated-review cost, but the first full-period parse can still take time on very large logs.
+
 ## 2026-06-21 - Post-Close Same-Direction Entry Guard
 
 ### Added
