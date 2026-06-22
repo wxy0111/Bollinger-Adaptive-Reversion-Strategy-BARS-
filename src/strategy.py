@@ -982,6 +982,7 @@ class BollPinStrategy:
                 "sl_ord_id": self._state.sl_ord_id,
                 "plan_liq_price": self._state.plan_liq_price,
                 "plan_sl_price": self._state.plan_sl_price,
+                "plan_sl_mode": self._state.plan_sl_mode,
                 "plan_tp_price": self._state.plan_tp_price,
                 "avg_entry": self._state.avg_entry,
                 "total_sz": self._state.total_sz,
@@ -1058,7 +1059,8 @@ class BollPinStrategy:
         log_check(
             f"{label}: direction={self._state.direction} avg={self._state.avg_entry:.2f} "
             f"sz={self._state.total_sz:g} tp={self._state.plan_tp_price:.2f} "
-            f"sl={self._state.plan_sl_price:.2f} liq={self._state.plan_liq_price:.2f} "
+            f"sl={self._state.plan_sl_price:.2f} sl_mode={self._state.plan_sl_mode or '--'} "
+            f"liq={self._state.plan_liq_price:.2f} "
             f"filled=[{self._filled_batch_summary()}]"
         )
 
@@ -1238,6 +1240,7 @@ class BollPinStrategy:
             self._state.sl_ord_id = state.get("sl_ord_id")
             self._state.plan_liq_price = float(state.get("plan_liq_price", 0) or 0)
             self._state.plan_sl_price = float(state.get("plan_sl_price", 0) or 0)
+            self._state.plan_sl_mode = str(state.get("plan_sl_mode") or "")
             self._state.plan_tp_price = float(state.get("plan_tp_price", 0) or 0)
             self._state.avg_entry = float(state.get("avg_entry", 0) or 0)
             self._state.total_sz = float(state.get("total_sz", 0) or 0)
@@ -3193,7 +3196,7 @@ class BollPinStrategy:
             return 0.0, "", 0.0, 0.0, 0.0, 0.0
 
         sl_price = 0.0
-        stop_mode = "liquidation_guard"
+        stop_mode = "L1_liquidation_guard"
         target_loss = 0.0
         fixed_stop_price = 0.0
 
@@ -3206,7 +3209,7 @@ class BollPinStrategy:
                     self._state.total_sz,
                 )
                 sl_price = fixed_stop_price
-                stop_mode = "fixed_cycle_loss"
+                stop_mode = "L2_cycle_loss"
 
         liq_guard_price = 0.0
         if self._state.plan_liq_price > 0:
@@ -3221,10 +3224,10 @@ class BollPinStrategy:
         if liq_guard_price > 0:
             if pos_side == "long" and sl_price < liq_guard_price:
                 sl_price = liq_guard_price
-                stop_mode = "liquidation_guard_fallback"
+                stop_mode = "L1_liquidation_guard_fallback"
             elif pos_side == "short" and sl_price > liq_guard_price:
                 sl_price = liq_guard_price
-                stop_mode = "liquidation_guard_fallback"
+                stop_mode = "L1_liquidation_guard_fallback"
 
         sl_price = round(sl_price, 2) if sl_price > 0 else 0.0
         if sl_price <= 0:
@@ -3254,7 +3257,9 @@ class BollPinStrategy:
         self._state.update_position(total_sz, avg_entry, liq_price)
         self._seed_existing_position_batch()
 
-        desired_sl, _, _, _, _, _ = self._desired_stop_loss_order()
+        desired_sl, desired_mode, target_loss, estimated_loss, fixed_stop_price, liq_guard_price = (
+            self._desired_stop_loss_order()
+        )
         if desired_sl <= 0:
             return
 
@@ -3265,7 +3270,10 @@ class BollPinStrategy:
         if sl_missing or sl_changed:
             log_action(
                 f"Refresh stop after liquidation update "
-                f"liq={old_liq:.2f}->{liq_price:.2f} sl={old_sl:.2f}->{desired_sl:.2f}"
+                f"mode={desired_mode} liq={old_liq:.2f}->{liq_price:.2f} "
+                f"sl={old_sl:.2f}->{desired_sl:.2f} "
+                f"l2_stop={fixed_stop_price:.2f} l1_guard={liq_guard_price:.2f} "
+                f"target_loss={target_loss:.2f} est_loss={estimated_loss:.2f}"
             )
             await self._update_sl(client)
             self._save_runtime_state()
@@ -3360,22 +3368,24 @@ class BollPinStrategy:
             )
             self._state.sl_ord_id = r.get("algoId", "")
             self._state.plan_sl_price = sl_price
-            if stop_mode == "fixed_cycle_loss":
+            self._state.plan_sl_mode = stop_mode
+            if stop_mode == "L2_cycle_loss":
                 log_action(
-                    f"Fixed cycle-loss stop order trigger={sl_price} mode={stop_mode} "
+                    f"L2 cycle-loss stop order trigger={sl_price} mode={stop_mode} "
                     f"target_loss={target_loss:.2f} est_loss={estimated_loss:.2f} "
                     f"avg={self._state.avg_entry:.2f} sz={self._state.total_sz}"
                 )
-            elif stop_mode == "liquidation_guard_fallback":
+            elif stop_mode == "L1_liquidation_guard_fallback":
                 log_action(
-                    f"Liquidation guard fallback stop order trigger={sl_price} "
-                    f"fixed_stop={fixed_stop_price:.2f} liq_guard={liq_guard_price:.2f} "
+                    f"L2 beyond liquidation, fallback to L1 liquidation guard "
+                    f"trigger={sl_price} l2_stop={fixed_stop_price:.2f} "
+                    f"l1_guard={liq_guard_price:.2f} "
                     f"target_loss={target_loss:.2f} est_loss={estimated_loss:.2f} "
                     f"avg={self._state.avg_entry:.2f} sz={self._state.total_sz}"
                 )
             else:
                 log_action(
-                    f"Liquidation stop order trigger={sl_price} "
+                    f"L1 liquidation guard stop order trigger={sl_price} mode={stop_mode} "
                     f"liq={self._state.plan_liq_price} sz={self._state.total_sz}"
                 )
         except Exception as e:

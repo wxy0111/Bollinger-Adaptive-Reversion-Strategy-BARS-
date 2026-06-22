@@ -40,6 +40,8 @@ class PositionState:
         sl_ord_id: Active stop-loss algo order id.
         plan_liq_price: Latest liquidation price from OKX or plan estimate.
         plan_sl_price: Latest stop trigger price.
+        plan_sl_mode: Latest stop type, such as L1 liquidation guard or
+            L2 cycle loss.
         plan_tp_price: Latest take-profit price.
         avg_entry: Latest average entry price.
         total_sz: Latest position size in contracts.
@@ -55,6 +57,7 @@ class PositionState:
     sl_ord_id: Optional[str] = None
     plan_liq_price: float = 0.0
     plan_sl_price: float  = 0.0
+    plan_sl_mode: str = ""
     plan_tp_price: float  = 0.0
     avg_entry: float = 0.0
     total_sz: float = 0.0
@@ -140,6 +143,7 @@ class PositionState:
         self.sl_ord_id = None
         self.plan_liq_price = 0.0
         self.plan_sl_price  = 0.0
+        self.plan_sl_mode = ""
         self.plan_tp_price  = 0.0
         self.avg_entry = 0.0
         self.total_sz = 0.0
