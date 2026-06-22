@@ -765,6 +765,38 @@ class BollPinStrategy:
             return avg_entry + price_delta
         return 0.0
 
+    def _estimated_liq_price_from_position(
+        self,
+        direction: str,
+        avg_entry: float,
+        total_sz: float,
+    ) -> float:
+        """Estimate a liquidation boundary when OKX omits liqPx after restart."""
+        if direction not in ("long", "short") or avg_entry <= 0 or total_sz <= 0 or LEVER <= 0:
+            return 0.0
+        margin = avg_entry * total_sz * CT_VAL / LEVER
+        price_delta = (margin * 0.9) / (total_sz * CT_VAL)
+        if direction == "long":
+            return round(max(avg_entry - price_delta, 0.0), 2)
+        return round(avg_entry + price_delta, 2)
+
+    def _ensure_liq_price_for_active_position(self, reason: str) -> None:
+        """Keep L1 liquidation guard available even if exchange liqPx is empty."""
+        if self._state.plan_liq_price > 0:
+            return
+        estimated = self._estimated_liq_price_from_position(
+            self._state.direction,
+            self._state.avg_entry,
+            self._state.total_sz,
+        )
+        if estimated <= 0:
+            return
+        self._state.plan_liq_price = estimated
+        log_check(
+            f"{reason}: exchange liqPx unavailable; estimated L1 liquidation boundary "
+            f"liq={estimated:.2f} avg={self._state.avg_entry:.2f} sz={self._state.total_sz:g}"
+        )
+
     def _simulated_entry_totals(self, batch_idx: int, candidate_price: float, candidate_sz: float):
         """Return average entry and size after replacing/adding one batch."""
         entries = [
@@ -3177,6 +3209,7 @@ class BollPinStrategy:
 
         self._state.direction = pos_side
         self._state.update_position(total_sz, avg_entry, liq_price)
+        self._ensure_liq_price_for_active_position("Exchange position sync")
         self._seed_existing_position_batch()
 
         if avg_entry > 0 and (not self._dynamic_tp_active or self._state.plan_tp_price <= 0):
@@ -3199,6 +3232,7 @@ class BollPinStrategy:
         stop_mode = "L1_liquidation_guard"
         target_loss = 0.0
         fixed_stop_price = 0.0
+        self._ensure_liq_price_for_active_position("Stop-loss calculation")
 
         if COPY_FIXED_LOSS_STOP_ENABLED and self._state.avg_entry > 0:
             target_loss = self._fixed_loss_target_usdt()
@@ -3220,14 +3254,6 @@ class BollPinStrategy:
 
         if sl_price <= 0 and liq_guard_price > 0:
             sl_price = liq_guard_price
-
-        if liq_guard_price > 0:
-            if pos_side == "long" and sl_price < liq_guard_price:
-                sl_price = liq_guard_price
-                stop_mode = "L1_liquidation_guard_fallback"
-            elif pos_side == "short" and sl_price > liq_guard_price:
-                sl_price = liq_guard_price
-                stop_mode = "L1_liquidation_guard_fallback"
 
         sl_price = round(sl_price, 2) if sl_price > 0 else 0.0
         if sl_price <= 0:
@@ -3255,6 +3281,7 @@ class BollPinStrategy:
 
         self._state.direction = pos_side
         self._state.update_position(total_sz, avg_entry, liq_price)
+        self._ensure_liq_price_for_active_position("Liquidation refresh")
         self._seed_existing_position_batch()
 
         desired_sl, desired_mode, target_loss, estimated_loss, fixed_stop_price, liq_guard_price = (
@@ -3371,8 +3398,10 @@ class BollPinStrategy:
             self._state.plan_sl_mode = stop_mode
             if stop_mode == "L2_cycle_loss":
                 log_action(
-                    f"L2 cycle-loss stop order trigger={sl_price} mode={stop_mode} "
+                    f"L2 current-position fixed-amount stop order trigger={sl_price} "
+                    f"mode={stop_mode} "
                     f"target_loss={target_loss:.2f} est_loss={estimated_loss:.2f} "
+                    f"l1_guard={liq_guard_price:.2f} "
                     f"avg={self._state.avg_entry:.2f} sz={self._state.total_sz}"
                 )
             elif stop_mode == "L1_liquidation_guard_fallback":
@@ -3935,6 +3964,8 @@ class BollPinStrategy:
         s.avg_entry = self._state.avg_entry if self._state.total_sz > 0 else 0.0
         s.total_sz = self._state.total_sz
         s.tp_price = self._state.plan_tp_price
+        s.sl_price = self._state.plan_sl_price
+        s.sl_mode = self._state.plan_sl_mode
         s.liq_price = self._state.plan_liq_price
         s.batches = [
             {

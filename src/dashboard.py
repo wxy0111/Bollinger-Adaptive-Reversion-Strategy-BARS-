@@ -85,6 +85,8 @@ class DashboardState:
     avg_entry: float = 0.0
     total_sz: float = 0.0
     tp_price: float = 0.0
+    sl_price: float = 0.0
+    sl_mode: str = ""
     liq_price: float = 0.0
     unrealized_pnl: float = 0.0
     batches: List[dict] = field(default_factory=list)
@@ -946,6 +948,8 @@ _DESIGN_HTML = """<!DOCTYPE html>
         <div class="panel span-4">
           <h2>退出订单</h2>
           <div class="metric"><span class="label">止盈价</span><span class="value green" id="tp-price">--</span></div>
+          <div class="metric"><span class="label">止损价</span><span class="value red" id="sl-price">--</span></div>
+          <div class="metric"><span class="label">止损模式</span><span class="value" id="sl-mode">--</span></div>
           <div class="metric"><span class="label">强平线</span><span class="value red" id="liq-price-copy">--</span></div>
           <div class="metric"><span class="label">成交流水</span><span class="value" id="trade-count">--</span></div>
         </div>
@@ -1217,6 +1221,8 @@ async function refreshLive() {
   upnlEl.textContent = d.total_sz > 0 ? pnlText(d.unrealized_pnl) : '--';
   upnlEl.className = `value ${pnlClass(d.unrealized_pnl)}`;
   document.getElementById('tp-price').textContent = d.tp_price > 0 ? fmt(d.tp_price) : '--';
+  document.getElementById('sl-price').textContent = d.sl_price > 0 ? fmt(d.sl_price) : '--';
+  document.getElementById('sl-mode').textContent = d.sl_mode || '--';
   document.getElementById('liq-price').textContent = d.liq_price > 0 ? fmt(d.liq_price) : '--';
   document.getElementById('liq-price-copy').textContent = d.liq_price > 0 ? fmt(d.liq_price) : '--';
   document.getElementById('trade-count').textContent = `${d.total_trades || 0} 次`;
