@@ -4,6 +4,51 @@ All notable strategy, risk-control, dashboard, and optimizer changes should be r
 
 Use this file to answer: what changed, why it changed, how it was tested, and what risk remains.
 
+## 2026-06-22 - Tiered Spike-Memory Entry And Fixed Cycle Stop
+
+### Added
+
+- Added spike-memory candidates for first entries and add-ons:
+  - Record a recent same-direction Bollinger-band spike.
+  - Wait until price stops making a fresh adverse extreme.
+  - Place the entry/add-on near the spike extreme with a rebound offset.
+- Added tiered inside confirmation:
+  - `1.5% <= Bollinger width < 2.4%`: D mode, near-band confirmation is enough.
+  - `2.4% <= Bollinger width < 2.8%`: price must return inside the Bollinger band before first entry/add-on.
+  - `>= 2.8%`: first batch remains blocked by `ENTRY_MAX_BOLL_WIDTH_PCT`.
+- Added spike-memory dynamic take-profit locking so dynamic TP waits for favorable profit momentum to stop extending before repricing.
+- Added offline comparison policies in `backtest/spike_entry_window_backtest.py` for D, D-inside, tiered inside, no-entry-max-width, and ablation checks.
+
+### Changed
+
+- Removed the regular tick-path call to the legacy recovery add-on logic so normal add-ons cannot bypass the spike-memory / tiered entry rules.
+- Updated unfilled first-batch and add-on reprice paths so repricing must still pass the tiered spike-entry zone.
+- Relaxed pending-order band guard to keep valid near-band pending orders, matching the spike-memory D entry zone.
+- Renamed fixed-loss stop logging to distinguish:
+  - `fixed_cycle_loss`
+  - `liquidation_guard_fallback`
+- Kept `ENTRY_MAX_BOLL_WIDTH_PCT = 0.028`; local log tests showed 3.0%, 3.2%, or disabling the max-width filter materially worsened return and drawdown.
+
+### Tested
+
+- `python -m py_compile src\strategy.py backtest\spike_entry_window_backtest.py`
+- Local 3-second log replay:
+  - D: `-9.6246U`, 35 trades, max drawdown `10.9451%`, min liq distance `0.3474%`.
+  - Global D-inside: `+34.4896U`, 20 trades, max drawdown `6.775%`, min liq distance `1.2216%`.
+  - Tier inside 2.2%: `+41.9692U`, 25 trades, max drawdown `7.0336%`, min liq distance `1.0031%`.
+  - Tier inside 2.4%: `+47.9533U`, 26 trades, max drawdown `7.1073%`, min liq distance `0.9472%`.
+- Local max-width replay:
+  - D at 3.0% / 3.2% worsened to `-158.9908U` / `-141.5103U`.
+  - D-inside at 3.0% / 3.2% worsened to `-38.1895U` / `-31.1623U`.
+  - Disabling first-entry max width worsened D to `-115.2501U` locally and `-477.1784U` on combined extreme logs.
+- Combined generated extreme-log replay was reviewed as a coarse stress test only because those logs are 15-minute kline resamples, not true 3-second order-book paths.
+
+### Risk Notes
+
+- The backtest remains a log replay, not an exchange order-book fill simulator.
+- The generated extreme logs are useful for broad single-sided stress direction, but their exact PnL is less reliable for 3-second spike-catching decisions.
+- Add-on maximum Bollinger width remains governed by `ADDON_MAX_BOLL_WIDTH_FILTER_ENABLED`; the 2.8% max-width rule still applies only to first entries unless add-on max-width filtering is enabled separately.
+
 ## 2026-06-21 - Dashboard P0-P2 Hardening
 
 ### Added

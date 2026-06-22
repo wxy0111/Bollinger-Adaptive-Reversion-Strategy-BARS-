@@ -149,6 +149,41 @@ A first batch is considered only when:
 - The price is not still making a fresh extreme according to the no-new-extreme rule.
 - After a close, the same candle is blocked; during the next 4 candles, same-direction re-entry must not be worse than the previous cycle's last filled entry/add-on price.
 
+#### Spike Memory And Tiered Inside Confirmation
+
+Live first entries and add-ons use a spike-memory confirmation layer instead of entering only from the current tick:
+
+- A long candidate is recorded when price spikes below the lower Bollinger band.
+- A short candidate is recorded when price spikes above the upper Bollinger band.
+- The candidate is kept for a short TTL and updated if price makes a deeper same-direction extreme.
+- Entry waits until price stops making a fresh adverse extreme.
+- The limit order is placed near the spike extreme with a small rebound offset, not blindly at the current mark.
+
+The current tiered confirmation rule is:
+
+```text
+1.5% <= Bollinger width < 2.4%:
+  D mode. Price may enter when it returns to the configured near-band zone.
+
+2.4% <= Bollinger width < 2.8%:
+  Inside-confirm mode. Price must return inside the Bollinger band before entry/add-on is allowed.
+
+Bollinger width >= 2.8%:
+  First batch remains blocked by the first-entry max-width filter.
+```
+
+The near-band zone is:
+
+```text
+max(0.5 USDT, Bollinger width * 5%)
+```
+
+The spike order rebound offset is:
+
+```text
+max(0.3 USDT, Bollinger width * 3%)
+```
+
 Important entry parameters:
 
 ```python
@@ -163,6 +198,7 @@ ENTRY_DISASTER_SCORE_THRESHOLD = 4
 ENTRY_DISASTER_FAR_MID_RATIO = 0.85
 NO_NEW_EXTREME_TICKS = 2
 REPRICE_GAP_USD = 0.5
+SPIKE_INSIDE_CONFIRM_WIDTH_PCT = 0.024
 PENDING_ORDER_BAND_GUARD_ENABLED = True
 POST_CLOSE_SAME_DIRECTION_PRICE_GUARD_ENABLED = True
 POST_CLOSE_SAME_DIRECTION_PRICE_GUARD_KLINES = 4
@@ -203,12 +239,13 @@ Pending entry orders are maintained separately from real fills:
 - A canceled or repriced order does not lock the current candle.
 - Only a real fill locks the candle, so each 15-minute candle can have at most one actual entry or add-on fill.
 - `PENDING_ORDER_BAND_GUARD_ENABLED` cancels stale pending entries when the order price is no longer outside the current Bollinger band.
+- Repricing an unfilled first batch or add-on must still pass the same tiered spike-entry zone. This prevents an order from being repriced outside the band when the 2.4% inside-confirm tier is active.
 
 Band-guard rules:
 
 ```text
-Long pending order: keep only when order_price <= current lower band.
-Short pending order: keep only when order_price >= current upper band.
+Long pending order: keep only when order_price <= current lower band + near-band tolerance.
+Short pending order: keep only when order_price >= current upper band - near-band tolerance.
 ```
 
 This keeps the strategy consistent with the band-break entry idea while still allowing the same candle to re-evaluate and re-place orders if nothing has filled yet.
@@ -220,6 +257,7 @@ Add-ons are considered only after a real position exists. The strategy checks:
 - No pending entry order is still working.
 - The current 15-minute candle has not already added a batch.
 - Bollinger width is wide enough but does not violate optional add-on max-width rules.
+- A same-direction spike candidate has been recorded, has stopped extending, and passes the same tiered near-band / inside-band confirmation as first entries.
 - Trend-risk freeze has not blocked add-ons.
 - The new candidate price is far enough from the last real fill price.
 - The completed-candle extreme guard allows the add-on.
@@ -268,12 +306,15 @@ DYNAMIC_TP_REPRICE_GAP_USD = 0.5
 
 If floating profit reaches the arm threshold and price stops making favorable extremes, the strategy can reprice the take-profit order near the current price. Once armed, it no longer restores the original target automatically.
 
+Dynamic take-profit now uses the same spike-memory idea as entries: it records the best favorable profit spike, waits until price stops extending that favorable extreme, then locks the take-profit near the current mark. This avoids locking while price is still making new favorable highs for longs or lows for shorts.
+
 ### Stop Loss And Risk Guards
 
 Current stop and risk modules:
 
 - Liquidation guard stop: keeps a conditional stop near the real liquidation price.
-- Fixed-loss stop: places a stop based on strategy risk equity and `COPY_FIXED_LOSS_STOP_RATIO`.
+- Fixed cycle-loss stop: places a stop based on strategy risk equity and `COPY_FIXED_LOSS_STOP_RATIO`.
+- Liquidation-guard fallback: if the fixed cycle-loss stop would cross the liquidation guard boundary, the exchange stop is placed at the liquidation guard instead.
 - Fixed-loss head buffer: blocks add-ons if the fixed-loss stop would move too close to the first entry.
 - Disaster stop: closes the current position when head adverse move and loss ratio both hit the configured threshold, then keeps the program running.
 - Bollinger-mid cost stop: reprices take-profit near the configured cost-midline target when Bollinger midline crosses the position cost.

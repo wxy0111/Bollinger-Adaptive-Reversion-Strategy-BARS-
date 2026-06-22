@@ -103,6 +103,13 @@ import src.dashboard as dashboard
 
 STATE_FILE = Path("logs/runtime_state.json")
 COOLDOWN_FILE = Path("logs/close_cooldown.json")
+SPIKE_MEMORY_SEC = 9.0
+SPIKE_CANDIDATE_TTL_SEC = 12.0
+SPIKE_ENTRY_TOLERANCE_USD = 0.5
+SPIKE_ENTRY_TOLERANCE_BOLL_RATIO = 0.05
+SPIKE_INSIDE_CONFIRM_WIDTH_PCT = 0.024
+SPIKE_ORDER_REBOUND_OFFSET_USD = 0.3
+SPIKE_ORDER_REBOUND_OFFSET_BOLL_RATIO = 0.03
 
 
 class BollPinStrategy:
@@ -132,6 +139,9 @@ class BollPinStrategy:
         self._inside_band_kline_count = 0
         self._last_inside_band_kline_ts = None
         self._recent_prices = []
+        self._probe_spike_candidate = None
+        self._addon_spike_candidate = None
+        self._tp_spike_candidate = None
         self._sizing_equity = 0.0
         self._fixed_batch_sizes = []
         self._restored_from_file = False
@@ -1055,6 +1065,7 @@ class BollPinStrategy:
     def _clear_runtime_state(self):
         """Delete the persisted runtime-state file."""
         self._dynamic_tp_active = False
+        self._clear_spike_candidates()
         self._cycle_tp_target_margin_return = TP_TARGET_MARGIN_RETURN
         self._entry_extreme_gap_pct = 0.0
         self._entry_extreme_gap_mult = 1.0
@@ -1072,6 +1083,12 @@ class BollPinStrategy:
                 STATE_FILE.unlink()
         except Exception as e:
             logger.warning(f"Clear runtime state failed: {e}")
+
+    def _clear_spike_candidates(self) -> None:
+        """Drop pending spike-memory candidates."""
+        self._probe_spike_candidate = None
+        self._addon_spike_candidate = None
+        self._tp_spike_candidate = None
 
     def _save_close_cooldown(self):
         """Persist the last close kline so restart cannot re-enter too soon."""
@@ -1146,6 +1163,7 @@ class BollPinStrategy:
         self._probe_kline_ts = None
         self._probe_direction = "none"
         self._probe_entry_price = 0.0
+        self._probe_spike_candidate = None
 
     def _clamp_tp_return(self, value: float) -> float:
         """Clamp a TP return into the configured narrow-width range."""
@@ -1373,8 +1391,6 @@ class BollPinStrategy:
         if await self._check_boll_mid_cost_stop(client, last):
             self._update_dashboard(mark_price, last, account_equity)
             return
-        if self._state.is_active():
-            await self._recover_missing_entry_orders(client, df, last, self._sizing_equity, mark_price)
         await self._maybe_notify_liq_warning(mark_price)
         if self._state.is_active():
             compressed = await self._maybe_update_boll_tp_compression(client, mark_price, last)
@@ -1982,7 +1998,7 @@ class BollPinStrategy:
         return move * LEVER
 
     async def _maybe_update_dynamic_tp(self, client: OKXClient, mark_price: float) -> None:
-        """Switch take-profit to a live-price lock when profit momentum stalls."""
+        """Switch take-profit to a live-price lock after profit spike confirmation."""
         if not DYNAMIC_TP_ENABLED or not self._state.is_active():
             return
         ret = self._position_margin_return(mark_price)
@@ -1992,24 +2008,56 @@ class BollPinStrategy:
         target_return = self._cycle_tp_target_margin_return or TP_TARGET_MARGIN_RETURN
         if ret < DYNAMIC_TP_ARM_RETURN or ret >= target_return:
             return
-        if self._state.direction == "long" and self._still_making_new_high():
-            return
-        if self._state.direction == "short" and self._still_making_new_low():
+        self._clear_expired_spike_candidates()
+        self._record_tp_spike_candidate(mark_price)
+        if not self._tp_spike_candidate_stable():
             return
 
         lock_price = round(mark_price, 2)
+        if self._state.direction == "long" and lock_price <= self._state.avg_entry:
+            return
+        if self._state.direction == "short" and lock_price >= self._state.avg_entry:
+            return
         if abs(lock_price - self._state.plan_tp_price) < DYNAMIC_TP_REPRICE_GAP_USD:
             return
 
         old_tp = self._state.plan_tp_price
         self._state.plan_tp_price = lock_price
         self._dynamic_tp_active = True
+        self._tp_spike_candidate = None
         log_action(
-            f"Dynamic TP lock: return={ret:.2%} old_tp={old_tp:.2f} "
+            f"Dynamic TP spike lock: return={ret:.2%} old_tp={old_tp:.2f} "
             f"new_tp={lock_price:.2f}"
         )
         await self._update_tp(client)
         self._save_runtime_state()
+
+    def _record_tp_spike_candidate(self, mark_price: float) -> None:
+        """Remember the best profitable mark before dynamic TP lock."""
+        direction = self._state.direction
+        candidate = self._tp_spike_candidate
+        should_replace = candidate is None or candidate.get("direction") != direction
+        if candidate is not None and candidate.get("direction") == direction:
+            if direction == "long" and mark_price > float(candidate.get("extreme", mark_price)):
+                should_replace = True
+            if direction == "short" and mark_price < float(candidate.get("extreme", mark_price)):
+                should_replace = True
+        if should_replace:
+            self._tp_spike_candidate = {
+                "direction": direction,
+                "seen_monotonic": time.monotonic(),
+                "extreme": float(mark_price),
+            }
+
+    def _tp_spike_candidate_stable(self) -> bool:
+        """Return whether profitable price stopped extending before TP lock."""
+        if not self._tp_spike_candidate:
+            return False
+        if self._tp_spike_candidate.get("direction") == "long":
+            return not self._still_making_new_high()
+        if self._tp_spike_candidate.get("direction") == "short":
+            return not self._still_making_new_low()
+        return False
 
     async def _maybe_update_boll_tp_compression(self, client: OKXClient, mark_price: float, last) -> bool:
         """Replace default take-profit when the target band compresses inside it."""
@@ -2083,15 +2131,107 @@ class BollPinStrategy:
     def _remember_price(self, mark_price: float):
         """Store recent mark prices for no-new-extreme checks."""
         self._recent_prices.append(mark_price)
-        keep = max(NO_NEW_EXTREME_TICKS + 1, 3)
+        keep = max(NO_NEW_EXTREME_TICKS + 1, int(SPIKE_MEMORY_SEC // max(POLL_INTERVAL, 1)) + 2, 3)
         if len(self._recent_prices) > keep:
             self._recent_prices = self._recent_prices[-keep:]
 
+    def _spike_candidate_age_sec(self, candidate: dict | None) -> float:
+        """Return age in seconds for a spike-memory candidate."""
+        if not candidate:
+            return 999999.0
+        return max(time.monotonic() - float(candidate.get("seen_monotonic", 0.0) or 0.0), 0.0)
+
+    def _clear_expired_spike_candidates(self) -> None:
+        """Drop stale spike-memory candidates."""
+        if self._spike_candidate_age_sec(self._probe_spike_candidate) > SPIKE_CANDIDATE_TTL_SEC:
+            self._probe_spike_candidate = None
+        if self._spike_candidate_age_sec(self._addon_spike_candidate) > SPIKE_CANDIDATE_TTL_SEC:
+            self._addon_spike_candidate = None
+        if self._spike_candidate_age_sec(self._tp_spike_candidate) > SPIKE_CANDIDATE_TTL_SEC:
+            self._tp_spike_candidate = None
+
+    def _record_entry_spike_candidate(self, current: dict | None, direction: str, last, mark_price: float) -> dict:
+        """Return an updated entry/add-on spike candidate."""
+        width = float(last["boll_width"])
+        candidate = current
+        should_replace = candidate is None or candidate.get("direction") != direction
+        if candidate is not None and candidate.get("direction") == direction:
+            if direction == "long" and mark_price < float(candidate.get("extreme", mark_price)):
+                should_replace = True
+            if direction == "short" and mark_price > float(candidate.get("extreme", mark_price)):
+                should_replace = True
+        if should_replace:
+            candidate = {
+                "direction": direction,
+                "seen_monotonic": time.monotonic(),
+                "kline_ts": self._ts_to_str(last["ts"]),
+                "extreme": float(mark_price),
+                "lower": float(last["boll_lower"]),
+                "upper": float(last["boll_upper"]),
+                "width": width,
+            }
+        return candidate
+
+    def _spike_candidate_stable(self, candidate: dict | None) -> bool:
+        """Return whether price stopped extending the candidate extreme."""
+        if not candidate:
+            return False
+        if candidate.get("direction") == "long":
+            return not self._still_making_new_low()
+        if candidate.get("direction") == "short":
+            return not self._still_making_new_high()
+        return False
+
+    def _spike_entry_zone_ok(self, candidate: dict | None, last, mark_price: float) -> bool:
+        """Return whether current price is in the tiered spike-entry zone."""
+        if not candidate:
+            return False
+        width = float(last["boll_width"])
+        tolerance = max(SPIKE_ENTRY_TOLERANCE_USD, width * SPIKE_ENTRY_TOLERANCE_BOLL_RATIO)
+        lower = float(last["boll_lower"])
+        upper = float(last["boll_upper"])
+        width_pct = width / mark_price if mark_price > 0 else 0.0
+        require_inside = width_pct >= SPIKE_INSIDE_CONFIRM_WIDTH_PCT
+        if candidate.get("direction") == "long":
+            if mark_price > lower + tolerance:
+                return False
+            return not require_inside or mark_price >= lower
+        if candidate.get("direction") == "short":
+            if mark_price < upper - tolerance:
+                return False
+            return not require_inside or mark_price <= upper
+        return False
+
+    def _spike_order_price(self, candidate: dict | None, mark_price: float) -> float:
+        """Return a limit price near the spike extreme after rebound confirmation."""
+        if not candidate:
+            return round(mark_price, 2)
+        width = float(candidate.get("width", 0.0) or 0.0)
+        offset = max(SPIKE_ORDER_REBOUND_OFFSET_USD, width * SPIKE_ORDER_REBOUND_OFFSET_BOLL_RATIO)
+        extreme = float(candidate.get("extreme", mark_price) or mark_price)
+        if candidate.get("direction") == "long":
+            return round(min(mark_price, extreme + offset), 2)
+        if candidate.get("direction") == "short":
+            return round(max(mark_price, extreme - offset), 2)
+        return round(mark_price, 2)
+
     async def _maybe_place_probe_batch(self, client: OKXClient, df, last, mark_price: float, equity: float):
         """Place the first probe batch when the current signal qualifies."""
-        direction = self._intrabar_probe_direction(df, last, mark_price)
+        self._clear_expired_spike_candidates()
+        current_direction = self._intrabar_probe_direction(df, last, mark_price)
 
-        if direction == "none":
+        if current_direction != "none":
+            self._probe_spike_candidate = self._record_entry_spike_candidate(
+                self._probe_spike_candidate,
+                current_direction,
+                last,
+                mark_price,
+            )
+        elif self._probe_spike_candidate is None:
+            return
+
+        direction = str(self._probe_spike_candidate.get("direction", "none"))
+        if direction not in ("long", "short"):
             return
 
         if not self._entry_max_boll_width_ok(last, mark_price):
@@ -2101,24 +2241,25 @@ class BollPinStrategy:
         if not self._entry_disaster_filter_ok(last, mark_price):
             return
 
-        if direction == "long" and self._still_making_new_low():
-            logger.info("Price is still making new lows; skip first long batch")
+        if not self._spike_candidate_stable(self._probe_spike_candidate):
+            log_check(f"Spike candidate still extending; delay first {direction} batch")
             return
-        if direction == "short" and self._still_making_new_high():
-            logger.info("Price is still making new highs; skip first short batch")
-            return
-
-        if not self._can_open_new_plan(last["ts"], mark_price, direction):
+        if not self._spike_entry_zone_ok(self._probe_spike_candidate, last, mark_price):
+            log_check(f"Spike candidate rebounded away from band; skip first {direction} batch")
             return
 
-        self._set_cycle_tp_target_from_boll(last, mark_price, "probe_prepare")
-        if not self._prepare_dynamic_batch_size(0, mark_price):
+        order_price = self._spike_order_price(self._probe_spike_candidate, mark_price)
+        if not self._can_open_new_plan(last["ts"], order_price, direction):
+            return
+
+        self._set_cycle_tp_target_from_boll(last, order_price, "probe_prepare")
+        if not self._prepare_dynamic_batch_size(0, order_price):
             return
 
         boll_std_val = float(df["close"].tail(BOLL_PERIOD).std(ddof=0))
         plan = build_batch_plan(
             direction   = direction,
-            first_price = mark_price,
+            first_price = order_price,
             boll_width  = float(last["boll_width"]),
             boll_mid    = float(last["boll_mid"]),
             boll_lower  = float(last["boll_lower"]),
@@ -2135,14 +2276,18 @@ class BollPinStrategy:
         if first_order is None:
             return
 
-        log_check(f"Probe entry prepared direction={direction} first_ref_price={mark_price:.2f}")
-        await self._prepare_entry_extreme_adjustment(client, direction, mark_price)
+        log_check(
+            f"Probe spike entry prepared direction={direction} "
+            f"mark={mark_price:.2f} order={order_price:.2f}"
+        )
+        await self._prepare_entry_extreme_adjustment(client, direction, order_price)
         self._log_plan(first_order, mark_price)
         if await self._place_batch_orders(client, first_order, remaining_batches_placed=False):
             self._probe_kline_ts = last["ts"]
             self._probe_direction = direction
-            self._probe_entry_price = mark_price
-            self._last_plan_entry_price = mark_price
+            self._probe_entry_price = order_price
+            self._last_plan_entry_price = order_price
+            self._probe_spike_candidate = None
 
     def _intrabar_probe_direction(self, df, last, mark_price: float) -> str:
         """Return signal side when mark price is outside the current band."""
@@ -2156,13 +2301,15 @@ class BollPinStrategy:
         return "none"
 
     def _pending_order_still_breaks_band(self, last, pending_batch) -> bool:
-        """Return whether a pending entry price is still outside the current band."""
+        """Return whether a pending entry price is still outside or near the band."""
         lower = float(last["boll_lower"])
         upper = float(last["boll_upper"])
+        width = float(last["boll_width"])
+        tolerance = max(SPIKE_ENTRY_TOLERANCE_USD, width * SPIKE_ENTRY_TOLERANCE_BOLL_RATIO)
         if self._state.direction == "long":
-            return float(pending_batch.price) <= lower
+            return float(pending_batch.price) <= lower + tolerance
         if self._state.direction == "short":
-            return float(pending_batch.price) >= upper
+            return float(pending_batch.price) >= upper - tolerance
         return True
 
     async def _cancel_pending_if_order_returns_inside_band(
@@ -2363,6 +2510,7 @@ class BollPinStrategy:
         """Place or maintain the next batch after the first batch has filled."""
         if not self._state.is_active():
             return
+        self._clear_expired_spike_candidates()
 
         pending_batch = self._state.pending_batch()
         if pending_batch is not None:
@@ -2390,14 +2538,23 @@ class BollPinStrategy:
             return
 
         trigger_direction = self._intrabar_probe_direction(df, last, mark_price)
-        if trigger_direction != self._state.direction:
+        if trigger_direction == self._state.direction:
+            self._addon_spike_candidate = self._record_entry_spike_candidate(
+                self._addon_spike_candidate,
+                self._state.direction,
+                last,
+                mark_price,
+            )
+        elif trigger_direction != "none":
+            return
+        elif self._addon_spike_candidate is None:
             return
 
-        if self._state.direction == "long" and self._still_making_new_low():
-            log_check("Price is still making new lows; delay next long batch")
+        if not self._spike_candidate_stable(self._addon_spike_candidate):
+            log_check(f"Spike candidate still extending; delay next {self._state.direction} batch")
             return
-        if self._state.direction == "short" and self._still_making_new_high():
-            log_check("Price is still making new highs; delay next short batch")
+        if not self._spike_entry_zone_ok(self._addon_spike_candidate, last, mark_price):
+            log_check(f"Spike candidate rebounded away from band; skip next {self._state.direction} batch")
             return
 
         next_idx = self._state.next_batch_idx()
@@ -2416,21 +2573,16 @@ class BollPinStrategy:
         last_batch = self._state.last_filled_batch()
         if last_batch is None:
             return
-        if self._state.direction == "long" and self._still_making_new_low():
-            log_check(f"Price is still making new lows; delay long batch {next_idx + 1}")
-            return
-        if self._state.direction == "short" and self._still_making_new_high():
-            log_check(f"Price is still making new highs; delay short batch {next_idx + 1}")
-            return
 
-        if not self._prepare_dynamic_batch_size(next_idx, mark_price):
+        order_price = self._spike_order_price(self._addon_spike_candidate, mark_price)
+        if not self._prepare_dynamic_batch_size(next_idx, order_price):
             self._save_runtime_state()
             return
 
         boll_std_val = float(df["close"].tail(BOLL_PERIOD).std(ddof=0))
         plan = build_batch_plan(
             direction   = self._state.direction,
-            first_price = mark_price,
+            first_price = order_price,
             boll_width  = float(last["boll_width"]),
             boll_mid    = float(last["boll_mid"]),
             boll_lower  = float(last["boll_lower"]),
@@ -2444,14 +2596,14 @@ class BollPinStrategy:
             logger.warning("Next add-on batch rejected by risk checks; skip")
             return
 
-        next_plan = self._plan_order_at_price(plan, next_idx, mark_price)
+        next_plan = self._plan_order_at_price(plan, next_idx, order_price)
         if next_plan is None:
             self._state.remaining_batches_placed = True
             return
 
         next_order = next_plan.orders[0]
         gap = abs(next_order.price - last_batch.price)
-        required_gap = self._effective_entry_gap(mark_price)
+        required_gap = self._effective_entry_gap(order_price)
         if gap < required_gap:
             log_check(
                 f"Next batch gap below {required_gap:.2f} USDT: "
@@ -2459,18 +2611,22 @@ class BollPinStrategy:
             )
             return
 
-        if self._state.direction == "long" and mark_price > last_batch.price:
+        if self._state.direction == "long" and order_price > last_batch.price:
             return
-        if self._state.direction == "short" and mark_price < last_batch.price:
+        if self._state.direction == "short" and order_price < last_batch.price:
             return
 
         self._update_addon_extreme_guard_from_completed_kline(df, last)
         if not self._addon_extreme_guard_allows(next_order.price, next_idx):
             return
 
-        log_check(f"Add-on batch triggered: batch={next_idx + 1} direction={self._state.direction}")
+        log_check(
+            f"Add-on spike batch triggered: batch={next_idx + 1} "
+            f"direction={self._state.direction} mark={mark_price:.2f} order={order_price:.2f}"
+        )
         self._log_plan(next_plan, mark_price)
         if await self._place_batch_orders(client, next_plan, remaining_batches_placed=False):
+            self._addon_spike_candidate = None
             self._save_runtime_state()
 
     async def _maybe_reprice_pending_batch(self, client: OKXClient, df, last, equity: float,
@@ -2508,6 +2664,14 @@ class BollPinStrategy:
             self._save_runtime_state()
             return
         if self._state.direction == "short" and self._still_making_new_high():
+            self._save_runtime_state()
+            return
+        if not self._spike_entry_zone_ok({"direction": self._state.direction}, last, mark_price):
+            log_check(
+                f"Pending batch reprice blocked by tiered spike zone "
+                f"batch={pending_batch.batch_idx + 1} direction={self._state.direction} "
+                f"mark={mark_price:.2f}"
+            )
             self._save_runtime_state()
             return
 
@@ -2594,6 +2758,13 @@ class BollPinStrategy:
             self._save_runtime_state()
             return
         if direction == "short" and self._still_making_new_high():
+            self._save_runtime_state()
+            return
+        if not self._spike_entry_zone_ok({"direction": direction}, last, mark_price):
+            log_check(
+                f"First batch reprice blocked by tiered spike zone "
+                f"direction={direction} mark={mark_price:.2f}"
+            )
             self._save_runtime_state()
             return
 
@@ -2931,6 +3102,9 @@ class BollPinStrategy:
                 if batch_idx == 0:
                     self._last_plan_kline_ts = fill_ts or kline_ts
                     self._last_plan_entry_price = fill_price
+                    self._probe_spike_candidate = None
+                else:
+                    self._addon_spike_candidate = None
                 self._start_addon_extreme_guard_from_fill(
                     df,
                     self._state.direction,
@@ -2944,6 +3118,7 @@ class BollPinStrategy:
 
         if self._state.total_sz != prev_sz:
             self._dynamic_tp_active = False
+            self._tp_spike_candidate = None
             avg = await self._sync_exchange_position(client)
             if avg <= 0:
                 avg = self._recalc_tp()
@@ -2972,6 +3147,7 @@ class BollPinStrategy:
         avg_entry      = weighted_price / total_sz
         self._state.avg_entry = avg_entry
         self._dynamic_tp_active = False
+        self._tp_spike_candidate = None
         self._state.plan_tp_price = self._tp_price_from_avg(self._state.direction, avg_entry)
         log_check(f"Average entry={avg_entry:.2f} new_tp={self._state.plan_tp_price}")
         return avg_entry
@@ -3010,25 +3186,27 @@ class BollPinStrategy:
         self._log_runtime_state_summary("Post-exchange sync state")
         return avg_entry
 
-    def _desired_stop_loss_order(self) -> tuple[float, str, float, float]:
-        """Return desired stop trigger, mode, target loss, and estimated loss."""
+    def _desired_stop_loss_order(self) -> tuple[float, str, float, float, float, float]:
+        """Return desired stop trigger and diagnostics for the current position."""
         pos_side = self._state.direction
         if self._state.total_sz <= 0 or pos_side not in ("long", "short"):
-            return 0.0, "", 0.0, 0.0
+            return 0.0, "", 0.0, 0.0, 0.0, 0.0
 
         sl_price = 0.0
         stop_mode = "liquidation_guard"
         target_loss = 0.0
+        fixed_stop_price = 0.0
 
         if COPY_FIXED_LOSS_STOP_ENABLED and self._state.avg_entry > 0:
             target_loss = self._fixed_loss_target_usdt()
             if target_loss > 0:
-                sl_price = self._fixed_loss_stop_price(
+                fixed_stop_price = self._fixed_loss_stop_price(
                     pos_side,
                     self._state.avg_entry,
                     self._state.total_sz,
                 )
-                stop_mode = "fixed_loss"
+                sl_price = fixed_stop_price
+                stop_mode = "fixed_cycle_loss"
 
         liq_guard_price = 0.0
         if self._state.plan_liq_price > 0:
@@ -3043,21 +3221,21 @@ class BollPinStrategy:
         if liq_guard_price > 0:
             if pos_side == "long" and sl_price < liq_guard_price:
                 sl_price = liq_guard_price
-                stop_mode = "fixed_loss_clamped_to_liq_guard"
+                stop_mode = "liquidation_guard_fallback"
             elif pos_side == "short" and sl_price > liq_guard_price:
                 sl_price = liq_guard_price
-                stop_mode = "fixed_loss_clamped_to_liq_guard"
+                stop_mode = "liquidation_guard_fallback"
 
         sl_price = round(sl_price, 2) if sl_price > 0 else 0.0
         if sl_price <= 0:
-            return 0.0, stop_mode, target_loss, 0.0
+            return 0.0, stop_mode, target_loss, 0.0, fixed_stop_price, liq_guard_price
 
         if pos_side == "long":
             estimated_loss = max((self._state.avg_entry - sl_price) * self._state.total_sz * CT_VAL, 0.0)
         else:
             estimated_loss = max((sl_price - self._state.avg_entry) * self._state.total_sz * CT_VAL, 0.0)
 
-        return sl_price, stop_mode, target_loss, estimated_loss
+        return sl_price, stop_mode, target_loss, estimated_loss, fixed_stop_price, liq_guard_price
 
     async def _maybe_refresh_stop_after_liq_change(self, client: OKXClient) -> None:
         """Refresh the stop order when exchange liquidation price changes."""
@@ -3076,7 +3254,7 @@ class BollPinStrategy:
         self._state.update_position(total_sz, avg_entry, liq_price)
         self._seed_existing_position_batch()
 
-        desired_sl, _, _, _ = self._desired_stop_loss_order()
+        desired_sl, _, _, _, _, _ = self._desired_stop_loss_order()
         if desired_sl <= 0:
             return
 
@@ -3156,7 +3334,14 @@ class BollPinStrategy:
             return
 
         close_side = "sell" if pos_side == "long" else "buy"
-        sl_price, stop_mode, target_loss, estimated_loss = self._desired_stop_loss_order()
+        (
+            sl_price,
+            stop_mode,
+            target_loss,
+            estimated_loss,
+            fixed_stop_price,
+            liq_guard_price,
+        ) = self._desired_stop_loss_order()
         if sl_price <= 0:
             logger.warning(f"Invalid stop-loss price; skip sl={sl_price}")
             return
@@ -3175,9 +3360,16 @@ class BollPinStrategy:
             )
             self._state.sl_ord_id = r.get("algoId", "")
             self._state.plan_sl_price = sl_price
-            if stop_mode.startswith("fixed_loss"):
+            if stop_mode == "fixed_cycle_loss":
                 log_action(
-                    f"Fixed-loss stop order trigger={sl_price} mode={stop_mode} "
+                    f"Fixed cycle-loss stop order trigger={sl_price} mode={stop_mode} "
+                    f"target_loss={target_loss:.2f} est_loss={estimated_loss:.2f} "
+                    f"avg={self._state.avg_entry:.2f} sz={self._state.total_sz}"
+                )
+            elif stop_mode == "liquidation_guard_fallback":
+                log_action(
+                    f"Liquidation guard fallback stop order trigger={sl_price} "
+                    f"fixed_stop={fixed_stop_price:.2f} liq_guard={liq_guard_price:.2f} "
                     f"target_loss={target_loss:.2f} est_loss={estimated_loss:.2f} "
                     f"avg={self._state.avg_entry:.2f} sz={self._state.total_sz}"
                 )
