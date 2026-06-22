@@ -149,6 +149,7 @@ class BollPinStrategy:
         self._last_liq_warning_ts = 0.0
         self._last_liq_warning_gap_usd = None
         self._dynamic_tp_active = False
+        self._boll_mid_cost_tp_active = False
         self._entry_extreme_gap_pct = 0.0
         self._entry_extreme_gap_mult = 1.0
         self._ticker_24h_cache = None
@@ -600,7 +601,7 @@ class BollPinStrategy:
         return True
 
     async def _check_boll_mid_cost_stop(self, client: OKXClient, row) -> bool:
-        """Reprice take-profit when Bollinger mid crosses the position average entry."""
+        """Reprice take-profit when the favorable Bollinger boundary reaches cost."""
         if not BOLL_MID_COST_STOP_ENABLED:
             return False
         if not self._state.is_active():
@@ -614,17 +615,28 @@ class BollPinStrategy:
 
         try:
             boll_mid = float(row.get("boll_mid", 0) or 0)
+            boll_upper = float(row.get("boll_upper", 0) or 0)
+            boll_lower = float(row.get("boll_lower", 0) or 0)
         except (TypeError, ValueError, AttributeError):
             return False
-        if boll_mid <= 0:
+        if boll_mid <= 0 or boll_upper <= 0 or boll_lower <= 0:
             return False
 
         avg_entry = self._state.avg_entry
         triggered = (
-            (direction == "long" and boll_mid <= avg_entry)
-            or (direction == "short" and boll_mid >= avg_entry)
+            (direction == "long" and boll_upper <= avg_entry)
+            or (direction == "short" and boll_lower >= avg_entry)
         )
         if not triggered:
+            if await self._maybe_restore_boll_mid_cost_tp(
+                client,
+                direction,
+                avg_entry,
+                boll_mid,
+                boll_upper,
+                boll_lower,
+            ):
+                return True
             return False
 
         new_tp = self._tp_price_from_margin_return(direction, avg_entry, BOLL_MID_COST_TP_RETURN)
@@ -636,11 +648,68 @@ class BollPinStrategy:
         old_tp = self._state.plan_tp_price
         self._state.plan_tp_price = new_tp
         self._dynamic_tp_active = True
+        self._boll_mid_cost_tp_active = True
         log_action(
-            "Boll mid cost TP repriced "
+            "Boll boundary cost TP repriced "
             f"direction={direction} boll_mid={boll_mid:.2f} "
+            f"boll_upper={boll_upper:.2f} boll_lower={boll_lower:.2f} "
             f"avg_entry={avg_entry:.2f} old_tp={old_tp:.2f} new_tp={new_tp:.2f} "
             f"target_return={BOLL_MID_COST_TP_RETURN:.2%} sz={self._state.total_sz}"
+        )
+        await self._update_tp(client)
+        self._save_runtime_state()
+        return True
+
+    def _looks_like_boll_mid_cost_tp(self, direction: str, avg_entry: float) -> bool:
+        """Return whether the current TP likely came from the Boll-mid cost rule."""
+        if self._boll_mid_cost_tp_active:
+            return True
+        if not self._dynamic_tp_active or self._state.plan_tp_price <= 0:
+            return False
+        boll_mid_tp = self._tp_price_from_margin_return(direction, avg_entry, BOLL_MID_COST_TP_RETURN)
+        normal_tp = self._tp_price_from_avg(direction, avg_entry)
+        if boll_mid_tp <= 0 or normal_tp <= 0:
+            return False
+        if abs(self._state.plan_tp_price - boll_mid_tp) >= DYNAMIC_TP_REPRICE_GAP_USD:
+            return False
+        if direction == "long":
+            return boll_mid_tp < normal_tp
+        if direction == "short":
+            return boll_mid_tp > normal_tp
+        return False
+
+    async def _maybe_restore_boll_mid_cost_tp(
+        self,
+        client: OKXClient,
+        direction: str,
+        avg_entry: float,
+        boll_mid: float,
+        boll_upper: float,
+        boll_lower: float,
+    ) -> bool:
+        """Restore normal TP after Bollinger boundary moves back beyond cost."""
+        if not self._looks_like_boll_mid_cost_tp(direction, avg_entry):
+            return False
+        normal_tp = self._tp_price_from_avg(direction, avg_entry)
+        if normal_tp <= 0:
+            return False
+        if self._state.plan_tp_price > 0 and abs(normal_tp - self._state.plan_tp_price) < DYNAMIC_TP_REPRICE_GAP_USD:
+            self._boll_mid_cost_tp_active = False
+            self._dynamic_tp_active = False
+            self._save_runtime_state()
+            return False
+
+        old_tp = self._state.plan_tp_price
+        self._state.plan_tp_price = normal_tp
+        self._boll_mid_cost_tp_active = False
+        self._dynamic_tp_active = False
+        self._tp_spike_candidate = None
+        log_action(
+            "Boll boundary recovered; restore normal TP "
+            f"direction={direction} boll_mid={boll_mid:.2f} "
+            f"boll_upper={boll_upper:.2f} boll_lower={boll_lower:.2f} "
+            f"avg_entry={avg_entry:.2f} "
+            f"old_tp={old_tp:.2f} new_tp={normal_tp:.2f}"
         )
         await self._update_tp(client)
         self._save_runtime_state()
@@ -1038,6 +1107,7 @@ class BollPinStrategy:
                 "fixed_batch_sizes": self._fixed_batch_sizes,
                 "capital_shortage_active": self._capital_shortage_active,
                 "dynamic_tp_active": self._dynamic_tp_active and self._state.is_active(),
+                "boll_mid_cost_tp_active": self._boll_mid_cost_tp_active and self._state.is_active(),
                 "cycle_tp_target_margin_return": (
                     self._cycle_tp_target_margin_return if self._state.has_working_plan() else TP_TARGET_MARGIN_RETURN
                 ),
@@ -1099,6 +1169,7 @@ class BollPinStrategy:
     def _clear_runtime_state(self):
         """Delete the persisted runtime-state file."""
         self._dynamic_tp_active = False
+        self._boll_mid_cost_tp_active = False
         self._clear_spike_candidates()
         self._cycle_tp_target_margin_return = TP_TARGET_MARGIN_RETURN
         self._entry_extreme_gap_pct = 0.0
@@ -1298,6 +1369,7 @@ class BollPinStrategy:
             if ROLLING_COMPOUND_ENABLED and self._capital_shortage_active:
                 self._capital_shortage_active = False
             self._dynamic_tp_active = bool(strategy.get("dynamic_tp_active", False))
+            self._boll_mid_cost_tp_active = bool(strategy.get("boll_mid_cost_tp_active", False))
             self._cycle_tp_target_margin_return = float(
                 strategy.get("cycle_tp_target_margin_return", TP_TARGET_MARGIN_RETURN) or TP_TARGET_MARGIN_RETURN
             )
@@ -2059,6 +2131,7 @@ class BollPinStrategy:
         old_tp = self._state.plan_tp_price
         self._state.plan_tp_price = lock_price
         self._dynamic_tp_active = True
+        self._boll_mid_cost_tp_active = False
         self._tp_spike_candidate = None
         log_action(
             f"Dynamic TP spike lock: return={ret:.2%} old_tp={old_tp:.2f} "
@@ -2130,6 +2203,7 @@ class BollPinStrategy:
 
         self._state.plan_tp_price = lock_price
         self._dynamic_tp_active = True
+        self._boll_mid_cost_tp_active = False
         log_action(
             f"Boll TP compression: direction={direction} return={ret:.2%} "
             f"old_tp={tp_price:.2f} new_tp={lock_price:.2f} "
@@ -3153,6 +3227,7 @@ class BollPinStrategy:
 
         if self._state.total_sz != prev_sz:
             self._dynamic_tp_active = False
+            self._boll_mid_cost_tp_active = False
             self._tp_spike_candidate = None
             avg = await self._sync_exchange_position(client)
             if avg <= 0:
@@ -3182,6 +3257,7 @@ class BollPinStrategy:
         avg_entry      = weighted_price / total_sz
         self._state.avg_entry = avg_entry
         self._dynamic_tp_active = False
+        self._boll_mid_cost_tp_active = False
         self._tp_spike_candidate = None
         self._state.plan_tp_price = self._tp_price_from_avg(self._state.direction, avg_entry)
         log_check(f"Average entry={avg_entry:.2f} new_tp={self._state.plan_tp_price}")
@@ -3213,6 +3289,7 @@ class BollPinStrategy:
         self._seed_existing_position_batch()
 
         if avg_entry > 0 and (not self._dynamic_tp_active or self._state.plan_tp_price <= 0):
+            self._boll_mid_cost_tp_active = False
             self._state.plan_tp_price = self._tp_price_from_avg(pos_side, avg_entry)
 
         log_check(

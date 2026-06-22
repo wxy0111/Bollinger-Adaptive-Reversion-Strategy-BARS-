@@ -391,6 +391,7 @@ class LogReplay:
         self.profit_transferred = 0.0
         self.loss_topup = 0.0
         self.dynamic_tp_active = False
+        self.boll_mid_cost_tp_active = False
         self.dynamic_tp_activated = 0
         self.cycle_tp_target_margin_return = self.params.tp_target_margin_return
         self.boll_tp_compression_activated = 0
@@ -979,6 +980,7 @@ class LogReplay:
             return
         self.pos.tp_price = lock_price
         self.dynamic_tp_active = True
+        self.boll_mid_cost_tp_active = False
         self.dynamic_tp_activated += 1
 
     def _maybe_update_boll_tp_compression(self, row) -> bool:
@@ -1011,6 +1013,7 @@ class LogReplay:
             return False
         self.pos.tp_price = lock_price
         self.dynamic_tp_active = True
+        self.boll_mid_cost_tp_active = False
         self.boll_tp_compression_activated += 1
         return True
 
@@ -1072,22 +1075,22 @@ class LogReplay:
         return head_move >= self.params.disaster_head_drop_pct and unrealized <= -loss_threshold
 
     def _boll_mid_cost_stop_triggered(self, row) -> bool:
-        """Return whether Bollinger mid has crossed the position average entry."""
+        """Return whether the favorable Bollinger boundary reached average entry."""
         if not self.params.boll_mid_cost_stop_enabled:
             return False
         if not self.pos.is_active() or self.pos.avg_entry <= 0:
             return False
-        _, mid, _, _ = self._bands(row)
+        lower, _, upper, _ = self._bands(row)
         if self.pos.direction == "long":
-            return mid <= self.pos.avg_entry
+            return upper <= self.pos.avg_entry
         if self.pos.direction == "short":
-            return mid >= self.pos.avg_entry
+            return lower >= self.pos.avg_entry
         return False
 
     def _maybe_reprice_boll_mid_cost_tp(self, row) -> bool:
-        """Reprice take-profit when Bollinger mid reaches the average entry."""
+        """Reprice take-profit when the Bollinger boundary reaches average entry."""
         if not self._boll_mid_cost_stop_triggered(row):
-            return False
+            return self._maybe_restore_boll_mid_cost_tp()
         new_tp = self._tp_price_from_margin_return(self.params.boll_mid_cost_tp_return)
         if new_tp <= 0:
             return False
@@ -1095,7 +1098,41 @@ class LogReplay:
             return False
         self.pos.tp_price = new_tp
         self.dynamic_tp_active = True
+        self.boll_mid_cost_tp_active = True
         self.boll_mid_cost_stop += 1
+        return True
+
+    def _looks_like_boll_mid_cost_tp(self) -> bool:
+        if self.boll_mid_cost_tp_active:
+            return True
+        if not self.dynamic_tp_active or self.pos.tp_price <= 0 or self.pos.avg_entry <= 0:
+            return False
+        boll_mid_tp = self._tp_price_from_margin_return(self.params.boll_mid_cost_tp_return)
+        normal_tp = self._target_tp_price()
+        if boll_mid_tp <= 0 or normal_tp <= 0:
+            return False
+        if abs(self.pos.tp_price - boll_mid_tp) >= self.params.dynamic_tp_reprice_gap_usd:
+            return False
+        if self.pos.direction == "long":
+            return boll_mid_tp < normal_tp
+        if self.pos.direction == "short":
+            return boll_mid_tp > normal_tp
+        return False
+
+    def _maybe_restore_boll_mid_cost_tp(self) -> bool:
+        """Restore normal TP after Bollinger mid moves back beyond cost."""
+        if not self._looks_like_boll_mid_cost_tp():
+            return False
+        normal_tp = self._target_tp_price()
+        if normal_tp <= 0:
+            return False
+        if self.pos.tp_price > 0 and abs(normal_tp - self.pos.tp_price) < self.params.dynamic_tp_reprice_gap_usd:
+            self.boll_mid_cost_tp_active = False
+            self.dynamic_tp_active = False
+            return False
+        self.pos.tp_price = normal_tp
+        self.boll_mid_cost_tp_active = False
+        self.dynamic_tp_active = False
         return True
 
     def _fixed_loss_stop_price(self) -> float:
@@ -1820,6 +1857,7 @@ class LogReplay:
         )
         self.pos.reset()
         self.dynamic_tp_active = False
+        self.boll_mid_cost_tp_active = False
         self.cycle_tp_target_margin_return = self.params.tp_target_margin_return
         self.entry_extreme_gap_pct = 0.0
         self.entry_extreme_gap_mult = 1.0

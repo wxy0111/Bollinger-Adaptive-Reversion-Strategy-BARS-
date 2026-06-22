@@ -457,6 +457,7 @@ class SpikeMemoryReplay(NoNewExtreme3Replay):
             return
         self.pos.tp_price = lock_price
         self.dynamic_tp_active = True
+        self.boll_mid_cost_tp_active = False
         self.dynamic_tp_activated += 1
         self.tp_spike_locks += 1
         self._tp_spike_candidate = None
