@@ -91,6 +91,7 @@ from src.config import (
     ENTRY_EXTREME_GAP_MAX_MULT,
     FIRST_BATCH_RATIO,
     LEVER,
+    LIQ_STOP_OFFSET_USD,
     MAX_ENTRY_BATCHES,
     MAX_TOTAL_ENTRY_RATIO,
     MIN_BOLL_WIDTH_USD,
@@ -144,26 +145,17 @@ INITIAL_TOTAL_EQUITY = 1000.0
 DEFAULT_DYNAMIC_TP_ARM_GRID = ",".join(f"{value / 1000:g}" for value in range(150, 241, 5))
 _WORKER_TICKS: pd.DataFrame | None = None
 
-# Only these fields are varied by the optimizer. The remaining Params fields
-# are still replayed, but they are fixed to the live config so the report stays
-# aligned with the real strategy instead of drifting into stale knobs.
+# Only these fields are varied by the default optimizer. Width gates, disaster
+# guards, sizing rails, and stop switches stay fixed to the live config because
+# local replay already showed they are regime rules rather than tuning knobs.
 CORE_OPTIMIZED_FIELDS = (
-    "min_width_pct",
-    "entry_max_width_pct",
-    "entry_disaster_score_threshold",
     "min_entry_gap_usd",
     "first_batch_ratio",
     "second_batch_dynamic_base_ratio",
-    "second_batch_dynamic_min_ratio",
-    "second_batch_dynamic_max_ratio",
-    "second_batch_dynamic_full_gap_usd",
     "dynamic_base_ratio",
-    "dynamic_min_ratio",
-    "dynamic_max_ratio",
     "max_total_entry_ratio",
     "tp_target_margin_return",
     "dynamic_tp_arm_return",
-    "boll_mid_cost_stop_enabled",
 )
 
 TICK_RE = re.compile(
@@ -381,6 +373,8 @@ class LogReplay:
         self.blocked_addon_guard = 0
         self.cross_copy_stop = 0
         self.fixed_loss_stop = 0
+        self.fixed_cycle_loss_stop = 0
+        self.liquidation_guard_fallback_stop = 0
         self.disaster_stop = 0
         self.boll_mid_cost_stop = 0
         self.trend_risk_guard_signal = 0
@@ -1122,9 +1116,36 @@ class LogReplay:
             return self.pos.avg_entry + price_delta
         return 0.0
 
+    def _desired_stop_loss_price(self) -> tuple[float, str]:
+        """Return live-style L2-first stop price and selected stop mode."""
+        if not self.pos.is_active() or self.pos.direction not in ("long", "short"):
+            return 0.0, "none"
+        fixed_stop = self._fixed_loss_stop_price()
+        liq = self._liq_price_for_batches(self.pos.filled)
+        liq_guard = 0.0
+        if liq and liq > 0:
+            if self.pos.direction == "long":
+                liq_guard = liq + LIQ_STOP_OFFSET_USD
+            else:
+                liq_guard = liq - LIQ_STOP_OFFSET_USD
+
+        stop_price = fixed_stop
+        mode = "fixed_cycle_loss" if fixed_stop > 0 else "none"
+        if stop_price <= 0 and liq_guard > 0:
+            stop_price = liq_guard
+            mode = "liquidation_guard"
+        if liq_guard > 0:
+            if self.pos.direction == "long" and stop_price < liq_guard:
+                stop_price = liq_guard
+                mode = "liquidation_guard_fallback"
+            elif self.pos.direction == "short" and stop_price > liq_guard:
+                stop_price = liq_guard
+                mode = "liquidation_guard_fallback"
+        return stop_price, mode
+
     def _fixed_loss_stop_triggered(self, mark_price: float) -> bool:
-        """Return whether the fixed-loss protection order would trigger."""
-        stop_price = self._fixed_loss_stop_price()
+        """Return whether the current L2/L1 stop order would trigger."""
+        stop_price, _ = self._desired_stop_loss_price()
         if stop_price <= 0:
             return False
         if self.pos.direction == "long":
@@ -1353,6 +1374,7 @@ class LogReplay:
         if self.pos.is_active():
             self._try_take_profit(row)
         if self.pos.is_active() and self._fixed_loss_stop_triggered(float(row.price)):
+            _, stop_mode = self._desired_stop_loss_price()
             self._close(
                 float(row.price),
                 str(row.ts),
@@ -1362,6 +1384,10 @@ class LogReplay:
                 reason="鍥哄畾浜忔崯淇濇姢骞充粨",
             )
             self.fixed_loss_stop += 1
+            if stop_mode == "fixed_cycle_loss":
+                self.fixed_cycle_loss_stop += 1
+            elif stop_mode == "liquidation_guard_fallback":
+                self.liquidation_guard_fallback_stop += 1
         if self.pos.is_active() and self._trend_risk_guard_triggered(row):
             if not self.trend_risk_guard_active:
                 self.trend_risk_guard_signal += 1
@@ -2037,6 +2063,8 @@ class LogReplay:
             "tp_improve_block": self.tp_improve_block,
             "cross_copy_stop": self.cross_copy_stop,
             "fixed_loss_stop": self.fixed_loss_stop,
+            "fixed_cycle_loss_stop": self.fixed_cycle_loss_stop,
+            "liquidation_guard_fallback_stop": self.liquidation_guard_fallback_stop,
             "disaster_stop": self.disaster_stop,
             "boll_mid_cost_stop": self.boll_mid_cost_stop,
             "trend_risk_guard_signal": self.trend_risk_guard_signal,
@@ -3153,25 +3181,25 @@ def main() -> None:
     parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR))
     parser.add_argument("--two-stage", action="store_true", help="Run coarse optimization on sample-sec, then replay top params on final-sample-sec.")
     parser.add_argument("--final-sample-sec", type=int, default=POLL_INTERVAL)
-    parser.add_argument("--refine-top-n", type=int, default=10)
-    parser.add_argument("--min-boll-width-pct", default="0.010,0.012,0.015,0.018")
-    parser.add_argument("--min-entry-gap-usd", default="4,5,6")
-    parser.add_argument("--entry-max-width-pct", default="0.028,0.03,0.035,0.04")
+    parser.add_argument("--refine-top-n", type=int, default=8)
+    parser.add_argument("--min-boll-width-pct", default=str(MIN_BOLL_WIDTH_PCT))
+    parser.add_argument("--min-entry-gap-usd", default="5,6,7")
+    parser.add_argument("--entry-max-width-pct", default=str(ENTRY_MAX_BOLL_WIDTH_PCT))
     parser.add_argument("--entry-disaster-score-threshold", default=str(ENTRY_DISASTER_SCORE_THRESHOLD))
     parser.add_argument("--entry-disaster-tp-distance-mult", default=str(ENTRY_DISASTER_TP_DISTANCE_MULT))
     parser.add_argument("--first-batch-ratio", default="0.08,0.10,0.12")
-    parser.add_argument("--second-batch-dynamic-base-ratio", default="0.10,0.12,0.14")
+    parser.add_argument("--second-batch-dynamic-base-ratio", default="0.12,0.14,0.16")
     parser.add_argument("--second-batch-dynamic-min-ratio", default=str(SECOND_BATCH_DYNAMIC_MIN_RATIO))
-    parser.add_argument("--second-batch-dynamic-max-ratio", default="0.15,0.18")
-    parser.add_argument("--second-batch-dynamic-full-gap-usd", default="8,10,12")
+    parser.add_argument("--second-batch-dynamic-max-ratio", default=str(SECOND_BATCH_DYNAMIC_MAX_RATIO))
+    parser.add_argument("--second-batch-dynamic-full-gap-usd", default=str(SECOND_BATCH_DYNAMIC_FULL_GAP_USD))
     parser.add_argument("--dynamic-base-ratio", default="0.06,0.08,0.10")
     parser.add_argument("--dynamic-min-ratio", default=str(DYNAMIC_MIN_ENTRY_RATIO))
-    parser.add_argument("--dynamic-max-ratio", default="0.12,0.15")
+    parser.add_argument("--dynamic-max-ratio", default=str(DYNAMIC_MAX_ENTRY_RATIO))
     parser.add_argument("--max-total-entry-ratio", default="0.70,0.80")
     parser.add_argument("--boll-width-tp-space-mult", default=str(BOLL_WIDTH_TP_SPACE_MULT))
-    parser.add_argument("--tp-target-margin-return", default="0.25,0.28,0.30")
-    parser.add_argument("--dynamic-tp-arm-return", default="0.05")
-    parser.add_argument("--boll-mid-cost-stop-enabled", default=f"{int(BOLL_MID_COST_STOP_ENABLED)},0")
+    parser.add_argument("--tp-target-margin-return", default="0.25,0.28,0.32")
+    parser.add_argument("--dynamic-tp-arm-return", default="0.20,0.22,0.24")
+    parser.add_argument("--boll-mid-cost-stop-enabled", default=str(int(BOLL_MID_COST_STOP_ENABLED)))
     parser.add_argument("--copy-fixed-loss-stop-ratio", default=str(COPY_FIXED_LOSS_STOP_RATIO))
     parser.add_argument("--fixed-loss-head-buffer-pct", default=str(FIXED_LOSS_HEAD_BUFFER_PCT))
     parser.add_argument("--disaster-head-drop-pct", default=str(DISASTER_HEAD_DROP_PCT))
@@ -3191,10 +3219,10 @@ def main() -> None:
     parser.add_argument("--addon-dynamic-gap-trend-klines", default=str(ADDON_DYNAMIC_GAP_TREND_KLINES))
     parser.add_argument("--addon-dynamic-gap-trend-mult", default=str(ADDON_DYNAMIC_GAP_TREND_MULT))
     parser.add_argument("--search-mode", choices=("grid", "random", "optuna"), default="random")
-    parser.add_argument("--random-trials", type=int, default=160)
+    parser.add_argument("--random-trials", type=int, default=96)
     parser.add_argument("--random-seed", type=int, default=42)
-    parser.add_argument("--optuna-trials", type=int, default=120)
-    parser.add_argument("--optuna-startup-trials", type=int, default=24)
+    parser.add_argument("--optuna-trials", type=int, default=80)
+    parser.add_argument("--optuna-startup-trials", type=int, default=16)
     parser.add_argument("--walk-forward-ratio", type=float, default=0.7)
     parser.add_argument("--walk-forward-top-n", type=int, default=10)
     parser.add_argument("--workers", type=int, default=0, help="Replay worker processes; 0 auto-detects, 1 disables multiprocessing.")

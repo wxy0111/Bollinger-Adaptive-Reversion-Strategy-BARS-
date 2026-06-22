@@ -409,21 +409,17 @@ Run:
 .\optimize_report.bat
 ```
 
-The optimizer replays local logs with live-like sizing and current risk guards. It uses a slim core parameter set:
+The optimizer replays local logs with live-like sizing and current risk guards. The default search is intentionally small and focuses on the parameters that most directly move exposure and exits:
 
-- `FIRST_BATCH_RATIO`
-- `MAX_TOTAL_ENTRY_RATIO`
 - `MIN_ENTRY_GAP_USD`
-- `MIN_BOLL_WIDTH_PCT`
-- `ENTRY_MAX_BOLL_WIDTH_PCT`
-- `ENTRY_DISASTER_SCORE_THRESHOLD`
-- `ENTRY_DISASTER_FAR_MID_RATIO`
-- `SECOND_BATCH_DYNAMIC_*`
-- `DYNAMIC_*_RATIO`
+- `FIRST_BATCH_RATIO`
+- `SECOND_BATCH_DYNAMIC_BASE_RATIO`
+- `DYNAMIC_BASE_ENTRY_RATIO`
+- `MAX_TOTAL_ENTRY_RATIO`
 - `TP_TARGET_MARGIN_RETURN`
 - `DYNAMIC_TP_ARM_RETURN`
-- `BOLL_MID_COST_STOP_ENABLED`
-- `BOLL_MID_COST_TP_RETURN`
+
+Width gates, disaster filters, sizing min/max rails, and stop switches are replayed from the current config by default. They can still be overridden from the CLI, but they are not part of the normal optimization core.
 
 The report compares the current config with optimized candidates and includes PnL, drawdown, liquidation buffer, wipeout flags, trades, and signal counts. It is a log replay, not an order-book fill simulator.
 
@@ -685,23 +681,19 @@ CROSS_COPY_DYNAMIC_SIZING_ENABLED = False
 .\optimize_report.bat
 ```
 
-优化器会读取本地 log，按当前策略逻辑做离线回放。当前只接入核心参数，避免网格过大：
+优化器会读取本地 log，按当前策略逻辑做离线回放。默认搜索刻意保持很小，只优化最直接影响仓位和出场的参数：
 
 ```text
-FIRST_BATCH_RATIO
-MAX_TOTAL_ENTRY_RATIO
 MIN_ENTRY_GAP_USD
-MIN_BOLL_WIDTH_PCT
-ENTRY_MAX_BOLL_WIDTH_PCT
-ENTRY_DISASTER_SCORE_THRESHOLD
-ENTRY_DISASTER_FAR_MID_RATIO
-SECOND_BATCH_DYNAMIC_*
-DYNAMIC_*_RATIO
+FIRST_BATCH_RATIO
+SECOND_BATCH_DYNAMIC_BASE_RATIO
+DYNAMIC_BASE_ENTRY_RATIO
+MAX_TOTAL_ENTRY_RATIO
 TP_TARGET_MARGIN_RETURN
 DYNAMIC_TP_ARM_RETURN
-BOLL_MID_COST_STOP_ENABLED
-BOLL_MID_COST_TP_RETURN
 ```
+
+布林宽度门槛、灾难过滤、仓位上下限护栏和止损开关默认跟随当前配置参与回放，但不进入常规优化核心；需要专项测试时仍可通过命令行参数覆盖。
 
 报告会输出收益、回撤、最小强平缓冲、是否 wipeout、交易次数和信号次数。它适合做参数方向判断，但不是订单簿级别的成交模拟。
 

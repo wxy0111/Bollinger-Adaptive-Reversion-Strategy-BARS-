@@ -21,6 +21,8 @@ Use this file to answer: what changed, why it changed, how it was tested, and wh
 
 ### Changed
 
+- Slimmed the log optimizer default core to seven high-impact knobs: entry gap, first batch, second-batch base size, later add-on base size, total exposure cap, fixed TP target, and dynamic TP arm.
+- Fixed width gates, disaster filters, sizing rails, and stop switches to the current live config in the default optimizer search so routine optimization stays fast and does not retune already-tested regime rules.
 - Removed the regular tick-path call to the legacy recovery add-on logic so normal add-ons cannot bypass the spike-memory / tiered entry rules.
 - Updated unfilled first-batch and add-on reprice paths so repricing must still pass the tiered spike-entry zone.
 - Relaxed pending-order band guard to keep valid near-band pending orders, matching the spike-memory D entry zone.
@@ -42,6 +44,9 @@ Use this file to answer: what changed, why it changed, how it was tested, and wh
   - D-inside at 3.0% / 3.2% worsened to `-38.1895U` / `-31.1623U`.
   - Disabling first-entry max width worsened D to `-115.2501U` locally and `-477.1784U` on combined extreme logs.
 - Combined generated extreme-log replay was reviewed as a coarse stress test only because those logs are 15-minute kline resamples, not true 3-second order-book paths.
+- Optimizer smoke:
+  - `python -m py_compile backtest\log_parameter_optimizer.py`
+  - `python backtest\log_parameter_optimizer.py --use-cache --sample-sec 60 --search-mode random --random-trials 2 --workers 1 --quiet --no-prompt --out-dir backtest\results\optimizer_smoke_slim`
 
 ### Risk Notes
 
