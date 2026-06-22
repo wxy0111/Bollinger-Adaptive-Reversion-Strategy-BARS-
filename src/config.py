@@ -88,7 +88,7 @@ MIN_BOLL_WIDTH_USD = 15
 
 # Minimum Bollinger width as current-price percentage.
 # 最小布林带宽度百分比：0.008=0.8%。
-MIN_BOLL_WIDTH_PCT = 0.015
+MIN_BOLL_WIDTH_PCT = 0.01
 
 # Dynamic Bollinger-width reference.
 # 动态布林宽度基准：价格在2000附近时，参考宽度为15U。
@@ -246,7 +246,7 @@ ADDON_MAX_BOLL_WIDTH_USD = 80.0
 
 # Add-on take-profit improvement guard.
 # 补仓止盈改善守卫：补仓后，目标止盈价必须明显变得更容易触达才允许补仓。
-ADDON_TP_IMPROVE_GUARD_ENABLED = True
+ADDON_TP_IMPROVE_GUARD_ENABLED = False
 
 # Expected take-profit return used by the add-on guard.
 # 守卫使用的预期止盈收益：按 25% 保证金收益计算，不跟随当前真实止盈目标 28%。
@@ -382,7 +382,7 @@ TREND_RISK_NOTIFY_INTERVAL_SEC = 3600
 
 # Strategy target capital.
 # 策略目标资金：开仓/补仓按这个目标资金计算；平仓后利润是否划走由 TRANSFER_PROFIT_AFTER_CLOSE_ENABLED 控制。
-TRADING_ACCOUNT_TARGET = 100
+TRADING_ACCOUNT_TARGET = 200
 
 # Rolling compound mode.
 # 滚仓模式：开启后盈利不再自动划转到资金账户，开仓/补仓/策略止损按真实有效权益计算。
