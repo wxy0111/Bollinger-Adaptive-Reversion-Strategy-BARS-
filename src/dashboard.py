@@ -1095,13 +1095,14 @@ function distanceText(from, to, direction, favorableForLong = true) {
 }
 
 function riskScore(d) {
-  if (!d.total_sz || !d.liq_price || !d.mark_price) {
+  const riskPrice = Number(d.sl_price || d.liq_price || 0);
+  if (!d.total_sz || !riskPrice || !d.mark_price) {
     return { score: '--', label: '空仓', pct: 0, color: 'rgba(132,144,165,.42)', level: 'muted' };
   }
   const side = d.direction;
   const distance = side === 'long'
-    ? (d.mark_price - d.liq_price) / d.mark_price
-    : (d.liq_price - d.mark_price) / d.mark_price;
+    ? (d.mark_price - riskPrice) / d.mark_price
+    : (riskPrice - d.mark_price) / d.mark_price;
   const pctValue = distance * 100;
   const color = pctValue < RISK_THRESHOLDS.danger ? 'var(--red)' : pctValue < RISK_THRESHOLDS.warning ? 'var(--yellow)' : 'var(--green)';
   return {
@@ -1223,8 +1224,9 @@ async function refreshLive() {
   document.getElementById('tp-price').textContent = d.tp_price > 0 ? fmt(d.tp_price) : '--';
   document.getElementById('sl-price').textContent = d.sl_price > 0 ? fmt(d.sl_price) : '--';
   document.getElementById('sl-mode').textContent = d.sl_mode || '--';
-  document.getElementById('liq-price').textContent = d.liq_price > 0 ? fmt(d.liq_price) : '--';
-  document.getElementById('liq-price-copy').textContent = d.liq_price > 0 ? fmt(d.liq_price) : '--';
+  const riskLine = Number(d.sl_price || d.liq_price || 0);
+  document.getElementById('liq-price').textContent = riskLine > 0 ? fmt(riskLine) : '--';
+  document.getElementById('liq-price-copy').textContent = riskLine > 0 ? fmt(riskLine) : '--';
   document.getElementById('trade-count').textContent = `${d.total_trades || 0} 次`;
   const r = riskScore(d);
   document.getElementById('risk-score').textContent = r.score;
